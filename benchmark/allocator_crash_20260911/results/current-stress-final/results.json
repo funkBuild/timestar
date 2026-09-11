@@ -1,0 +1,22 @@
+[
+  {
+    "rep": 0,
+    "binary": "/home/matt/Desktop/source/tsdb/build/bin/timestar_http_server",
+    "quota_ms": "0.005",
+    "memory": "8G",
+    "failure": null,
+    "server_rc": 0,
+    "peak_observed_rss_kib": 570284,
+    "peak_hwm_kib": 570284
+  },
+  {
+    "rep": 1,
+    "binary": "/home/matt/Desktop/source/tsdb/build/bin/timestar_http_server",
+    "quota_ms": "0.005",
+    "memory": "8G",
+    "failure": null,
+    "server_rc": 0,
+    "peak_observed_rss_kib": 572432,
+    "peak_hwm_kib": 572432
+  }
+]

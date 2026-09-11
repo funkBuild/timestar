@@ -46,10 +46,61 @@ public:
                   InterpolationMethod interpolation = InterpolationMethod::LINEAR)
         : strategy_(strategy), interpolation_(interpolation) {}
 
+    // Resampling refuses to build a grid wider than this and falls back to the
+    // un-resampled axis; see resampleTimestamps().  Public so that a caller
+    // sizing a result BEFORE asking for it (projectedOutputSize() below, and
+    // through it the multi-series /derived bound) cannot drift from the rule
+    // align() actually applies.
+    static constexpr uint64_t kMaxResamplePoints = 10000000;  // 10M points max
+
     // Align multiple series to common timestamps
     // Input: map of query name -> (timestamps, values)
     // Output: map of query name -> AlignedSeries with matching timestamps
     std::map<std::string, AlignedSeries> align(const std::map<std::string, SubQueryResult>& series);
+
+    // How many points align() would emit for `series`, computed WITHOUT
+    // materialising either the axis or the resampled grid.
+    //
+    // Exists so a caller can refuse an over-large result BEFORE paying for it.
+    // The multi-series /derived path used to check its budget only after a group
+    // had been aligned, evaluated and pushed, which meant the FIRST group was
+    // never checked at all: four stored points at a one-second interval over a
+    // thirty-day window materialised 2,592,001 points (10.4x the budget) and
+    // stalled the reactor before anything refused them.
+    //
+    // EXACT for the strategies whose axis is determined by the inputs' contents:
+    //   * INNER  -- the axis is the intersection, which is counted by walking the
+    //     inputs' sorted timestamps as a merge: O(sum of lengths), copying no
+    //     timestamp and (up to eight sub-queries) allocating nothing.
+    //   * LEFT   -- exactly the first input.
+    // For these the answer equals align()'s output size, resampling and its
+    // kMaxResamplePoints fallback included, so a bound built on it refuses
+    // exactly what align() would go on to build -- no more and no less.
+    //
+    // UNION/OUTER over-state, never under-state.  The COUNT is at most the sum
+    // of the inputs' lengths (exact when they share no timestamp, high by the
+    // number they do share).  The SPAN, [min(first), max(last)], is exact, so
+    // with a target interval the GRID SIZE computed from it is exact -- but
+    // that does not make the ANSWER exact, because the grid is not always what
+    // align() emits.  Past kMaxResamplePoints align() abandons the grid and
+    // falls back to the real union axis, while this falls back to the summed
+    // axisSize, and the two differ: legs {0, 10000000} x {0, 10000000} at
+    // interval 1 project a grid of 10,000,001 (over the ceiling), so align()
+    // returns the 2-point union and this returns 4.  An earlier version of this
+    // comment claimed UNION/OUTER were "exact too" under a target interval;
+    // they are not, and the fallback is where it breaks.
+    //
+    // The over-statement is harmless -- nothing here ever UNDER-states, so
+    // nothing escapes a bound built on it -- and /derived is hard-configured to
+    // INNER, so no caller sees it today.  A caller may still keep an
+    // after-the-fact check as a backstop (the /derived path does).
+    //
+    // Sizing INNER by the interval that merely CONTAINS the intersection --
+    // length <= the shortest input, span within [max(first), min(last)] -- was
+    // both, and is why this walks the data instead: it refused a legitimate
+    // 2,000-point result claiming 299,999, and elsewhere admitted a 9,990,001-
+    // point one as 1,002 (see the note in the definition).
+    size_t projectedOutputSize(const std::map<std::string, SubQueryResult>& series) const;
 
     // Get statistics from the last alignment operation
     const AlignmentStats& getStats() const { return stats_; }

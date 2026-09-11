@@ -66,6 +66,7 @@ public:
     const std::string& currentPath() const { return currentPath_; }
 
 private:
+    friend struct NativeIndexTestAccess;
     IndexWAL() = default;
 
     // Open/reopen the Seastar DMA file for the current WAL.

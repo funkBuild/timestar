@@ -1055,6 +1055,92 @@ TEST(ProtoConverterDerived, FormatDerivedQueryResponse) {
     EXPECT_EQ(stats.points_dropped_due_to_alignment(), 1u);
 }
 
+// ---- Phase 4: the multi_series request flag and the DerivedSeries array ----
+
+TEST(ProtoConverterDerived, ParseDerivedQueryRequestCarriesMultiSeries) {
+    ::timestar_pb::DerivedQueryRequest req;
+    auto* q = req.add_queries();
+    q->set_name("a");
+    q->set_query("avg:cpu(usage){} by {host}");
+    req.set_formula("a * 2");
+    req.set_multi_series(true);
+
+    std::string bytes;
+    req.SerializeToString(&bytes);
+
+    auto parsed = parseDerivedQueryRequest(bytes.data(), bytes.size());
+    EXPECT_TRUE(parsed.multiSeries)
+        << "the /derived handler re-serializes THIS struct as JSON for the executor, so a flag "
+           "that stops here is unreachable from a protobuf client";
+}
+
+TEST(ProtoConverterDerived, ParseDerivedQueryRequestMultiSeriesDefaultsToFalse) {
+    ::timestar_pb::DerivedQueryRequest req;
+    auto* q = req.add_queries();
+    q->set_name("a");
+    q->set_query("avg:cpu(usage)");
+    req.set_formula("a");
+
+    std::string bytes;
+    req.SerializeToString(&bytes);
+
+    // A request encoded before the field existed decodes with it unset, i.e.
+    // the pre-Phase-4 behaviour.
+    auto parsed = parseDerivedQueryRequest(bytes.data(), bytes.size());
+    EXPECT_FALSE(parsed.multiSeries);
+}
+
+TEST(ProtoConverterDerived, FormatDerivedQueryResponseOmitsSeriesWhenThereAreNoGroups) {
+    DerivedQueryResultData result;
+    result.timestamps = {1000ULL, 2000ULL};
+    result.values = {1.0, 2.0};
+    result.formula = "a + b";
+
+    auto bytes = formatDerivedQueryResponse(result);
+    ::timestar_pb::DerivedQueryResponse resp;
+    ASSERT_TRUE(resp.ParseFromString(bytes));
+    EXPECT_EQ(resp.series_size(), 0) << "additive: a response without groups is what it always was";
+}
+
+TEST(ProtoConverterDerived, FormatDerivedQueryResponseCarriesEveryGroup) {
+    DerivedQueryResultData result;
+    result.formula = "a / b";
+    result.stats.pointCount = 4;
+
+    DerivedSeriesData first;
+    first.groupTags = {"deviceId=DEV-A", "_field=rx"};
+    first.timestamps = {1000ULL, 2000ULL};
+    first.values = {1.5, 2.5};
+    result.series.push_back(first);
+
+    DerivedSeriesData second;
+    second.groupTags = {"deviceId=DEV-B", "_field=rx"};
+    second.timestamps = {1000ULL, 2000ULL};
+    second.values = {10.5, 20.5};
+    result.series.push_back(second);
+
+    auto bytes = formatDerivedQueryResponse(result);
+    ::timestar_pb::DerivedQueryResponse resp;
+    ASSERT_TRUE(resp.ParseFromString(bytes));
+
+    ASSERT_EQ(resp.series_size(), 2);
+
+    const auto& a = resp.series(0);
+    ASSERT_EQ(a.group_tags_size(), 2);
+    EXPECT_EQ(a.group_tags(0), "deviceId=DEV-A");
+    EXPECT_EQ(a.group_tags(1), "_field=rx");
+    // Compressed exactly like the flat columns; the packed fields stay empty.
+    EXPECT_EQ(a.timestamps_size(), 0);
+    EXPECT_EQ(a.values_size(), 0);
+    EXPECT_EQ(decodeFforU64(a.compressed_timestamps(), 2), (std::vector<uint64_t>{1000ULL, 2000ULL}));
+    EXPECT_EQ(decodeAlpValues(a.compressed_values(), 2), (std::vector<double>{1.5, 2.5}));
+
+    const auto& b = resp.series(1);
+    ASSERT_EQ(b.group_tags_size(), 2);
+    EXPECT_EQ(b.group_tags(0), "deviceId=DEV-B");
+    EXPECT_EQ(decodeAlpValues(b.compressed_values(), 2), (std::vector<double>{10.5, 20.5}));
+}
+
 TEST(ProtoConverterDerived, FormatDerivedQueryError) {
     auto bytes = formatDerivedQueryError("QUERY_ERROR", "undefined variable 'z'");
     ::timestar_pb::DerivedQueryResponse resp;
@@ -1486,6 +1572,70 @@ TEST(ProtoConverterRoundTrip, DerivedQueryRoundTrip) {
     // The uncompressed repeated fields should be empty since we use compression
     EXPECT_EQ(resp.timestamps_size(), 0);
     EXPECT_EQ(resp.values_size(), 0);
+}
+
+// The same round trip with the Phase 4 additions in play: the request flag
+// survives encode/parse and the per-group array survives format/parse.
+//
+// REPOINTED: the one-group answer used to be encoded into BOTH the flat columns
+// and the array, so the compression ran over the same points twice; the executor
+// now fills the array only, and this pins the shape it actually produces.
+TEST(ProtoConverterRoundTrip, DerivedQueryMultiSeriesRoundTrip) {
+    ::timestar_pb::DerivedQueryRequest req;
+    auto* q = req.add_queries();
+    q->set_name("a");
+    q->set_query("avg:cpu(usage){} by {host}");
+    req.set_formula("a * 100");
+    req.set_multi_series(true);
+
+    std::string reqBytes;
+    req.SerializeToString(&reqBytes);
+    auto parsed = parseDerivedQueryRequest(reqBytes.data(), reqBytes.size());
+    ASSERT_TRUE(parsed.multiSeries);
+
+    // Exactly what the executor now hands over for a one-group multiSeries
+    // answer: the array, and EMPTY flat columns.
+    DerivedQueryResultData result;
+    result.formula = "a * 100";
+    result.stats.pointCount = 2;
+    result.stats.groupCount = 1;
+    DerivedSeriesData only;
+    only.groupTags = {"host=s1"};
+    only.timestamps = {1000ULL, 2000ULL};
+    only.values = {95.0, 87.5};
+    result.series.push_back(only);
+
+    auto respBytes = formatDerivedQueryResponse(result);
+    ::timestar_pb::DerivedQueryResponse resp;
+    ASSERT_TRUE(resp.ParseFromString(respBytes));
+
+    ASSERT_EQ(resp.series_size(), 1);
+    EXPECT_EQ(resp.series(0).group_tags(0), "host=s1");
+    EXPECT_EQ(decodeFforU64(resp.series(0).compressed_timestamps(), 2), (std::vector<uint64_t>{1000ULL, 2000ULL}));
+    EXPECT_EQ(decodeAlpValues(resp.series(0).compressed_values(), 2), (std::vector<double>{95.0, 87.5}));
+    // The points are NOT also compressed into the flat columns.
+    EXPECT_TRUE(resp.compressed_timestamps().empty()) << "a one-group answer must not be encoded twice";
+    EXPECT_TRUE(resp.compressed_values().empty());
+    EXPECT_EQ(resp.statistics().group_count(), 1u);
+}
+
+// group_count is additive: a response from the single-series path leaves it 0,
+// which proto3 keeps off the wire entirely.
+TEST(ProtoConverterDerived, DerivedQueryGroupCountIsAdditive) {
+    DerivedQueryResultData result;
+    result.timestamps = {1000ULL};
+    result.values = {1.0};
+    result.formula = "a";
+    result.stats.pointCount = 1;
+
+    auto bytes = formatDerivedQueryResponse(result);
+    ::timestar_pb::DerivedQueryResponse resp;
+    ASSERT_TRUE(resp.ParseFromString(bytes));
+    EXPECT_EQ(resp.statistics().group_count(), 0u);
+    // Serialized size is unchanged by the new field when it is zero.
+    DerivedQueryResultData withGroups = result;
+    withGroups.stats.groupCount = 0;
+    EXPECT_EQ(formatDerivedQueryResponse(withGroups).size(), bytes.size());
 }
 
 // ============================================================================

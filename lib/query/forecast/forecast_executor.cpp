@@ -109,6 +109,16 @@ size_t ForecastExecutor::windowInput(ForecastInput& input, size_t windowSize) {
     return trimCount;
 }
 
+size_t ForecastExecutor::resolveHorizon(size_t historicalPoints, size_t configuredHorizon) {
+    if (configuredHorizon > 0) {
+        return configuredHorizon;
+    }
+    // Auto horizon: 20% of historical, floored at 50 and capped at 2000 points.
+    // For large datasets (e.g., 1 year at 5m intervals = 105K points),
+    // forecasting the same number of points is excessive and slow.
+    return std::min(std::max<size_t>(historicalPoints / 5, 50), size_t(2000));
+}
+
 // ── execute() ─────────────────────────────────────────────────────────────
 
 ForecastOutput ForecastExecutor::execute(const ForecastInput& input, const ForecastConfig& config) {
@@ -117,13 +127,7 @@ ForecastOutput ForecastExecutor::execute(const ForecastInput& input, const Forec
     }
 
     // Generate forecast timestamps
-    size_t horizon = config.forecastHorizon;
-    if (horizon == 0) {
-        // Auto horizon: 20% of historical, capped at 2000 points.
-        // For large datasets (e.g., 1 year at 5m intervals = 105K points),
-        // forecasting the same number of points is excessive and slow.
-        horizon = std::min(std::max<size_t>(input.size() / 5, 50), size_t(2000));
-    }
+    size_t horizon = resolveHorizon(input.size(), config.forecastHorizon);
 
     // Auto-windowing: trim old data before expensive computation.
     // Only copy the input if we actually need to trim.
@@ -281,10 +285,7 @@ ForecastQueryResult ForecastExecutor::executeMulti(const std::vector<uint64_t>& 
     }
 
     // Generate extended timestamps (historical + forecast)
-    size_t horizon = config.forecastHorizon;
-    if (horizon == 0) {
-        horizon = std::min(std::max<size_t>(timestamps.size() / 5, 50), size_t(2000));
-    }
+    size_t horizon = resolveHorizon(timestamps.size(), config.forecastHorizon);
 
     // Period detection runs ONCE for AUTO/MULTI and feeds both auto-windowing
     // and the statistics record (previously two identical detectPeriods runs —
@@ -347,6 +348,11 @@ ForecastQueryResult ForecastExecutor::executeMulti(const std::vector<uint64_t>& 
     ForecastConfig innerConfig = config;
     innerConfig.disableAutoWindow = true;
 
+    // Groups that resolved but produced no forecast.  Every `continue` below is
+    // a DECLINE -- the group is silently absent from `result.series` -- so each
+    // one must be recorded, or the response asserts groups it does not carry.
+    size_t declinedSeries = 0;
+
     // Process each series
     for (size_t s = 0; s < seriesValues.size(); ++s) {
         ForecastInput input;
@@ -356,6 +362,7 @@ ForecastQueryResult ForecastExecutor::executeMulti(const std::vector<uint64_t>& 
         if (trimCount > 0 && seriesValues[s].size() > trimCount) {
             input.values.assign(seriesValues[s].begin() + static_cast<ptrdiff_t>(trimCount), seriesValues[s].end());
         } else if (trimCount > 0 && seriesValues[s].size() <= trimCount) {
+            ++declinedSeries;
             continue;  // Not enough data after trimming
         } else {
             input.values = seriesValues[s];
@@ -368,6 +375,7 @@ ForecastQueryResult ForecastExecutor::executeMulti(const std::vector<uint64_t>& 
         ForecastOutput output = execute(input, innerConfig);
 
         if (output.empty()) {
+            ++declinedSeries;
             continue;  // Skip failed series
         }
 
@@ -408,7 +416,11 @@ ForecastQueryResult ForecastExecutor::executeMulti(const std::vector<uint64_t>& 
         result.statistics.seasonality = "none";
     }
 
-    result.statistics.seriesCount = seriesValues.size();
+    // The groups that were EMITTED, plus the ones that were not.  Reporting
+    // the INPUT count here made a fan-out response claim a group it had
+    // declined: two devices in, one forecast out, "series_count": 2.
+    result.statistics.seriesCount = seriesValues.size() - declinedSeries;
+    result.statistics.declinedSeriesCount = declinedSeries;
 
     auto endTime = std::chrono::high_resolution_clock::now();
     result.statistics.executionTimeMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();

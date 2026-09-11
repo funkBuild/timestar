@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rollup.hpp"
 #include "util.hpp"
 
 #include <stdint.h>
@@ -20,6 +21,7 @@ private:
 public:
     std::vector<uint64_t> timestamps;
     std::vector<T> values;
+    std::vector<RollupState> rollups;
 
     TSMBlock(size_t initialSize) {
         timestamps.reserve(initialSize);

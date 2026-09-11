@@ -11,6 +11,7 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/with_scheduling_group.hh>
+#include <unordered_set>
 
 namespace fs = std::filesystem;
 
@@ -72,6 +73,17 @@ seastar::future<> TSMFileManager::init() {
     for (const auto& path : tsmPaths) {
         co_await openTsmFile(path);
     }
+    // A durable V4 output records its inputs. A crash between publishing it
+    // and unlinking the old files must never make both sets visible again.
+    std::unordered_set<uint64_t> obsolete;
+    for (const auto& [rank, file] : sequencedTsmFiles) {
+        obsolete.insert(file->replacedFileRanks().begin(), file->replacedFileRanks().end());
+    }
+    std::vector<seastar::shared_ptr<TSM>> retired;
+    for (const auto& [rank, file] : sequencedTsmFiles)
+        if (obsolete.contains(rank))
+            retired.push_back(file);
+    co_await removeTSMFiles(retired);
 }
 
 seastar::future<> TSMFileManager::stop() {
@@ -265,7 +277,10 @@ seastar::future<> TSMFileManager::removeTSMFiles(const std::vector<seastar::shar
         // Remove from sequenced map
         uint64_t tsmSeqNum = file->rankAsInteger();
         sequencedTsmFiles.erase(tsmSeqNum);
-
+    }
+    // Registry replacement is synchronous across ALL inputs, before the first
+    // unlink can suspend and let a query observe output plus surviving inputs.
+    for (const auto& file : files) {
         // Delete the tombstone file first (if any), then the TSM file itself
         co_await file->deleteTombstoneFile();
         co_await file->scheduleDelete();

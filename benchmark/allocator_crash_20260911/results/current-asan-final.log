@@ -1,0 +1,4 @@
+INFO  2026-09-11 22:08:09,566 seastar - Reactor backend: linux-aio
+INFO  2026-09-11 22:08:09,567 seastar - Perf-based stall detector creation failed (EACCESS), try setting /proc/sys/kernel/perf_event_paranoid to 1 or less to enable kernel backtraces: falling back to posix timer.
+pending=1; forcing cache rehash before resumption
+added=1 present=1

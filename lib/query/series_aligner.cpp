@@ -1,6 +1,7 @@
 #include "series_aligner.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -48,6 +49,171 @@ std::map<std::string, AlignedSeries> SeriesAligner::align(const std::map<std::st
     }
 
     return result;
+}
+
+size_t SeriesAligner::projectedOutputSize(const std::map<std::string, SubQueryResult>& series) const {
+    if (series.empty()) {
+        return 0;
+    }
+
+    // Size the axis and the span it covers, per strategy.  Mirrors
+    // computeOutputTimestamps() / computeIntersection() / computeUnion() without
+    // building any of their vectors.  Exact for INNER and LEFT; for UNION/OUTER
+    // the count is an upper bound (see the header) and the span is exact.
+    size_t axisSize = 0;
+    uint64_t spanStart = 0;
+    uint64_t spanEnd = 0;
+    bool haveSpan = false;
+
+    switch (strategy_) {
+        case AlignmentStrategy::LEFT: {
+            const auto& first = series.begin()->second;
+            axisSize = first.timestamps.size();
+            if (!first.timestamps.empty()) {
+                spanStart = first.timestamps.front();
+                spanEnd = first.timestamps.back();
+                haveSpan = true;
+            }
+            break;
+        }
+
+        case AlignmentStrategy::OUTER:
+        case AlignmentStrategy::UNION: {
+            for (const auto& [name, result] : series) {
+                (void)name;
+                if (result.timestamps.empty()) {
+                    continue;
+                }
+                axisSize += result.timestamps.size();
+                if (!haveSpan) {
+                    spanStart = result.timestamps.front();
+                    spanEnd = result.timestamps.back();
+                    haveSpan = true;
+                } else {
+                    spanStart = std::min(spanStart, result.timestamps.front());
+                    spanEnd = std::max(spanEnd, result.timestamps.back());
+                }
+            }
+            break;
+        }
+
+        case AlignmentStrategy::INNER:
+        default: {
+            // EXACT, not bounded: walk the inputs' sorted timestamp vectors as a
+            // merge and count the real intersection, taking its real first and
+            // last as the span.
+            //
+            // Sizing the span as [max(first), min(last)] instead -- an interval
+            // that merely CONTAINS the intersection -- bears no relation to it
+            // when the extreme timestamps are not shared, and the resample grid
+            // projected from it then over-states by orders of magnitude.  Two
+            // legs sharing 1,000 one-second points but differing at both ends of
+            // a 300,000-second window projected 299,999 points at a one-second
+            // interval and were refused by the /derived budget; the true answer
+            // was 1,000 (0.4% of that budget), and a pair whose spans overlap but
+            // whose timestamps are wholly disjoint was refused claiming 299,999
+            // for a result of zero points.
+            //
+            // It also removes the only case that could UNDER-state: the grid over
+            // the containing interval can exceed kMaxResamplePoints (projecting
+            // the un-resampled axis) while the grid over the REAL intersection
+            // stays under it and is materialised.  Measured at 9,990,001 points
+            // -- projected as 1,002, admitted by the budget, then built at a cost
+            // of 200 ms and two reactor stalls before the after-the-fact backstop
+            // caught it.
+            //
+            // Cost is O(sum of the inputs' lengths) and copies no timestamp,
+            // which is trivial beside align()'s own intersect-and-interpolate
+            // over the same data -- and it is only ever reached because a caller
+            // is about to do exactly that.
+            struct Cursor {
+                const uint64_t* next;
+                const uint64_t* end;
+            };
+            // Cursors live on the stack for any realistic sub-query count (the
+            // formula names the legs, so this is 2 in the ordinary case); the
+            // vector is a correctness fallback, never the hot path.
+            static constexpr size_t kInlineCursors = 8;
+            std::array<Cursor, kInlineCursors> inlineCursors{};
+            std::vector<Cursor> spilledCursors;
+            Cursor* cursors = inlineCursors.data();
+            if (series.size() > kInlineCursors) {
+                spilledCursors.resize(series.size());
+                cursors = spilledCursors.data();
+            }
+
+            size_t legCount = 0;
+            for (const auto& [name, result] : series) {
+                (void)name;
+                if (result.timestamps.empty()) {
+                    // An empty input makes the intersection empty.
+                    return 0;
+                }
+                cursors[legCount].next = result.timestamps.data();
+                cursors[legCount].end = result.timestamps.data() + result.timestamps.size();
+                ++legCount;
+            }
+
+            // Same sortedness contract computeIntersection() already relies on,
+            // and the same multiset semantics as the set_intersection chain it
+            // uses: a value repeated in every input contributes min(counts).
+            bool exhausted = false;
+            while (!exhausted) {
+                uint64_t candidate = *cursors[0].next;
+                for (size_t i = 1; i < legCount; ++i) {
+                    candidate = std::max(candidate, *cursors[i].next);
+                }
+                bool shared = true;
+                for (size_t i = 0; i < legCount; ++i) {
+                    while (cursors[i].next != cursors[i].end && *cursors[i].next < candidate) {
+                        ++cursors[i].next;
+                    }
+                    if (cursors[i].next == cursors[i].end) {
+                        exhausted = true;
+                        break;
+                    }
+                    // Overshot: this input has no `candidate`, and its head is now
+                    // the next iteration's (strictly larger) candidate -- which is
+                    // what makes the walk terminate.
+                    shared = shared && *cursors[i].next == candidate;
+                }
+                if (exhausted || !shared) {
+                    continue;
+                }
+                if (!haveSpan) {
+                    spanStart = candidate;
+                    haveSpan = true;
+                }
+                spanEnd = candidate;
+                ++axisSize;
+                for (size_t i = 0; i < legCount; ++i) {
+                    ++cursors[i].next;
+                    exhausted = exhausted || cursors[i].next == cursors[i].end;
+                }
+            }
+            if (!haveSpan) {
+                return 0;  // the inputs share no timestamp at all
+            }
+            break;
+        }
+    }
+
+    if (axisSize == 0 || !haveSpan) {
+        return 0;
+    }
+    if (targetInterval_ == 0) {
+        return axisSize;
+    }
+
+    // Resampled onto a dense grid: the same arithmetic resampleTimestamps() does
+    // (start aligned DOWN to an interval boundary, end inclusive), without the
+    // vector.
+    const uint64_t alignedStart = (spanStart / targetInterval_) * targetInterval_;
+    const uint64_t grid = (spanEnd - alignedStart) / targetInterval_ + 1;
+    if (grid > kMaxResamplePoints) {
+        return axisSize;  // align() keeps the un-resampled axis
+    }
+    return static_cast<size_t>(grid);
 }
 
 std::vector<uint64_t> SeriesAligner::computeOutputTimestamps(const std::map<std::string, SubQueryResult>& series) {
@@ -151,8 +317,7 @@ std::vector<uint64_t> SeriesAligner::resampleTimestamps(const std::vector<uint64
     // Guard against extremely small intervals that would create too many points
     uint64_t range = end - start;
     uint64_t expectedCount = range / interval + 1;
-    static constexpr uint64_t MAX_RESAMPLE_POINTS = 10000000;  // 10M points max
-    if (expectedCount > MAX_RESAMPLE_POINTS) {
+    if (expectedCount > kMaxResamplePoints) {
         // Interval too small for the range; return original timestamps
         return timestamps;
     }

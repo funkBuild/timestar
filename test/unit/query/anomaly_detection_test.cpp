@@ -10,6 +10,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <limits>
 #include <random>
 #include <set>
 #include <vector>
@@ -372,6 +373,217 @@ TEST_F(AnomalyDetectionTest, ExecutorMultiSeriesMismatchedSizesThrows) {
     EXPECT_THROW(executor.executeMulti(timestamps, seriesValues, seriesGroupTags, config), std::invalid_argument);
 }
 
+// R4: the two entry points must agree.  execute() reported totalPoints as the
+// ROW WIDTH while executeMulti() counted non-NaN observations, so the same
+// series answered through the two doors reported different totals -- and the
+// finite-point gate executeMulti grew was missing from execute() entirely.
+// execute() is now defined as the one-series case of executeMulti, so any
+// future divergence has to be introduced deliberately.
+TEST_F(AnomalyDetectionTest, ExecuteAgreesWithExecuteMultiOnASingleSeries) {
+    AnomalyExecutor executor;
+
+    auto timestamps = generateTimestamps(60);
+    auto values = generateConstant(60, 50.0);
+    values[40] = 250.0;  // an anomaly, so anomalyCount is non-trivial
+    // ...and genuine gaps, which is where the two used to disagree.
+    for (size_t i : {5u, 6u, 17u, 33u}) {
+        values[i] = std::numeric_limits<double>::quiet_NaN();
+    }
+
+    std::vector<std::string> groupTags = {"host=server01"};
+
+    AnomalyConfig config;
+    config.algorithm = Algorithm::BASIC;
+    config.bounds = 2.0;
+
+    auto single = executor.execute(timestamps, values, groupTags, config);
+    auto multi = executor.executeMulti(timestamps, {values}, {groupTags}, config);
+
+    ASSERT_TRUE(single.success);
+    ASSERT_TRUE(multi.success);
+    EXPECT_EQ(single.statistics.totalPoints, multi.statistics.totalPoints);
+    EXPECT_EQ(single.statistics.totalPoints, 56u) << "60 slots, 4 of them missing";
+    EXPECT_EQ(single.statistics.anomalyCount, multi.statistics.anomalyCount);
+    EXPECT_EQ(single.statistics.declinedSeriesCount, multi.statistics.declinedSeriesCount);
+    EXPECT_EQ(single.statistics.algorithm, multi.statistics.algorithm);
+    EXPECT_EQ(single.series.size(), multi.series.size());
+    EXPECT_EQ(single.times, multi.times);
+
+    for (size_t i = 0; i < single.series.size(); ++i) {
+        EXPECT_EQ(single.series[i].piece, multi.series[i].piece);
+        EXPECT_EQ(single.series[i].groupTags, multi.series[i].groupTags);
+        EXPECT_EQ(single.series[i].values.size(), multi.series[i].values.size());
+    }
+}
+
+// R3: a series with fewer OBSERVATIONS than minDataPoints is declined rather
+// than given an envelope derived from a handful of samples.  The warm-up is
+// indexed by slot, so on a mostly-NaN row it stops protecting anything.
+TEST_F(AnomalyDetectionTest, ExecutorDeclinesASeriesWithTooFewObservations) {
+    AnomalyExecutor executor;
+
+    auto timestamps = generateTimestamps(40);
+    std::vector<double> oneObservation(40, std::numeric_limits<double>::quiet_NaN());
+    oneObservation[3] = 900.0;
+    auto dense = generateConstant(40, 50.0);
+
+    AnomalyConfig config;
+    config.algorithm = Algorithm::BASIC;
+    config.bounds = 2.0;
+
+    auto result = executor.executeMulti(timestamps, {dense, oneObservation}, {{"dev=FULL"}, {"dev=SPARSE"}}, config);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(result.statistics.declinedSeriesCount, 1u);
+    EXPECT_EQ(result.statistics.totalPoints, 40u) << "only the answered group's points count";
+    for (const auto& piece : result.series) {
+        ASSERT_FALSE(piece.groupTags.empty());
+        EXPECT_EQ(piece.groupTags[0], "dev=FULL")
+            << "REGRESSION: a group with one observation was given a confidence envelope";
+    }
+}
+
+// Phase 3.7 / S1: the gate above does not fire below the warm-up length.  A
+// SHORT series is answered however short it is, because it is the shape the
+// ordinary single-series path produces, where the axis IS the series' own
+// timestamps.
+//
+// Gating on length instead threw data away: a dense 5-point series used to come
+// back with `raw` and `predictions` carrying the STORED VALUES (under BASIC,
+// used here, with an honest all-null envelope since it never leaves warm-up;
+// ROBUST has no warm-up and produces a finite band even at n = 3), and Phase
+// 3.6 answered `"series": []` for it.  A client plotting a 5-minute panel at
+// one-minute resolution, or any series younger than minDataPoints intervals,
+// lost its data to a guard aimed at fan-out.
+TEST_F(AnomalyDetectionTest, ADenseSeriesShorterThanMinDataPointsIsAnsweredNotDeclined) {
+    AnomalyExecutor executor;
+
+    AnomalyConfig config;
+    config.algorithm = Algorithm::BASIC;
+    config.bounds = 3.0;
+    ASSERT_EQ(config.minDataPoints, 10u) << "this test is about lengths BELOW the default warm-up";
+
+    for (size_t n : {1u, 5u, 8u, 9u}) {
+        auto timestamps = generateTimestamps(n);
+        std::vector<double> values;
+        for (size_t i = 0; i < n; ++i) {
+            values.push_back(10.0 + static_cast<double>(i));
+        }
+
+        auto result = executor.executeMulti(timestamps, {values}, {{"dev=SHORT"}}, config);
+
+        ASSERT_TRUE(result.success) << result.errorMessage;
+        EXPECT_EQ(result.statistics.declinedSeriesCount, 0u) << "n=" << n << ": a dense series must not be declined";
+        EXPECT_EQ(result.statistics.totalPoints, n) << "n=" << n;
+        ASSERT_FALSE(result.series.empty()) << "n=" << n << ": REGRESSION: the stored values were dropped";
+
+        // The stored values come back verbatim under `raw`.
+        const auto* raw = [&]() -> const AnomalySeriesPiece* {
+            for (const auto& piece : result.series) {
+                if (piece.piece == "raw") {
+                    return &piece;
+                }
+            }
+            return nullptr;
+        }();
+        ASSERT_NE(raw, nullptr) << "n=" << n;
+        ASSERT_EQ(raw->values.size(), n);
+        for (size_t i = 0; i < n; ++i) {
+            EXPECT_DOUBLE_EQ(raw->values[i], 10.0 + static_cast<double>(i)) << "n=" << n << " i=" << i;
+        }
+    }
+}
+
+// Phase 3.8 / F1: the BOUNDARY the two tests above jump straight over.
+//
+// Phase 3.7's gate was `finitePoints < values.size() && finitePoints <
+// minDataPoints` -- ANY padding at all, however short the row.  So the same
+// nine observations were answered in full on a 9-slot axis and declined
+// outright (`"series": []`, total_points 0, declined 1) on a 10-slot one.  One
+// missing slot flipped the answer from the data to nothing, and it bought
+// nothing: a 10-slot row is entirely inside BASIC's warm-up, so its envelope is
+// all-null and its scores all zero either way.  MEASURED against a pre-campaign
+// build, which answered every row in this loop.
+//
+// The gate is now `values.size() > minDataPoints && finitePoints <
+// minDataPoints`: a row no longer than the warm-up is never declined, whatever
+// it holds.
+TEST_F(AnomalyDetectionTest, ARowNoLongerThanTheWarmUpIsNeverDeclinedHoweverPaddedItIs) {
+    AnomalyExecutor executor;
+
+    AnomalyConfig config;
+    config.algorithm = Algorithm::BASIC;
+    config.bounds = 3.0;
+    ASSERT_EQ(config.minDataPoints, 10u) << "the boundary under test is minDataPoints itself";
+
+    // slots x gaps, walked across the boundary at slots == minDataPoints.
+    struct Case {
+        size_t slots;
+        size_t gaps;
+        bool declined;
+    };
+    const Case cases[] = {
+        {9, 0, false},   // dense 9 -- answered before and after
+        {9, 1, false},   // 8 of 9   -- 3.7 declined this
+        {10, 1, false},  // 9 of 10  -- 3.7 declined this: the reported bug
+        {10, 0, false},  // dense 10 -- at the warm-up length
+        {11, 1, false},  // 10 of 11 -- enough observations on its own
+        {12, 3, true},   // 9 of 12  -- past the warm-up AND short of it
+        {40, 31, true},  // 9 of 40  -- the fan-out case the gate exists for
+        {40, 0, false},  // dense 40
+    };
+
+    for (const auto& c : cases) {
+        auto timestamps = generateTimestamps(c.slots);
+        std::vector<double> values(c.slots, std::numeric_limits<double>::quiet_NaN());
+        // Put the gaps first so the finite points are contiguous at the end.
+        for (size_t i = c.gaps; i < c.slots; ++i) {
+            values[i] = 10.0 + static_cast<double>(i);
+        }
+
+        auto result = executor.executeMulti(timestamps, {values}, {{"dev=D1"}}, config);
+
+        ASSERT_TRUE(result.success) << result.errorMessage;
+        EXPECT_EQ(result.statistics.declinedSeriesCount, c.declined ? 1u : 0u)
+            << "slots=" << c.slots << " gaps=" << c.gaps;
+        EXPECT_EQ(result.series.empty(), c.declined) << "slots=" << c.slots << " gaps=" << c.gaps;
+        if (!c.declined) {
+            EXPECT_EQ(result.statistics.totalPoints, c.slots - c.gaps)
+                << "slots=" << c.slots << " gaps=" << c.gaps << ": only the real observations count";
+        }
+    }
+}
+
+// The same rule from the other side: past the warm-up length a row IS gated on
+// its observation count, so a long sparse row is declined even though it is
+// longer than a dense row that is answered.  9 dense points are answered; 9
+// observations spread over 40 slots are not.
+TEST_F(AnomalyDetectionTest, PaddingNotLengthDecidesWhetherASeriesIsDeclined) {
+    AnomalyExecutor executor;
+
+    AnomalyConfig config;
+    config.algorithm = Algorithm::BASIC;
+    config.bounds = 3.0;
+
+    auto shortDense = generateTimestamps(9);
+    std::vector<double> dense(9, 42.0);
+    auto denseResult = executor.executeMulti(shortDense, {dense}, {{"dev=DENSE"}}, config);
+    ASSERT_TRUE(denseResult.success);
+    EXPECT_EQ(denseResult.statistics.declinedSeriesCount, 0u);
+    EXPECT_FALSE(denseResult.series.empty());
+
+    auto longAxis = generateTimestamps(40);
+    std::vector<double> sparse(40, std::numeric_limits<double>::quiet_NaN());
+    for (size_t i = 0; i < 9; ++i) {
+        sparse[i * 4] = 42.0;
+    }
+    auto sparseResult = executor.executeMulti(longAxis, {sparse}, {{"dev=SPARSE"}}, config);
+    ASSERT_TRUE(sparseResult.success);
+    EXPECT_EQ(sparseResult.statistics.declinedSeriesCount, 1u)
+        << "REGRESSION: 9 observations on a 40-slot axis were given an envelope";
+    EXPECT_TRUE(sparseResult.series.empty());
+}
+
 // ==================== Algorithm Config Tests ====================
 
 TEST_F(AnomalyDetectionTest, ParseAlgorithmStrings) {
@@ -683,4 +895,3 @@ TEST_F(AnomalyDetectionTest, BasicDetectorAccurateOnLongSeriesWithKnownAnomalies
         EXPECT_FALSE(std::isnan(output.scores[i])) << "NaN score at index " << i;
     }
 }
-

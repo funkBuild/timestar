@@ -72,6 +72,101 @@ void AnomalyExecutor::addSeriesPieces(AnomalyQueryResult& result, const std::vec
     }
 }
 
+void AnomalyExecutor::detectOneSeries(AnomalyQueryResult& result, AnomalyDetector& detector,
+                                      const std::vector<uint64_t>& timestamps, const std::vector<double>& values,
+                                      const std::vector<std::string>& groupTags, size_t queryIndex,
+                                      const AnomalyConfig& config, SeriesTally& tally) {
+    if (values.empty()) {
+        return;  // nothing resolved here at all — not a decline, just absent
+    }
+
+    // Count the points that are REALLY there, not the row width.  Every group
+    // may be projected onto one shared time axis and carries NaN wherever it
+    // has no sample (docs/nan_policy.md, "NaN = missing"), so values.size() is
+    // the axis length and counts another group's timestamps as this group's
+    // data: 3 groups holding 66 real points between them, spread over a
+    // 30-slot axis, reported 90.  The same rule the aggregation paths already
+    // follow -- count counts only non-NaN values.
+    size_t finitePoints = 0;
+    for (double v : values) {
+        if (!std::isnan(v)) {
+            ++finitePoints;
+        }
+    }
+
+    // DECLINE a LONG row that has too few observations to detect against.
+    //
+    // The detectors' warm-up is indexed by SLOT, not by observation: for BASIC
+    // and AGILE the first minDataPoints slots get infinite bounds and a zero
+    // score, and every slot after that gets a finite envelope built from
+    // whatever the rolling stats have seen.  On a fan-out group that is nearly
+    // all NaN, "whatever they have seen" can be a single sample -- and a device
+    // with one observation came back with a 30-slot confidence envelope, a
+    // prediction at every timestamp and a score at every timestamp, inside a
+    // "status":"success" response.  That is the same fabrication the forecast
+    // half declines (LinearForecaster::forecast).
+    //
+    // The gate is `axis longer than the warm-up` AND `too few observations`.
+    // Both halves matter:
+    //
+    //   * the OBSERVATION half is the point: a row must be judged on the
+    //     samples it really holds, never on the width of an axis it shares
+    //     with other groups.
+    //   * the AXIS half exists because a row no longer than minDataPoints
+    //     cannot leave a slot-indexed warm-up at all, so for BASIC and AGILE
+    //     there is nothing there to fabricate -- declining it would only throw
+    //     away the stored values under `raw` and `predictions`.  Below the
+    //     warm-up length the gate therefore costs data and buys nothing, so it
+    //     does not fire.
+    //
+    // Gating on `finitePoints < values.size()` (any padding at all) instead
+    // cost real data at the boundary: a 10-slot row holding 9 observations was
+    // declined outright -- `"series": []`, total_points 0 -- while the same
+    // nine observations on a 9-slot axis were answered in full.  One missing
+    // slot flipped the answer from the data to nothing, for a row that is
+    // entirely inside the warm-up either way.
+    //
+    // NOT true of ROBUST, which has no warm-up (docs/anomaly-detection.md): it
+    // runs an STL decomposition over the whole row and produces a finite
+    // envelope at every slot however short the row is -- a dense 3-point robust
+    // series comes back with a +/-0.36 band.  The `values.size() >
+    // minDataPoints` arm is therefore about what the OTHER two algorithms
+    // cannot fabricate; for robust it simply means a short row keeps the same
+    // answer it gave before this campaign, which is the standing
+    // byte-identity guarantee.
+    //
+    // NaN is missing (docs/nan_policy.md), so a long single series carrying
+    // stored NaNs is genuinely sparse and is gated like any other sparse row.
+    if (values.size() > config.minDataPoints && finitePoints < config.minDataPoints) {
+        ++tally.declined;
+        return;
+    }
+
+    // Borrow, do not copy: detectors only read.
+    AnomalyInputView input{timestamps, values};
+
+    AnomalyOutput output = detector.detect(input, config);
+
+    tally.anomalies += output.anomalyCount;
+    tally.points += finitePoints;
+
+    // Add series pieces to result (moves the output vectors)
+    addSeriesPieces(result, values, std::move(output), groupTags, queryIndex);
+}
+
+void AnomalyExecutor::fillStatistics(AnomalyQueryResult& result, const AnomalyConfig& config,
+                                     const SeriesTally& tally) {
+    result.statistics.algorithm = algorithmToString(config.algorithm);
+    result.statistics.bounds = config.bounds;
+    result.statistics.seasonality = (config.seasonality == Seasonality::NONE)     ? "none"
+                                    : (config.seasonality == Seasonality::HOURLY) ? "hourly"
+                                    : (config.seasonality == Seasonality::DAILY)  ? "daily"
+                                                                                  : "weekly";
+    result.statistics.anomalyCount = tally.anomalies;
+    result.statistics.totalPoints = tally.points;
+    result.statistics.declinedSeriesCount = tally.declined;
+}
+
 AnomalyQueryResult AnomalyExecutor::execute(const std::vector<uint64_t>& timestamps, const std::vector<double>& values,
                                             const std::vector<std::string>& groupTags, const AnomalyConfig& config) {
     auto startTime = std::chrono::high_resolution_clock::now();
@@ -87,27 +182,14 @@ AnomalyQueryResult AnomalyExecutor::execute(const std::vector<uint64_t>& timesta
     // Create detector based on algorithm
     auto detector = createDetector(config.algorithm);
 
-    // Prepare input view — detectors only read, so borrow the caller's
-    // vectors instead of copying them (O(1) instead of two O(N) copies).
-    AnomalyInputView input{timestamps, values};
+    SeriesTally tally;
 
     try {
-        // Run detection
-        AnomalyOutput output = detector->detect(input, config);
-
-        // Add series pieces to result (moves the output vectors)
-        addSeriesPieces(result, values, std::move(output), groupTags, 0);
-
-        // Fill statistics
-        result.statistics.algorithm = algorithmToString(config.algorithm);
-        result.statistics.bounds = config.bounds;
-        result.statistics.seasonality = (config.seasonality == Seasonality::NONE)     ? "none"
-                                        : (config.seasonality == Seasonality::HOURLY) ? "hourly"
-                                        : (config.seasonality == Seasonality::DAILY)  ? "daily"
-                                                                                      : "weekly";
-        result.statistics.anomalyCount = output.anomalyCount;
-        result.statistics.totalPoints = values.size();
-
+        // The SAME per-group routine executeMulti runs, so the two entry points
+        // cannot disagree about the finite-point gate or the point accounting.
+        // They did: this one reported totalPoints as the row width.
+        detectOneSeries(result, *detector, timestamps, values, groupTags, 0, config, tally);
+        fillStatistics(result, config, tally);
         result.success = true;
 
     } catch (const std::exception& e) {
@@ -142,46 +224,15 @@ AnomalyQueryResult AnomalyExecutor::executeMulti(const std::vector<uint64_t>& sh
     // Create detector based on algorithm
     auto detector = createDetector(config.algorithm);
 
-    size_t totalAnomalies = 0;
-    size_t totalPoints = 0;
+    SeriesTally tally;
 
     try {
-        // Borrow the shared timestamps once; per-series values are borrowed
-        // each iteration — no O(N) copies into the detector input.
-        AnomalyInputView input;
-        input.timestamps = sharedTimestamps;
-
         // Process each series
         for (size_t i = 0; i < seriesValues.size(); ++i) {
-            const auto& values = seriesValues[i];
-            const auto& groupTags = seriesGroupTags[i];
-
-            if (values.empty())
-                continue;
-
-            input.values = values;
-
-            // Run detection
-            AnomalyOutput output = detector->detect(input, config);
-
-            totalAnomalies += output.anomalyCount;
-
-            // Add series pieces to result (moves the output vectors)
-            addSeriesPieces(result, values, std::move(output), groupTags, i);
-
-            totalPoints += values.size();
+            detectOneSeries(result, *detector, sharedTimestamps, seriesValues[i], seriesGroupTags[i], i, config, tally);
         }
 
-        // Fill statistics
-        result.statistics.algorithm = algorithmToString(config.algorithm);
-        result.statistics.bounds = config.bounds;
-        result.statistics.seasonality = (config.seasonality == Seasonality::NONE)     ? "none"
-                                        : (config.seasonality == Seasonality::HOURLY) ? "hourly"
-                                        : (config.seasonality == Seasonality::DAILY)  ? "daily"
-                                                                                      : "weekly";
-        result.statistics.anomalyCount = totalAnomalies;
-        result.statistics.totalPoints = totalPoints;
-
+        fillStatistics(result, config, tally);
         result.success = true;
 
     } catch (const std::exception& e) {

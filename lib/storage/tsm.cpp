@@ -4,6 +4,7 @@
 #include "float_encoder.hpp"
 #include "integer_encoder.hpp"
 #include "logger.hpp"
+#include "rollup_codec.hpp"
 #include "slice_buffer.hpp"
 #include "string_encoder.hpp"
 #include "zigzag.hpp"
@@ -336,6 +337,29 @@ seastar::future<> TSM::open() {
             throw std::runtime_error("TSM file too small (" + std::to_string(length) +
                                      " bytes, minimum 13): " + filePath);
         }
+        if (fileVersion >= 4) {
+            if (length < 21)
+                throw std::runtime_error("Truncated V4 TSM header");
+            auto countBytes = co_await tsmFile.dma_read_exactly<uint8_t>(5, 4);
+            uint32_t count = 0;
+            std::memcpy(&count, countBytes.get(), 4);
+            if (count > (length - 21) / 8)
+                throw std::runtime_error("Corrupt TSM compaction ancestry");
+            replacedFileRanks_.resize(count);
+            if (count) {
+                auto ranks = co_await tsmFile.dma_read_exactly<uint8_t>(9, static_cast<size_t>(count) * 8);
+                std::memcpy(replacedFileRanks_.data(), ranks.get(), ranks.size());
+            }
+            auto checksumBytes = co_await tsmFile.dma_read_exactly<uint8_t>(9 + static_cast<size_t>(count) * 8, 4);
+            uint32_t checksum = 0;
+            std::memcpy(&checksum, checksumBytes.get(), 4);
+            uint32_t crc = CRC32::update(CRC32::INIT, reinterpret_cast<const uint8_t*>(&count), 4);
+            if (count)
+                crc = CRC32::update(crc, reinterpret_cast<const uint8_t*>(replacedFileRanks_.data()),
+                                    static_cast<size_t>(count) * 8);
+            if (CRC32::finalize(crc) != checksum)
+                throw std::runtime_error("TSM compaction ancestry checksum mismatch");
+        }
         co_await readSparseIndex();
 
         // Load tombstones if they exist
@@ -396,13 +420,17 @@ seastar::future<> TSM::readSparseIndex() {
     std::memcpy(&indexOffset, indexOffsetBuf.get(), sizeof(uint64_t));
 
     // Validate indexOffset is within file bounds
-    if (indexOffset >= length - sizeof(uint64_t)) {
+    const uint64_t minimumIndexOffset = fileVersion >= 4 ? 13 + replacedFileRanks_.size() * 8 : 5;
+    if (indexOffset < minimumIndexOffset || indexOffset > length - sizeof(uint64_t)) {
         throw std::runtime_error("Corrupted TSM file: indexOffset " + std::to_string(indexOffset) +
                                  " is out of bounds (file size: " + std::to_string(length) + "): " + filePath);
     }
 
     // Read entire index section
-    auto indexBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexOffset, length - indexOffset - sizeof(uint64_t));
+    seastar::temporary_buffer<uint8_t> indexBuf;
+    if (indexOffset < length - sizeof(uint64_t)) {
+        indexBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexOffset, length - indexOffset - sizeof(uint64_t));
+    }
     Slice indexSlice(indexBuf.get(), indexBuf.size());
 
     // First pass: Parse index to collect series and build sparse index
@@ -445,9 +473,11 @@ seastar::future<> TSM::readSparseIndex() {
         // Peek at first/last block metadata from the index for sparse lookups.
         uint64_t seriesMinTime = 0;
         uint64_t seriesMaxTime = 0;
+        uint32_t seriesPointCount = 0;
         double firstValue = 0.0;
         double latestValue = 0.0;
         bool hasExtStats = false;
+        bool hasRollupData = false;
         bool boolFirst = false;
         bool boolLatest = false;
 
@@ -459,6 +489,33 @@ seastar::future<> TSM::readSparseIndex() {
             std::memcpy(&seriesMinTime, indexSlice.data + blockStart, sizeof(uint64_t));
             // Last block: maxTime at offset 8
             std::memcpy(&seriesMaxTime, indexSlice.data + lastBlockStart + 8, sizeof(uint64_t));
+
+            // Sum the per-block point counts. This is the ONLY pass in this
+            // function that touches every block rather than just the first and
+            // last, and it exists so the age-driven downsample sweep can judge
+            // a series' stored density without a single disk read (see
+            // SparseIndexEntry::pointCount). It is a strided read over a buffer
+            // this function has already DMA'd in full, so the marginal cost is
+            // one pass over the index region — far below the read that fetched
+            // it. V1 non-Float entries carry no count and stay at 0, which the
+            // sweep reads as "unknown, do not act".
+            if (auto countOffset = indexBlockCountOffset(seriesType, fileVersion); countOffset.has_value()) {
+                const uint8_t* blockBase = indexSlice.data + blockStart + *countOffset;
+                // Saturating: the accumulator is uint32 (it lives in an
+                // alignment hole, see SparseIndexEntry::pointCount) and a
+                // corrupt index could otherwise wrap it to a small number,
+                // which the sweep would read as a genuinely sparse series.
+                // Saturation reads as "very dense", the safe direction.
+                for (uint32_t b = 0; b < blockCount; ++b) {
+                    uint32_t blockPoints = 0;
+                    std::memcpy(&blockPoints, blockBase + static_cast<size_t>(b) * perBlockBytes, sizeof(uint32_t));
+                    if (blockPoints > std::numeric_limits<uint32_t>::max() - seriesPointCount) {
+                        seriesPointCount = std::numeric_limits<uint32_t>::max();
+                        break;
+                    }
+                    seriesPointCount += blockPoints;
+                }
+            }
 
             // Float: blockFirstValue at offset 64, blockLatestValue at offset 72
             if (seriesType == TSMValueType::Float) {
@@ -490,6 +547,13 @@ seastar::future<> TSM::readSparseIndex() {
             }
         }
 
+        if (fileVersion >= 4) {
+            for (uint32_t b = 0; b < blockCount; ++b) {
+                uint32_t bytes = 0;
+                std::memcpy(&bytes, indexSlice.data + indexSlice.offset + b * perBlockBytes + perBlockBytes - 4, 4);
+                hasRollupData |= bytes != 0;
+            }
+        }
         // Skip over the blocks (don't parse them yet)
         indexSlice.offset += blockBytes;
 
@@ -533,13 +597,15 @@ seastar::future<> TSM::readSparseIndex() {
                                      .fileOffset = entryStartOffset,
                                      .entrySize = entrySize,
                                      .seriesType = seriesType,
+                                     .pointCount = seriesPointCount,
                                      .minTime = seriesMinTime,
                                      .maxTime = seriesMaxTime,
                                      .firstValue = firstValue,
                                      .latestValue = latestValue,
                                      .hasExtendedStats = hasExtStats,
                                      .boolFirstValue = boolFirst,
-                                     .boolLatestValue = boolLatest};
+                                     .boolLatestValue = boolLatest,
+                                     .hasRollups = hasRollupData};
         sparseIndex.insert({seriesId, sparseEntry});
 
         // Collect series ID for bloom filter
@@ -652,6 +718,8 @@ void TSM::parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uin
                 // No value stats for strings — blockCount enables COUNT pushdown
             }
         }
+        if (fileVersion >= 4)
+            block.rollupSize = indexSlice.read<uint32_t>();
         entry.indexBlocks.push_back(block);
     }
 
@@ -1143,7 +1211,7 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlockImpl(const TSM
     auto blockBuf = co_await coalescedDmaRead(indexBlock.offset, indexBlock.size);
     Slice blockSlice(blockBuf.get(), blockBuf.size());
 
-    // Everything from here on is synchronous. Whatever it throws is re-raised
+    // Decode failures, including rollup metadata reads, are re-raised
     // with the block's identity and the header values decoded so far
     // (rethrowWithBlockContext), so a production decode failure names the block
     // and says whether the descriptor or the bytes disagreed — not just the file.
@@ -1228,6 +1296,15 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlockImpl(const TSM
                                              " timestamps");
         }
 
+        if (indexBlock.rollupSize != 0) {
+            if (indexBlock.offset > length || indexBlock.size > length - indexBlock.offset ||
+                indexBlock.rollupSize > length - indexBlock.offset - indexBlock.size) {
+                throw std::runtime_error("Rollup metadata outside file");
+            }
+            auto metadata = co_await coalescedDmaRead(indexBlock.offset + indexBlock.size, indexBlock.rollupSize);
+            auto states = rollup_codec::decode(metadata.get(), metadata.size(), timestampSize);
+            blockResults->rollups.assign(states.begin() + nSkipped, states.begin() + nSkipped + nTimestamps);
+        }
         co_return blockResults;
     } catch (...) {
         rethrowWithBlockContext(indexBlock, &ctx);
@@ -1604,6 +1681,10 @@ seastar::future<> TSM::readBlockBatch(const BlockBatch& batch, uint64_t startTim
 template <class T>
 seastar::future<> TSM::readSeriesBatched(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
                                          TSMResult<T>& results) {
+    if (hasRollups(seriesId)) {
+        co_await readSeries<T>(seriesId, startTime, endTime, results);
+        co_return;
+    }
     // Get full index entry (uses bloom filter + sparse index + lazy load)
     auto* indexEntry = co_await getFullIndexEntry(seriesId);
     if (!indexEntry) {
@@ -2207,3 +2288,58 @@ template std::unique_ptr<TSMBlock<std::string>> TSM::decodeBlock<std::string>(Sl
 template std::unique_ptr<TSMBlock<int64_t>> TSM::decodeBlock<int64_t>(Slice& blockSlice, uint32_t blockSize,
                                                                       uint64_t startTime, uint64_t endTime,
                                                                       const std::vector<std::string>*);
+
+seastar::future<std::pair<uint64_t, uint64_t>> TSM::estimateRollupDensity(
+    const SeriesId128& seriesId, const std::vector<std::pair<uint64_t, uint64_t>>& stages) {
+    auto* entry = co_await getFullIndexEntry(seriesId);
+    if (!entry || stages.empty())
+        co_return std::pair<uint64_t, uint64_t>{0, 0};
+    auto blocks = entry->indexBlocks;
+    uint64_t before = 0, after = 0, lastBucket = 0;
+    bool seen = false;
+    uint64_t bucketCount = 0;
+    auto closeBucket = [&] {
+        // Already folded singleton buckets must not dilute the reduction in
+        // the older band: a week's minute data may contain just one newly
+        // eligible day, whose reduction is still 15x.
+        if (bucketCount > 1) {
+            before += bucketCount;
+            ++after;
+        }
+        bucketCount = 0;
+    };
+    for (const auto& block : blocks) {
+        if (block.minTime >= stages.front().first)
+            break;
+        auto data = co_await coalescedDmaRead(block.offset, block.size);
+        Slice input(data.get(), data.size());
+        auto header = input.getSlice(BLOCK_HEADER_SIZE);
+        header.read<uint8_t>();
+        const auto count = header.read<uint32_t>();
+        const auto bytes = header.read<uint32_t>();
+        if (bytes > input.bytesLeft() || !timestampCountIsPlausible(count, bytes)) {
+            throw std::runtime_error("Corrupt timestamps during rollup sweep");
+        }
+        auto encoded = input.getSlice(bytes);
+        std::vector<uint64_t> timestamps;
+        IntegerEncoder::decode(encoded, count, timestamps);
+        for (const auto ts : timestamps) {
+            uint64_t interval = 0;
+            for (const auto& [threshold, width] : stages)
+                if (ts < threshold)
+                    interval = width;
+            if (!interval)
+                continue;
+            const auto bucket = ts / interval * interval;
+            if (!seen || bucket != lastBucket) {
+                closeBucket();
+                seen = true;
+                lastBucket = bucket;
+            }
+            ++bucketCount;
+        }
+        co_await seastar::yield();
+    }
+    closeBucket();
+    co_return std::pair<uint64_t, uint64_t>{before, after};
+}

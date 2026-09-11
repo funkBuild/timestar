@@ -1,0 +1,36 @@
+[  0%] Built target seastar_http_request_parser
+[  0%] Built target seastar_http_chunk_parsers
+[  0%] Built target gtest
+[  0%] Built target seastar_http_response_parser
+[  0%] Built target seastar_proto_metrics2
+[  1%] Built target hwy
+[  7%] Built target roaring
+[ 14%] Built target libzstd_static
+[ 14%] Built target timestar_proto
+[ 14%] Built target gtest_main
+[ 33%] Built target seastar
+[ 35%] Built target libtimestar_proto_conv
+[ 51%] Built target libtimestar
+[ 51%] Built target timestar_index_crash_worker
+[ 51%] Building CXX object test/CMakeFiles/timestar_unit_test.dir/unit/storage/tsm_universal_stats_test.cpp.o
+[ 51%] Building CXX object test/CMakeFiles/timestar_unit_test.dir/unit/storage/wal_recovery_order_and_close_sync_test.cpp.o
+[ 51%] Building CXX object test/CMakeFiles/timestar_unit_test.dir/unit/storage/wal_file_manager_seastar_test.cpp.o
+[ 51%] Building CXX object test/CMakeFiles/timestar_unit_test.dir/unit/storage/wal_rollover_race_test.cpp.o
+[ 51%] Building CXX object test/CMakeFiles/timestar_unit_test.dir/unit/storage/wal_seastar_test.cpp.o
+[ 51%] Building CXX object test/CMakeFiles/timestar_unit_test.dir/unit/storage/wal_test.cpp.o
+[ 51%] Linking CXX executable timestar_unit_test
+[100%] Built target timestar_unit_test
+[  0%] Built target seastar_http_chunk_parsers
+[  0%] Built target seastar_proto_metrics2
+[  0%] Built target seastar_http_request_parser
+[  0%] Built target timestar_proto
+[  0%] Built target seastar_http_response_parser
+[  3%] Built target hwy
+[ 13%] Built target roaring
+[ 26%] Built target libzstd_static
+[ 63%] Built target seastar
+[ 66%] Built target libtimestar_proto_conv
+[ 96%] Built target libtimestar
+[ 96%] Building CXX object bin/CMakeFiles/timestar_http_server.dir/timestar_http_server.cpp.o
+[100%] Linking CXX executable timestar_http_server
+[100%] Built target timestar_http_server

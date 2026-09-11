@@ -14,6 +14,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <random>
 
@@ -663,7 +664,25 @@ TEST_F(ForecastNumericalTest, BelowMinimumDataPoints) {
 }
 
 TEST_F(ForecastNumericalTest, TwoDataPoints) {
-    // Edge case: exactly 2 data points
+    // Edge case: exactly 2 data points.
+    //
+    // BEHAVIOUR CHANGE (was: "with 2 points we can fit a perfect line", and
+    // asserted slope 10 / intercept 10).  Two points do determine a line
+    // exactly -- and that is the problem.  A 2-parameter model has k - 2 == 0
+    // degrees of freedom, so residualStdDev is forced to 0 and
+    // predictionIntervalWidth returns deviations * 0 == 0: the forecast came
+    // back with upper == lower == the prediction at every horizon point.  A
+    // zero-width confidence band is indistinguishable, to any client, from a
+    // band the model is genuinely certain about, and under fan-out it arrives
+    // labelled with a real device's tags inside a "status":"success" response.
+    //
+    // This pinned the DIRECT LinearForecaster API with an explicit
+    // minDataPoints=2; it is not a documented public behaviour (neither
+    // docs/forecasting.md nor docs/api-derived.md mentions a two-point fit), so
+    // it is adapted here to assert the decline rather than kept.  The
+    // regression itself is untouched -- fitLinearRegression still computes the
+    // exact line through two points; what is refused is PUBLISHING it as a
+    // forecast carrying an uncertainty estimate it does not have.
     std::vector<double> values = {10.0, 20.0};
     auto timestamps = generateTimestamps(2);
     auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 3);
@@ -679,8 +698,30 @@ TEST_F(ForecastNumericalTest, TwoDataPoints) {
     LinearForecaster forecaster;
     auto output = forecaster.forecast(input, config, forecastTs);
 
-    // With 2 points, we can fit a perfect line
-    EXPECT_FALSE(output.empty());
+    EXPECT_TRUE(output.empty()) << "2 points carry no uncertainty information; a band derived from them is fabricated";
+}
+
+TEST_F(ForecastNumericalTest, ThreeDataPointsIsTheSmallestAcceptedFit) {
+    // The boundary on the other side of TwoDataPoints: three points give one
+    // degree of freedom, so residualStdDev is a real (here exactly zero,
+    // because the points are collinear) estimate rather than a forced 0, and
+    // the fit is published.
+    std::vector<double> values = {10.0, 20.0, 30.0};
+    auto timestamps = generateTimestamps(3);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 3);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.minDataPoints = 2;
+
+    LinearForecaster forecaster;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    ASSERT_FALSE(output.empty());
     EXPECT_NEAR(output.slope, 10.0, 1e-6);
     EXPECT_NEAR(output.intercept, 10.0, 1e-6);
 }
@@ -2758,8 +2799,18 @@ TEST_F(ForecastNumericalTest, ExecuteMultiEmptyTimestampsReportsFailure) {
     EXPECT_FALSE(result.errorMessage.empty());
 }
 
-TEST_F(ForecastNumericalTest, ExecuteMultiTwoPointsSucceeds) {
-    // executeMulti() with 2 points and minDataPoints = 2 must succeed
+TEST_F(ForecastNumericalTest, ExecuteMultiTwoPointsDeclinesTheGroupButStillSucceeds) {
+    // executeMulti() with 2 points and minDataPoints = 2.
+    //
+    // BEHAVIOUR CHANGE (was: "must succeed" with 4 pieces).  The RUN succeeds
+    // -- the axis and the forecast window are still computed and reported --
+    // but the one group is DECLINED, because a 2-point fit has zero residual
+    // degrees of freedom and its confidence band would be exactly zero wide.
+    // See ForecastNumericalTest.TwoDataPoints for the full reasoning.
+    //
+    // This is the shape of the fix that matters: an empty `series` with a
+    // non-zero declined count, not an error.  Declining to fabricate a number
+    // is not a failed read.
     uint64_t start = 1704067200000000000ULL;
     uint64_t interval = 60000000000ULL;
     std::vector<uint64_t> timestamps = {start, start + interval};
@@ -2776,11 +2827,14 @@ TEST_F(ForecastNumericalTest, ExecuteMultiTwoPointsSucceeds) {
     auto result = executor.executeMulti(timestamps, seriesValues, groupTags, config);
 
     EXPECT_TRUE(result.success);
-    // times = 2 historical + 3 forecast
+    // times = 2 historical + 3 forecast — unchanged, the axis does not depend
+    // on whether any group could be fitted.
     EXPECT_EQ(result.times.size(), 5u);
     EXPECT_EQ(result.forecastStartIndex, 2u);
-    // 4 pieces (past, forecast, upper, lower)
-    EXPECT_EQ(result.series.size(), 4u);
+
+    EXPECT_EQ(result.series.size(), 0u);
+    EXPECT_EQ(result.statistics.seriesCount, 0u) << "series_count reports what was EMITTED";
+    EXPECT_EQ(result.statistics.declinedSeriesCount, 1u) << "the declined group must be reported, not vanish";
 }
 
 // ==================== All-NaN Input Safety Tests ====================
@@ -3433,4 +3487,487 @@ TEST_F(ForecastNumericalTest, LinearForecaster_DuplicateTimestamps_FiniteOutput)
         EXPECT_TRUE(std::isfinite(output.lower[i]))
             << "LinearForecaster duplicate timestamps: lower[" << i << "] is not finite";
     }
+}
+
+// ===========================================================================
+// NaN = missing: gaps must cost the fit NOTHING
+//
+// Bug: the three accumulation loops in fitLinearRegression claimed to "skip
+// NaN values by zeroing their weight", but 0.0 * NaN is NaN -- so a single
+// missing value poisoned sumWY / sumXY / sse and the entire fit came back NaN
+// (slope, intercept and residualStdDev all serialized as null).  A fit over
+// y = 2x + 5 with a few holes in it must still recover slope 2 and intercept
+// 5 exactly, since the surviving points lie exactly on that line.
+//
+// This became load-bearing when forecast() started fanning out over several
+// groups: the groups share one time axis, and a group with no point at some
+// timestamp carries NaN there (docs/nan_policy.md).
+// ===========================================================================
+TEST_F(ForecastNumericalTest, LinearRegressionSkipsNaNGapsEntirely) {
+    std::vector<double> values(100);
+    for (size_t i = 0; i < 100; ++i) {
+        values[i] = 2.0 * static_cast<double>(i) + 5.0;
+    }
+    // Punch holes: leading, interior and trailing.
+    for (size_t i : {size_t(0), size_t(1), size_t(37), size_t(38), size_t(63), size_t(99)}) {
+        values[i] = std::numeric_limits<double>::quiet_NaN();
+    }
+
+    auto timestamps = generateTimestamps(100);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 10);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.deviations = 2.0;
+
+    LinearForecaster forecaster;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    ASSERT_FALSE(std::isnan(output.slope)) << "REGRESSION: a NaN gap poisoned the fit";
+    EXPECT_NEAR(output.slope, 2.0, 1e-10);
+    EXPECT_NEAR(output.intercept, 5.0, 1e-10);
+    EXPECT_NEAR(output.rSquared, 1.0, 1e-10);
+    EXPECT_NEAR(output.residualStdDev, 0.0, 1e-10);
+
+    // ...and the projection itself is finite.
+    ASSERT_FALSE(output.forecast.empty());
+    for (double v : output.forecast) {
+        EXPECT_TRUE(std::isfinite(v));
+    }
+}
+
+// Half the axis missing -- the shape a two-group fan-out over devices sampled
+// on disjoint offsets produces -- is still an exact fit on the points present.
+TEST_F(ForecastNumericalTest, LinearRegressionFitsAnAlternatingHalfNaNSeries) {
+    std::vector<double> values(100);
+    for (size_t i = 0; i < 100; ++i) {
+        values[i] = (i % 2 == 0) ? (3.0 * static_cast<double>(i) - 7.0) : std::numeric_limits<double>::quiet_NaN();
+    }
+
+    auto timestamps = generateTimestamps(100);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 10);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.deviations = 2.0;
+
+    LinearForecaster forecaster;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    EXPECT_NEAR(output.slope, 3.0, 1e-10);
+    EXPECT_NEAR(output.intercept, -7.0, 1e-10);
+}
+
+// An all-NaN input has no regression to compute, so the forecaster must
+// DECLINE -- return an empty output, which ForecastExecutor::executeMulti()
+// skips -- rather than answer.
+//
+// It used to answer.  The minDataPoints gate measured the AXIS LENGTH (100
+// here), not the finite-point count (0), so fitLinearRegression's
+// sumWeights <= 0 branch escaped as a real result: a constant 0.0 forecast
+// with a zero-width confidence band.  Under fan-out that reached the wire
+// labelled with a real device's group_tags inside a "status":"success"
+// response -- a device that had simply stopped reporting was presented as
+// forecast to sit at exactly zero, with no uncertainty.  The same input under
+// algorithm='seasonal' was omitted, because SeasonalForecaster::forecast()
+// already had this guard; that asymmetry was the tell.
+TEST_F(ForecastNumericalTest, LinearRegressionAllNaNInputIsDeclinedNotFabricated) {
+    std::vector<double> values(100, std::numeric_limits<double>::quiet_NaN());
+
+    auto timestamps = generateTimestamps(100);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 10);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.deviations = 2.0;
+
+    LinearForecaster forecaster;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    EXPECT_TRUE(output.empty()) << "an all-NaN group must be declined, not answered with a fabricated zero";
+    EXPECT_TRUE(output.forecast.empty());
+    EXPECT_TRUE(output.upper.empty());
+    EXPECT_TRUE(output.lower.empty());
+    EXPECT_EQ(output.forecastCount, 0u);
+
+    // ...and the same input under 'seasonal' is declined too, which is the
+    // symmetry the fix restores.
+    ForecastConfig seasonalConfig = config;
+    seasonalConfig.algorithm = Algorithm::SEASONAL;
+    SeasonalForecaster seasonal;
+    EXPECT_TRUE(seasonal.forecast(input, seasonalConfig, forecastTs).empty());
+}
+
+// ===========================================================================
+// D-B / D-C: the minDataPoints gate counts FINITE points, not axis slots.
+//
+// Under fan-out a group is projected onto the union of every group's
+// timestamps and carries NaN wherever it has no sample, so the axis length
+// says nothing about how much data the group actually has.
+// ===========================================================================
+
+// A group with real but too-few points on a long axis is declined.  This is
+// D-C's shape: 6 daily points on a 30-slot axis used to produce a flat line
+// projected 30 days past the last sample.
+TEST_F(ForecastNumericalTest, LinearSparseGroupBelowMinDataPointsIsDeclined) {
+    std::vector<double> values(30, std::numeric_limits<double>::quiet_NaN());
+    for (size_t i = 0; i < 6; ++i) {
+        values[i * 5] = 10.0 + 2.0 * static_cast<double>(i);
+    }
+
+    auto timestamps = generateTimestamps(30);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 5);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.minDataPoints = 10;  // the default
+
+    LinearForecaster forecaster;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    EXPECT_TRUE(output.empty()) << "6 finite points on a 30-slot axis is 6 points, not 30";
+}
+
+// A single finite point is the extreme of the same case: it used to fit
+// slope 0 / r^2 = 1.0 / residualStdDev 0 -- a "perfect fit" with zero error
+// bars on one observation.
+TEST_F(ForecastNumericalTest, LinearSingleFinitePointGroupIsDeclined) {
+    std::vector<double> values(30, std::numeric_limits<double>::quiet_NaN());
+    values[7] = 100.0;
+
+    auto timestamps = generateTimestamps(30);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 5);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.minDataPoints = 10;
+
+    LinearForecaster forecaster;
+    EXPECT_TRUE(forecaster.forecast(input, config, forecastTs).empty());
+
+    // Even with minDataPoints lowered to 1, one point cannot determine a line:
+    // the fit-level guard declines it rather than reporting a zero-uncertainty
+    // horizontal line through it.
+    config.minDataPoints = 1;
+    EXPECT_TRUE(forecaster.forecast(input, config, forecastTs).empty());
+}
+
+// Two finite points on a long axis are DECLINED, and three are not: the fit
+// uses the points' own positions -- not the axis -- so the slope of the
+// accepted case is the real one.
+//
+// The two-point case previously returned a fit with residualStdDev == 0, on
+// the reasoning that "two points determine the line exactly, so a zero band is
+// honest".  That reasoning is wrong at the wire: the response cannot say "this
+// band is zero because there is no residual to estimate" as distinct from
+// "this band is zero because the model is certain", and the caller reads the
+// latter.  A 2-parameter model needs k > 2 to have any residual degrees of
+// freedom at all.
+TEST_F(ForecastNumericalTest, LinearTwoFinitePointsOnALongAxisAreDeclined) {
+    std::vector<double> values(30, std::numeric_limits<double>::quiet_NaN());
+    values[10] = 100.0;
+    values[20] = 200.0;  // +10 per slot
+
+    auto timestamps = generateTimestamps(30);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 5);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.minDataPoints = 2;
+
+    LinearForecaster forecaster;
+    EXPECT_TRUE(forecaster.forecast(input, config, forecastTs).empty())
+        << "a 2-point fit has zero residual degrees of freedom, so its band is fabricated certainty";
+
+    // Three finite points on the same long axis ARE accepted, and the slope
+    // comes from the points' own slot positions rather than from the axis.
+    values[0] = 0.0;
+    input.values = values;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    ASSERT_FALSE(output.empty());
+    EXPECT_NEAR(output.slope, 10.0, 1e-9);
+    EXPECT_NEAR(output.intercept, 0.0, 1e-9);
+}
+
+// Exactly minDataPoints FINITE points on a much longer axis is accepted -- the
+// gate must not have become a gate on density.
+TEST_F(ForecastNumericalTest, LinearExactlyMinDataPointsFiniteOnALongAxisIsAccepted) {
+    std::vector<double> values(200, std::numeric_limits<double>::quiet_NaN());
+    for (size_t i = 0; i < 10; ++i) {
+        values[i * 19] = 5.0 + 3.0 * static_cast<double>(i * 19);
+    }
+
+    auto timestamps = generateTimestamps(200);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 5);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.minDataPoints = 10;
+
+    LinearForecaster forecaster;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    ASSERT_FALSE(output.empty());
+    EXPECT_NEAR(output.slope, 3.0, 1e-9);
+    EXPECT_NEAR(output.intercept, 5.0, 1e-9);
+}
+
+// ===========================================================================
+// D-D: residualStdDev divides by the FINITE point count.
+//
+// sqrt(sse * n / (sumWeights * (n - 2))) mixed two different counts: sse and
+// sumWeights are summed over the k finite points while n came from the axis.
+// The result was systematically too NARROW on sparse groups -- confidence the
+// fit does not have.
+// ===========================================================================
+
+// Same k points, two different axis lengths: the residual estimate must be
+// identical, because it describes the POINTS and nothing else.
+TEST_F(ForecastNumericalTest, LinearResidualStdDevIsIndependentOfAxisPadding) {
+    // 20 points on y = 2x + 5 with a deterministic unit residual whose
+    // pattern (+1, -1, -1, +1 per block of four) is orthogonal to BOTH the
+    // constant and the x column, so least squares recovers y = 2x + 5 exactly
+    // and SSE is exactly the point count.  An alternating +1/-1 residual is
+    // NOT orthogonal to x and would tilt the fit.
+    auto makeValues = [](size_t stride, size_t axisLen) {
+        std::vector<double> values(axisLen, std::numeric_limits<double>::quiet_NaN());
+        for (size_t i = 0; i < 20; ++i) {
+            const size_t slot = i * stride;
+            const double residual = (i % 4 == 0 || i % 4 == 3) ? 1.0 : -1.0;
+            values[slot] = 2.0 * static_cast<double>(slot) + 5.0 + residual;
+        }
+        return values;
+    };
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.minDataPoints = 10;
+    LinearForecaster forecaster;
+
+    // Dense: 20 points on a 20-slot axis (k == n, the classic case).
+    ForecastInput dense;
+    dense.timestamps = generateTimestamps(20);
+    dense.values = makeValues(1, 20);
+    auto denseOut =
+        forecaster.forecast(dense, config, ForecastExecutor::generateForecastTimestamps(dense.timestamps, 3));
+
+    // Sparse: the SAME 20 points, spread over a 200-slot axis.
+    ForecastInput sparse;
+    sparse.timestamps = generateTimestamps(200);
+    sparse.values = makeValues(10, 200);
+    auto sparseOut =
+        forecaster.forecast(sparse, config, ForecastExecutor::generateForecastTimestamps(sparse.timestamps, 3));
+
+    ASSERT_FALSE(denseOut.empty());
+    ASSERT_FALSE(sparseOut.empty());
+
+    // The two fits are over points with the same residual structure, just
+    // rescaled in x; the residual standard deviation is the same number.
+    EXPECT_NEAR(sparseOut.residualStdDev, denseOut.residualStdDev, 1e-9)
+        << "residualStdDev must divide by the finite point count, not the axis length";
+
+    // And it is the textbook sqrt(SSE / (k - 2)): 20 residuals of magnitude 1
+    // about a line the least-squares fit reproduces exactly.
+    EXPECT_NEAR(denseOut.slope, 2.0, 1e-9);
+    EXPECT_NEAR(denseOut.intercept, 5.0, 1e-9);
+    EXPECT_NEAR(denseOut.residualStdDev, std::sqrt(20.0 / 18.0), 1e-9);
+}
+
+// The direction of the old error matters: it was too NARROW, and increasingly
+// so as the group got sparser.  k=3 on an n=200 axis was measured 42% low.
+TEST_F(ForecastNumericalTest, LinearResidualStdDevIsNotDeflatedByNaNPadding) {
+    const size_t kAxis = 200;
+    std::vector<double> values(kAxis, std::numeric_limits<double>::quiet_NaN());
+    // 12 finite points with a known unit residual about y = x, in the
+    // (+1, -1, -1, +1) pattern that is orthogonal to both fitted columns, so
+    // SSE is exactly 12.
+    for (size_t i = 0; i < 12; ++i) {
+        const size_t slot = i * 16;
+        values[slot] = static_cast<double>(slot) + ((i % 4 == 0 || i % 4 == 3) ? 1.0 : -1.0);
+    }
+
+    ForecastInput input;
+    input.timestamps = generateTimestamps(kAxis);
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.minDataPoints = 10;
+
+    LinearForecaster forecaster;
+    auto output = forecaster.forecast(input, config, ForecastExecutor::generateForecastTimestamps(input.timestamps, 3));
+
+    ASSERT_FALSE(output.empty());
+
+    const double correct = std::sqrt(12.0 / 10.0);                     // sqrt(SSE / (k - 2)), k = 12
+    const double oldWrong = std::sqrt(12.0 * 200.0 / (12.0 * 198.0));  // sse * n / (sumW * (n - 2))
+    EXPECT_NEAR(output.residualStdDev, correct, 1e-9);
+    EXPECT_GT(output.residualStdDev, oldWrong) << "the old estimate was too narrow; the fix must widen it";
+}
+
+// The weighted (REACTIVE) model keeps its weighting: with all points finite
+// the expression is unchanged from before, since sumWeights and k are then the
+// only two quantities involved and n == k.
+//
+// REACTIVE is the case that motivates the sse * k / (sumW * (k - 2)) form at
+// all -- it is the only model whose weights are not all 1, so it is the only
+// one where that form differs from the textbook sqrt(SSE / (k - 2)).  The
+// assertion is therefore the VALUE, computed here by an independent long
+// double reference implementation of weighted OLS (straight loops, no SIMD, no
+// Kahan compensation, weights derived from the documented
+// w[i] = exp(-lambda * (n - 1 - i)) rule).  Asserting only isfinite() and > 0,
+// as this test originally did, would pass for sqrt(SSE / (k - 2)), for
+// sqrt(SSE / sumW), and for any other plausible mis-derivation -- it tested
+// nothing the name claims.
+//
+// The data is deterministic and analytically plain (a line plus a fixed
+// alternating residual) so the expected value does not depend on any
+// implementation-defined RNG distribution.
+TEST_F(ForecastNumericalTest, LinearReactiveResidualStdDevUnchangedWhenEveryPointIsFinite) {
+    constexpr size_t kN = 60;
+    constexpr double kLambda = 0.05;  // must match LinearForecaster's REACTIVE decay
+
+    std::vector<double> values(kN);
+    for (size_t i = 0; i < kN; ++i) {
+        // A fixed, non-degenerate residual pattern: not orthogonal to the
+        // fitted columns, so the fit is not exact and SSE is genuinely
+        // weight-dependent.
+        const double residual = (i % 3 == 0) ? 1.0 : ((i % 3 == 1) ? -0.5 : 0.25);
+        values[i] = 1.5 * static_cast<double>(i) + 4.0 + residual;
+    }
+
+    ForecastInput input;
+    input.timestamps = generateTimestamps(kN);
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.linearModel = LinearModelType::REACTIVE;
+
+    LinearForecaster forecaster;
+    auto output = forecaster.forecast(input, config, ForecastExecutor::generateForecastTimestamps(input.timestamps, 3));
+
+    ASSERT_FALSE(output.empty());
+
+    // ---- independent long double reference -------------------------------
+    long double sumW = 0.0L, sumWX = 0.0L, sumWY = 0.0L;
+    std::vector<long double> w(kN);
+    for (size_t i = 0; i < kN; ++i) {
+        w[i] = std::exp(-static_cast<long double>(kLambda) * static_cast<long double>(kN - 1 - i));
+        sumW += w[i];
+        sumWX += w[i] * static_cast<long double>(i);
+        sumWY += w[i] * static_cast<long double>(values[i]);
+    }
+    const long double meanX = sumWX / sumW;
+    const long double meanY = sumWY / sumW;
+
+    long double sxy = 0.0L, sxx = 0.0L;
+    for (size_t i = 0; i < kN; ++i) {
+        const long double dx = static_cast<long double>(i) - meanX;
+        const long double dy = static_cast<long double>(values[i]) - meanY;
+        sxy += w[i] * dx * dy;
+        sxx += w[i] * dx * dx;
+    }
+    const long double slope = sxy / sxx;
+    const long double intercept = meanY - slope * meanX;
+
+    long double sse = 0.0L;
+    for (size_t i = 0; i < kN; ++i) {
+        const long double r = static_cast<long double>(values[i]) - (slope * static_cast<long double>(i) + intercept);
+        sse += w[i] * r * r;
+    }
+
+    const long double k = static_cast<long double>(kN);
+    const long double expected = std::sqrt(sse * k / (sumW * (k - 2.0L)));
+
+    EXPECT_NEAR(output.slope, static_cast<double>(slope), 1e-9);
+    EXPECT_NEAR(output.intercept, static_cast<double>(intercept), 1e-9);
+    EXPECT_NEAR(output.residualStdDev, static_cast<double>(expected), 1e-12);
+
+    // The weighting is load-bearing: the value must NOT be the unweighted
+    // textbook estimate, or the k/(k-2) correction and the 1/sumW scaling are
+    // cancelling out by accident rather than being applied.
+    const double unweighted = static_cast<double>(std::sqrt(sse / (k - 2.0L)));
+    EXPECT_GT(std::abs(output.residualStdDev - unweighted), 1e-6)
+        << "REACTIVE must divide the weighted SSE by sumWeights, not by k - 2 alone";
+    EXPECT_TRUE(std::isfinite(output.residualStdDev));
+    EXPECT_GT(output.residualStdDev, 0.0);
+}
+
+// ===========================================================================
+// R6: a ForecastInput whose value column is shorter than its timestamp column
+// must not be read past its end.
+//
+// ForecastInput::size() is the TIMESTAMP count and nothing in the type ties
+// the two vectors together.  Before the finite-point gate existed, the DEFAULT
+// model's first use of the values was `y = input.values`, and a length
+// mismatch surfaced as fitLinearRegression's "x, y and weights must have the
+// same size" throw.  The gate now scans input.values[i] for every
+// i < timestamps.size() BEFORE that throw is reachable, so the check has to
+// happen up front.  Not demonstrated reachable from any caller in this tree --
+// hardening, and cheap.
+// ===========================================================================
+TEST_F(ForecastNumericalTest, ShortValueColumnIsClampedNotReadPastItsEnd) {
+    ForecastInput input;
+    input.timestamps = generateTimestamps(30);
+    // Only 12 values for 30 timestamps.
+    for (size_t i = 0; i < 12; ++i) {
+        input.values.push_back(5.0 + 3.0 * static_cast<double>(i));
+    }
+
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(input.timestamps, 4);
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.minDataPoints = 10;
+
+    LinearForecaster forecaster;
+
+    for (auto model : {LinearModelType::DEFAULT, LinearModelType::SIMPLE, LinearModelType::REACTIVE}) {
+        config.linearModel = model;
+        // No throw, no out-of-bounds read: the input is treated as the 12
+        // points it really carries.
+        ForecastOutput output;
+        ASSERT_NO_THROW(output = forecaster.forecast(input, config, forecastTs));
+        ASSERT_FALSE(output.empty()) << "12 points clears minDataPoints=10";
+        EXPECT_EQ(output.historicalCount, 12u) << "the historical window is the values, not the timestamps";
+        EXPECT_EQ(output.past.size(), output.historicalCount);
+        EXPECT_NEAR(output.slope, 3.0, 1e-9);
+        EXPECT_NEAR(output.intercept, 5.0, 1e-9);
+    }
+
+    // ...and a value column shorter than minDataPoints is declined on the
+    // strength of its OWN length, not the timestamp column's.
+    input.values.resize(4);
+    config.linearModel = LinearModelType::DEFAULT;
+    EXPECT_TRUE(forecaster.forecast(input, config, forecastTs).empty());
 }

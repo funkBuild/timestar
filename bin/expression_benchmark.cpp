@@ -4,10 +4,8 @@
 // Build: add_executable(expression_benchmark expression_benchmark.cpp)
 //        target_link_libraries(expression_benchmark libtimestar benchmark::benchmark)
 //
-// Run:   ./bin/expression_benchmark \
-//            --benchmark_repetitions=10 \
-//            --benchmark_report_aggregates_only=true \
-//            --benchmark_display_aggregates_only=true
+// Run:   ./bin/expression_benchmark --benchmark_repetitions=10
+//        --benchmark_report_aggregates_only=true --benchmark_display_aggregates_only=true
 
 #include "expression_evaluator.hpp"
 #include "expression_parser.hpp"

@@ -330,7 +330,8 @@ seastar::future<> run_benchmark(seastar::sharded<Engine>& engine) {
     size_t tsmFiles = 0;
     size_t walFiles = 0;
 
-    for (int i = 0; i < seastar::smp::count; ++i) {
+    // `seastar::smp::count` is unsigned; matching it avoids -Wsign-compare.
+    for (unsigned i = 0; i < seastar::smp::count; ++i) {
         std::string shardPath = "shard_" + std::to_string(i);
         if (fs::exists(shardPath)) {
             for (const auto& entry : fs::recursive_directory_iterator(shardPath)) {

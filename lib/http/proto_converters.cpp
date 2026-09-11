@@ -510,14 +510,25 @@ ParsedRetentionPutRequest parseRetentionPutRequest(const void* data, size_t size
     result.measurement = req.measurement();
     result.ttl = req.ttl();
 
-    if (req.has_downsample()) {
+    auto toDownsampleData = [](const ::timestar_pb::DownsamplePolicy& pb) {
         ParsedRetentionPutRequest::DownsampleData ds;
-        ds.after = req.downsample().after();
-        ds.afterNanos = req.downsample().after_nanos();
-        ds.interval = req.downsample().interval();
-        ds.intervalNanos = req.downsample().interval_nanos();
-        ds.method = req.downsample().method();
-        result.downsample = std::move(ds);
+        ds.after = pb.after();
+        ds.afterNanos = pb.after_nanos();
+        ds.interval = pb.interval();
+        ds.intervalNanos = pb.interval_nanos();
+        ds.method = pb.method();
+        for (const auto& [field, method] : pb.field_methods()) {
+            ds.fieldMethods.emplace(field, method);
+        }
+        return ds;
+    };
+
+    if (req.has_downsample()) {
+        result.downsample = toDownsampleData(req.downsample());
+    }
+    result.downsampleTiers.reserve(static_cast<size_t>(req.downsample_tiers_size()));
+    for (const auto& tier : req.downsample_tiers()) {
+        result.downsampleTiers.push_back(toDownsampleData(tier));
     }
 
     return result;
@@ -532,13 +543,25 @@ std::string formatRetentionGetResponse(const RetentionPolicyData& policy) {
     pbPolicy->set_ttl(policy.ttl);
     pbPolicy->set_ttl_nanos(policy.ttlNanos);
 
+    auto fillDownsample = [](::timestar_pb::DownsamplePolicy* ds,
+                             const ParsedRetentionPutRequest::DownsampleData& src) {
+        ds->set_after(src.after);
+        ds->set_after_nanos(src.afterNanos);
+        ds->set_interval(src.interval);
+        ds->set_interval_nanos(src.intervalNanos);
+        ds->set_method(src.method);
+        for (const auto& [field, method] : src.fieldMethods) {
+            (*ds->mutable_field_methods())[field] = method;
+        }
+    };
+
+    // Both representations go on the wire: the cascade, plus the legacy
+    // single-tier mirror so a pre-cascade client still sees the finest tier.
     if (policy.downsample.has_value()) {
-        auto* ds = pbPolicy->mutable_downsample();
-        ds->set_after(policy.downsample->after);
-        ds->set_after_nanos(policy.downsample->afterNanos);
-        ds->set_interval(policy.downsample->interval);
-        ds->set_interval_nanos(policy.downsample->intervalNanos);
-        ds->set_method(policy.downsample->method);
+        fillDownsample(pbPolicy->mutable_downsample(), *policy.downsample);
+    }
+    for (const auto& tier : policy.downsampleTiers) {
+        fillDownsample(pbPolicy->add_downsample_tiers(), tier);
     }
 
     std::string out;
@@ -670,6 +693,7 @@ ParsedDerivedQueryRequest parseDerivedQueryRequest(const void* data, size_t size
     result.startTime = req.start_time();
     result.endTime = req.end_time();
     result.aggregationInterval = req.aggregation_interval();
+    result.multiSeries = req.multi_series();
 
     for (const auto& sub : req.queries()) {
         result.queries[sub.name()] = sub.query();
@@ -694,11 +718,31 @@ std::string formatDerivedQueryResponse(const DerivedQueryResultData& result) {
         resp.set_compressed_values(vEncoded.data.data(), vEncoded.dataByteSize());
     }
 
+    // Per-group results (multi_series opt-in only).  Compressed exactly like
+    // the flat columns above -- an existing protobuf client already has to read
+    // compressed_timestamps / compressed_values, so the array asks nothing new
+    // of it beyond the group_tags.
+    for (const auto& series : result.series) {
+        auto* pbSeries = resp.add_series();
+        for (const auto& groupTag : series.groupTags) {
+            pbSeries->add_group_tags(groupTag);
+        }
+        if (!series.timestamps.empty()) {
+            auto tsEncoded = IntegerEncoder::encode(std::span<const uint64_t>(series.timestamps));
+            pbSeries->set_compressed_timestamps(tsEncoded.data.data(), tsEncoded.size());
+        }
+        if (!series.values.empty()) {
+            auto vEncoded = FloatEncoder::encode(std::span<const double>(series.values));
+            pbSeries->set_compressed_values(vEncoded.data.data(), vEncoded.dataByteSize());
+        }
+    }
+
     auto* stats = resp.mutable_statistics();
     stats->set_point_count(result.stats.pointCount);
     stats->set_execution_time_ms(result.stats.executionTimeMs);
     stats->set_sub_queries_executed(result.stats.subQueriesExecuted);
     stats->set_points_dropped_due_to_alignment(result.stats.pointsDroppedDueToAlignment);
+    stats->set_group_count(result.stats.groupCount);
 
     std::string out;
     resp.SerializeToString(&out);
@@ -748,6 +792,7 @@ std::string formatAnomalyResponse(const AnomalyQueryResultData& result) {
     stats->set_anomaly_count(result.statistics.anomalyCount);
     stats->set_total_points(result.statistics.totalPoints);
     stats->set_execution_time_ms(result.statistics.executionTimeMs);
+    stats->set_declined_series_count(result.statistics.declinedSeriesCount);
 
     std::string out;
     resp.SerializeToString(&out);
@@ -802,6 +847,7 @@ std::string formatForecastResponse(const ForecastQueryResultData& result) {
     stats->set_forecast_points(result.statistics.forecastPoints);
     stats->set_series_count(result.statistics.seriesCount);
     stats->set_execution_time_ms(result.statistics.executionTimeMs);
+    stats->set_declined_series_count(result.statistics.declinedSeriesCount);
 
     std::string out;
     resp.SerializeToString(&out);

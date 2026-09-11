@@ -297,7 +297,27 @@ struct ForecastStatistics {
     // Counts
     size_t historicalPoints = 0;
     size_t forecastPoints = 0;
+
+    // Groups actually EMITTED into `series` -- NOT the number of groups the
+    // sub-query resolved to.  A group the forecaster declines (too few finite
+    // observations to fit a line that carries any uncertainty) contributes to
+    // declinedSeriesCount below and to nothing else, so
+    // `seriesCount + declinedSeriesCount` is the resolved group count.
+    //
+    // Counting the INPUT groups here made the response assert data it did not
+    // contain: a two-device leg where one device was declined reported
+    // series_count 2 and returned one group's pieces, so a client could not
+    // tell "that device has too little data" from "that device does not
+    // exist".
     size_t seriesCount = 0;
+
+    // Groups the forecaster DECLINED.  Declining is not a failed read -- there
+    // is nothing wrong with the stored data, the fit simply has no uncertainty
+    // information to report -- so it is not the QUERY_INCOMPLETE case in
+    // CLAUDE.md's "Incomplete Results Are Failures" rule.  But the response
+    // must still carry the fact rather than silently returning fewer groups
+    // than it claims.
+    size_t declinedSeriesCount = 0;
 
     // Windowing
     size_t originalPoints = 0;

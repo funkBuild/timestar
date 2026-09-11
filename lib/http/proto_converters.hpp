@@ -111,16 +111,31 @@ struct SubscriptionStatsData {
     uint64_t eventsSent = 0;
 };
 
+// Mirrors timestar::DerivedSeriesResult — one (tag set x field) group of a
+// multi-series derived result.
+struct DerivedSeriesData {
+    std::vector<std::string> groupTags;
+    std::vector<uint64_t> timestamps;
+    std::vector<double> values;
+};
+
 // Mirrors timestar::DerivedQueryResult
 struct DerivedQueryResultData {
     std::vector<uint64_t> timestamps;
     std::vector<double> values;
+    // Empty unless the request set multi_series — and then it is the whole
+    // answer at every group count, the flat columns above staying empty.
+    std::vector<DerivedSeriesData> series;
     std::string formula;
     struct Stats {
         size_t pointCount = 0;
         double executionTimeMs = 0.0;
         size_t subQueriesExecuted = 0;
+        // SUM across groups on the multi-series path.
         size_t pointsDroppedDueToAlignment = 0;
+        // Groups the formula was evaluated over — see
+        // DerivedQueryStatistics.group_count in proto/timestar.proto.
+        size_t groupCount = 0;
     } stats;
 };
 
@@ -144,6 +159,9 @@ struct AnomalyQueryResultData {
         size_t anomalyCount = 0;
         size_t totalPoints = 0;
         double executionTimeMs = 0.0;
+        // Groups resolved but declined for want of observations — see
+        // AnomalyStatistics.declined_series_count in proto/timestar.proto.
+        size_t declinedSeriesCount = 0;
     } statistics;
     std::string errorMessage;
 };
@@ -168,6 +186,9 @@ struct ForecastStatisticsData {
     size_t forecastPoints = 0;
     size_t seriesCount = 0;
     double executionTimeMs = 0.0;
+    // Groups resolved but declined for want of observations — see
+    // ForecastStatistics.declined_series_count in proto/timestar.proto.
+    size_t declinedSeriesCount = 0;
 };
 
 // Mirrors timestar::forecast::ForecastQueryResult
@@ -322,8 +343,17 @@ struct ParsedRetentionPutRequest {
         std::string interval;
         uint64_t intervalNanos = 0;
         std::string method;
+        // Per-field method overrides; empty means "no overrides", which is what
+        // a client that predates the field always sends.
+        std::map<std::string, std::string> fieldMethods;
     };
+    // Legacy single-tier field, kept for clients that predate the cascade.
     std::optional<DownsampleData> downsample;
+    // Canonical ordered cascade. When non-empty it WINS over `downsample`;
+    // when empty the legacy field is promoted to a one-element cascade by the
+    // handler. proto3 repeated-absent is empty, so old clients land here with
+    // nothing set and are unaffected.
+    std::vector<DownsampleData> downsampleTiers;
 };
 
 // Parse a RetentionPutRequest proto from raw bytes.
@@ -334,7 +364,10 @@ struct RetentionPolicyData {
     std::string measurement;
     std::string ttl;
     uint64_t ttlNanos = 0;
+    // Mirrors the wire message: `downsample` is the legacy view of
+    // downsampleTiers[0], emitted alongside the full cascade.
     std::optional<ParsedRetentionPutRequest::DownsampleData> downsample;
+    std::vector<ParsedRetentionPutRequest::DownsampleData> downsampleTiers;
 };
 
 // Format retention get response as serialized RetentionGetResponse proto bytes.
@@ -380,6 +413,11 @@ struct ParsedDerivedQueryRequest {
     uint64_t startTime = 0;
     uint64_t endTime = 0;
     std::string aggregationInterval;
+    // Opt in to per-group evaluation of an arithmetic formula — see
+    // DerivedQueryRequest.multi_series in proto/timestar.proto.  The /derived
+    // handler re-serializes this request as JSON for the executor, so this must
+    // be carried across or the flag is unreachable from a protobuf client.
+    bool multiSeries = false;
 };
 
 // Parse a DerivedQueryRequest proto from raw bytes.

@@ -40,6 +40,12 @@ private:
         double residualStdDev;
         double sumSquaredX;  // For prediction intervals
         double meanX;
+
+        // How many points ACTUALLY entered the fit: the finite (x, y) pairs,
+        // which on a fan-out group is far fewer than the shared axis is long.
+        // Every "per observation" quantity divides by this, never by the axis
+        // length -- see the residual-std-dev block in fitLinearRegression().
+        size_t usedPoints;
     };
 
     LinearFit fitLinearRegression(const std::vector<double>& x, const std::vector<double>& y,

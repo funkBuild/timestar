@@ -40,67 +40,84 @@ static RetentionPolicyRequest parseRequest(const std::string& json) {
 }
 
 // ---------------------------------------------------------------------------
-// Replicate the validation logic from handlePut so that we can test all the
-// rejection paths without needing a live Seastar reactor.  Returns an empty
-// string on success, or the error message on failure.
+// The tiers a request asks for. `downsample` is raw JSON on the wire because it
+// accepts an object (legacy, one tier) or an array (the cascade); this is the
+// same dispatch handlePut performs.
+// ---------------------------------------------------------------------------
+static std::vector<DownsamplePolicy> requestTiers(const RetentionPolicyRequest& req) {
+    std::vector<DownsamplePolicy> tiers;
+    if (req.downsample.has_value()) {
+        auto why = timestar::retention::parseDownsampleRequestField(*req.downsample, tiers);
+        if (why.has_value()) {
+            throw std::runtime_error(*why);
+        }
+    }
+    return tiers;
+}
+
+// ---------------------------------------------------------------------------
+// Mirror handlePut's SEQUENCE (request-shape checks, then duration parsing,
+// then the shared validator) without needing a live Seastar reactor. Returns an
+// empty string on success, or the error message on failure.
+//
+// The rule checks themselves are deliberately NOT reimplemented here: they live
+// in timestar::retention::validateRetentionPolicy, which is the only copy. An
+// earlier version of this file replicated them, which is exactly how a test can
+// stay green while the production rule drifts away from it.
 // ---------------------------------------------------------------------------
 static std::string validatePutRequest(const RetentionPolicyRequest& req) {
     if (req.measurement.empty()) {
         return "'measurement' is required";
     }
-    if (!req.ttl.has_value() && !req.downsample.has_value()) {
+
+    std::vector<DownsamplePolicy> tiers;
+    try {
+        tiers = requestTiers(req);
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+
+    if (!req.ttl.has_value() && tiers.empty()) {
         return "At least one of 'ttl' or 'downsample' is required";
     }
 
-    uint64_t ttlNanos = 0;
+    RetentionPolicy policy;
+    policy.measurement = req.measurement;
     if (req.ttl.has_value()) {
+        policy.ttl = *req.ttl;
         try {
-            ttlNanos = timestar::HttpQueryHandler::parseInterval(*req.ttl);
+            policy.ttlNanos = timestar::HttpQueryHandler::parseInterval(policy.ttl);
         } catch (const std::exception& e) {
             return std::string("Invalid ttl: ") + e.what();
         }
     }
 
-    if (req.downsample.has_value()) {
-        const auto& ds = *req.downsample;
+    for (size_t k = 0; k < tiers.size(); ++k) {
+        DownsamplePolicy& ds = tiers[k];
+        const std::string label = tiers.size() <= 1 ? "downsample" : ("downsample[" + std::to_string(k) + "]");
         if (ds.after.empty())
-            return "downsample.after is required";
+            return label + ".after is required";
         if (ds.interval.empty())
-            return "downsample.interval is required";
+            return label + ".interval is required";
         if (ds.method.empty())
-            return "downsample.method is required";
-
-        const auto& validMethods = {"avg", "min", "max", "sum", "latest"};
-        bool methodOk = false;
-        for (auto& m : validMethods) {
-            if (ds.method == m) {
-                methodOk = true;
-                break;
-            }
-        }
-        if (!methodOk) {
-            return "Invalid downsample.method: must be one of avg, min, max, sum, latest";
-        }
-
-        uint64_t afterNanos = 0;
+            return label + ".method is required";
         try {
-            afterNanos = timestar::HttpQueryHandler::parseInterval(ds.after);
+            ds.afterNanos = timestar::HttpQueryHandler::parseInterval(ds.after);
         } catch (const std::exception& e) {
-            return std::string("Invalid downsample.after: ") + e.what();
+            return "Invalid " + label + ".after: " + e.what();
         }
-
         try {
-            timestar::HttpQueryHandler::parseInterval(ds.interval);
+            ds.intervalNanos = timestar::HttpQueryHandler::parseInterval(ds.interval);
         } catch (const std::exception& e) {
-            return std::string("Invalid downsample.interval: ") + e.what();
-        }
-
-        // ttl must be > downsample.after when both are present
-        if (ttlNanos > 0 && ttlNanos <= afterNanos) {
-            return "ttl must be greater than downsample.after";
+            return "Invalid " + label + ".interval: " + e.what();
         }
     }
 
+    policy.downsampleTiers = std::move(tiers);
+    timestar::retention::normalizeRetentionTiers(policy);
+    if (auto why = timestar::retention::validateRetentionPolicy(policy); why.has_value()) {
+        return *why;
+    }
     return "";  // success
 }
 
@@ -302,9 +319,47 @@ TEST_F(RetentionPolicyRequestParsingTest, ParseValidDownsampleOnly) {
     EXPECT_EQ(req.measurement, "temperature");
     EXPECT_FALSE(req.ttl.has_value());
     ASSERT_TRUE(req.downsample.has_value());
-    EXPECT_EQ(req.downsample->after, "30d");
-    EXPECT_EQ(req.downsample->interval, "5m");
-    EXPECT_EQ(req.downsample->method, "avg");
+    auto tiers = requestTiers(req);
+    ASSERT_EQ(tiers.size(), 1u) << "a legacy object must promote to exactly one tier";
+    EXPECT_EQ(tiers[0].after, "30d");
+    EXPECT_EQ(tiers[0].interval, "5m");
+    EXPECT_EQ(tiers[0].method, "avg");
+}
+
+// The cascade form: `downsample` as an ARRAY. Same field, same endpoint.
+TEST_F(RetentionPolicyRequestParsingTest, ParseDownsampleTierArray) {
+    auto req = parseRequest(R"({
+        "measurement": "scada",
+        "ttl": "730d",
+        "downsample": [
+            {"after":"7d",  "interval":"1m",  "method":"avg"},
+            {"after":"90d", "interval":"15m", "method":"avg"}
+        ]
+    })");
+
+    EXPECT_EQ(req.measurement, "scada");
+    ASSERT_TRUE(req.downsample.has_value());
+    auto tiers = requestTiers(req);
+    ASSERT_EQ(tiers.size(), 2u);
+    EXPECT_EQ(tiers[0].interval, "1m");
+    EXPECT_EQ(tiers[1].interval, "15m");
+    EXPECT_EQ(validatePutRequest(req), "");
+}
+
+TEST_F(RetentionPolicyRequestParsingTest, EmptyDownsampleArrayRejected) {
+    auto req = parseRequest(R"({"measurement":"m","downsample":[]})");
+    EXPECT_NE(validatePutRequest(req).find("at least one tier"), std::string::npos);
+}
+
+TEST_F(RetentionPolicyRequestParsingTest, ScalarDownsampleRejected) {
+    auto req = parseRequest(R"({"measurement":"m","downsample":7})");
+    EXPECT_NE(validatePutRequest(req).find("must be an object or an array"), std::string::npos);
+}
+
+// An explicit JSON null is "no downsampling", not a malformed tier.
+TEST_F(RetentionPolicyRequestParsingTest, NullDownsampleTreatedAsAbsent) {
+    auto req = parseRequest(R"({"measurement":"m","downsample":null})");
+    EXPECT_EQ(validatePutRequest(req), "At least one of 'ttl' or 'downsample' is required");
 }
 
 TEST_F(RetentionPolicyRequestParsingTest, ParseBothTtlAndDownsample) {
@@ -322,7 +377,7 @@ TEST_F(RetentionPolicyRequestParsingTest, ParseBothTtlAndDownsample) {
     ASSERT_TRUE(req.ttl.has_value());
     EXPECT_EQ(*req.ttl, "90d");
     ASSERT_TRUE(req.downsample.has_value());
-    EXPECT_EQ(req.downsample->method, "max");
+    EXPECT_EQ(requestTiers(req).at(0).method, "max");
 }
 
 TEST_F(RetentionPolicyRequestParsingTest, ParseDownsampleAllMethods) {
@@ -331,7 +386,7 @@ TEST_F(RetentionPolicyRequestParsingTest, ParseDownsampleAllMethods) {
                            method + R"("}})";
         auto req = parseRequest(json);
         ASSERT_TRUE(req.downsample.has_value()) << "method=" << method;
-        EXPECT_EQ(req.downsample->method, method) << "method=" << method;
+        EXPECT_EQ(requestTiers(req).at(0).method, method) << "method=" << method;
     }
 }
 
@@ -376,8 +431,10 @@ TEST_F(RetentionPolicyRequestParsingTest, DownsampleNanosFieldsPreservedOnRoundT
     })");
 
     ASSERT_TRUE(req.downsample.has_value());
-    EXPECT_EQ(req.downsample->afterNanos, 604800000000000ULL);
-    EXPECT_EQ(req.downsample->intervalNanos, 3600000000000ULL);
+    auto tiers = requestTiers(req);
+    ASSERT_EQ(tiers.size(), 1u);
+    EXPECT_EQ(tiers[0].afterNanos, 604800000000000ULL);
+    EXPECT_EQ(tiers[0].intervalNanos, 3600000000000ULL);
 }
 
 // =============================================================================

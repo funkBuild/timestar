@@ -47,10 +47,84 @@ private:
 public:
     std::vector<uint64_t> timestamps;
     std::vector<T> values;
+    std::vector<RollupState> rollups;
 
     QueryResult() = default;
 
+    // Rollups at the same label are contributions, not duplicate raw writes.
+    // Keep raw LWW ordering, then fold contributions using their persisted state.
+    static QueryResult fromRollupResults(std::vector<TSMResult<T>>& inputs) {
+        struct Cursor {
+            size_t source, block = 0, point = 0;
+        };
+        std::vector<Cursor> cursors;
+        auto normalize = [&](Cursor& c) {
+            while (c.block < inputs[c.source].blocks.size() &&
+                   c.point >= inputs[c.source].blocks[c.block]->timestamps.size()) {
+                ++c.block;
+                c.point = 0;
+            }
+            return c.block < inputs[c.source].blocks.size();
+        };
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            Cursor c{i};
+            if (normalize(c))
+                cursors.push_back(c);
+        }
+        RollupStream<T> fold;
+        bool seenRaw = false;
+        uint64_t lastRaw = 0;
+        auto stateOf = [&](const Cursor& c) {
+            const auto& b = inputs[c.source].blocks[c.block];
+            return b->rollups.empty() ? RollupState{} : b->rollups[c.point];
+        };
+        while (!cursors.empty()) {
+            size_t winner = 0;
+            for (size_t i = 1; i < cursors.size(); ++i) {
+                const auto& a = cursors[i];
+                const auto& b = cursors[winner];
+                const uint64_t ta = inputs[a.source].blocks[a.block]->timestamps[a.point];
+                const uint64_t tb = inputs[b.source].blocks[b.block]->timestamps[b.point];
+                const auto wa = stateOf(a).interval, wb = stateOf(b).interval;
+                if (ta < tb || (ta == tb && (wa > wb || (wa == wb && inputs[a.source].rank > inputs[b.source].rank))))
+                    winner = i;
+            }
+            auto& c = cursors[winner];
+            const auto state = stateOf(c);
+            const uint64_t ts = inputs[c.source].blocks[c.block]->timestamps[c.point];
+            T value = inputs[c.source].blocks[c.block]->values[c.point];
+            ++c.point;
+            bool more = normalize(c);
+            // Last raw copy within one source wins, including block seams.
+            while (!state.folded() && more && inputs[c.source].blocks[c.block]->timestamps[c.point] == ts &&
+                   !stateOf(c).folded()) {
+                value = inputs[c.source].blocks[c.block]->values[c.point];
+                ++c.point;
+                more = normalize(c);
+            }
+            if (state.folded() || !seenRaw || ts != lastRaw)
+                fold.add(ts, value, state);
+            if (!state.folded()) {
+                seenRaw = true;
+                lastRaw = ts;
+            }
+            if (!more)
+                cursors.erase(cursors.begin() + winner);
+        }
+        fold.finish();
+        QueryResult result;
+        result.timestamps = std::move(fold.timestamps);
+        result.values = std::move(fold.values);
+        result.rollups = std::move(fold.states);
+        return result;
+    }
+
     static QueryResult fromTsmResults(std::vector<TSMResult<T>>& tsmResults) {
+        for (const auto& source : tsmResults)
+            for (const auto& block : source.blocks) {
+                if (!block->rollups.empty())
+                    return fromRollupResults(tsmResults);
+            }
         QueryResult<T> results;
         results.mergeTsmResults(tsmResults);
         return results;

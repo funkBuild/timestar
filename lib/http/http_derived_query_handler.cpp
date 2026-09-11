@@ -100,6 +100,11 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::
                 timestar::jsonEscapeAppend(parsed.aggregationInterval, jsonBody);
                 jsonBody += "\"";
             }
+            // Emitted only when set, so a protobuf request that predates the
+            // flag re-serializes to exactly the JSON it always did.
+            if (parsed.multiSeries) {
+                jsonBody += ",\"multiSeries\":true";
+            }
             jsonBody += "}";
             body = std::move(jsonBody);
         }
@@ -121,6 +126,16 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::
                     data.stats.executionTimeMs = r.stats.executionTimeMs;
                     data.stats.subQueriesExecuted = r.stats.subQueriesExecuted;
                     data.stats.pointsDroppedDueToAlignment = r.stats.pointsDroppedDueToAlignment;
+                    data.stats.groupCount = r.stats.groupCount;
+                    // Per-group results; empty unless the request set
+                    // multi_series, and then the whole answer.
+                    for (const auto& gs : r.series) {
+                        timestar::proto::DerivedSeriesData series;
+                        series.groupTags = gs.groupTags;
+                        series.timestamps = gs.timestamps;
+                        series.values = gs.values;
+                        data.series.push_back(std::move(series));
+                    }
                     rep->_content = timestar::proto::formatDerivedQueryResponse(data);
                 } else if (std::holds_alternative<anomaly::AnomalyQueryResult>(result)) {
                     const auto& r = std::get<anomaly::AnomalyQueryResult>(result);
@@ -134,6 +149,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::
                     data.statistics.anomalyCount = r.statistics.anomalyCount;
                     data.statistics.totalPoints = r.statistics.totalPoints;
                     data.statistics.executionTimeMs = r.statistics.executionTimeMs;
+                    data.statistics.declinedSeriesCount = r.statistics.declinedSeriesCount;
                     for (const auto& sp : r.series) {
                         timestar::proto::AnomalySeriesPieceData piece;
                         piece.piece = sp.piece;
@@ -161,6 +177,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::
                     data.statistics.forecastPoints = r.statistics.forecastPoints;
                     data.statistics.seriesCount = r.statistics.seriesCount;
                     data.statistics.executionTimeMs = r.statistics.executionTimeMs;
+                    data.statistics.declinedSeriesCount = r.statistics.declinedSeriesCount;
                     for (const auto& sp : r.series) {
                         timestar::proto::ForecastSeriesPieceData piece;
                         piece.piece = sp.piece;

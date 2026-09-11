@@ -300,8 +300,8 @@ TEST_F(TSMUniversalStatsTest, StringAggregationReturnsZero) {
 
 // ==================== Phase 1: Version V3 ====================
 
-TEST_F(TSMUniversalStatsTest, TSMVersionIsV3AndV2StaysReadable) {
-    EXPECT_EQ(TSM_VERSION, 3u);
+TEST_F(TSMUniversalStatsTest, TSMVersionIsV4AndV2StaysReadable) {
+    EXPECT_EQ(TSM_VERSION, 4u);
     // V3 widened the per-series index block count from uint16 to uint32. V2
     // files MUST remain readable: rejecting them on open would orphan every
     // pre-upgrade file (data invisible to queries, never compacted or

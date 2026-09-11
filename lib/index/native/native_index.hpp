@@ -28,6 +28,7 @@
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/timer.hh>
+#include <seastar/util/noncopyable_function.hh>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -269,7 +270,8 @@ public:
     //   "1": 1.4.3 and earlier (batch writes recorded no membership).
     //   "2": batch writes record membership before the memory store consumes
     //        their timestamps.
-    static constexpr const char* kDayBitmapRecorderGeneration = "2";
+    //   "3": durable recording barriers and explicit repair coverage.
+    static constexpr const char* kDayBitmapRecorderGeneration = "3";
 
     // Test/ops hook: make close() behave like a process that died — skip the
     // clean-shutdown marker. Modelling a crash otherwise requires killing the
@@ -282,6 +284,15 @@ public:
 
     // Persist dirty day bitmaps now (timer callback; also called by close()).
     seastar::future<> flushDayBitmapsNow();
+
+    // Durability boundary for a logical write: stage day membership and wait
+    // for the index WAL. Low-level getOrCreateSeriesId/indexInsert calls stage
+    // changes; Engine calls this once per data batch, before its data WAL.
+    seastar::future<> sync();
+
+    // Used when startup repair is disabled or incomplete. Missing day
+    // membership is then unknown rather than proof of absence.
+    seastar::future<> disableDayPruning();
 
     // Schema broadcast: index metadata and return schema changes for broadcast
     seastar::future<SchemaUpdate> indexMetadataBatchWithSchema(const std::vector<MetadataOp>& ops);
@@ -312,6 +323,13 @@ private:
     // destroy the map under a suspended scan.
     std::shared_ptr<MemTable> memtable_;
     std::shared_ptr<MemTable> immutableMemtable_;  // Being flushed to SSTable in background
+    // Retained through SST/manifest/unlink failures; never replace this pair
+    // until its WAL has been durably retired.
+    std::optional<std::string> immutableWalPath_;
+    bool rotationPending_ = false;
+    // An append can fail after buffering its record, or application can fail
+    // after only some map allocations. Replay this batch before later writes.
+    std::optional<IndexWriteBatch> pendingWrite_;
 
     // shared_future: multiple coroutines may wait on the same in-flight flush
     // (a plain future is single-consumer — the second waiter hit a moved-from
@@ -323,6 +341,9 @@ private:
     // both swap memtable_ into immutableMemtable_, destroying unflushed data
     // and double-rotating the WAL.
     seastar::semaphore flushMutex_{1};
+    // Schema blob read-modify-write transactions, including broadcasts.
+    // Already-indexed writes retain their lock-free cache fast path.
+    seastar::semaphore schemaMutex_{1};
 
     // Periodic WAL durability sync: append() only buffers, so without this an
     // acknowledged index write could sit in user-space memory indefinitely.
@@ -358,6 +379,8 @@ private:
     seastar::future<> kvPut(const std::string& key, const std::string& value);
     seastar::future<> kvDelete(const std::string& key);
     seastar::future<> kvWriteBatch(const IndexWriteBatch& batch);
+    seastar::future<> appendAndApplyBatch(const IndexWriteBatch& batch);  // flushMutex_ held
+    seastar::future<> recoverWriteState();                                // flushMutex_ held
 
     // Prefix scan: iterate all keys with the given prefix, calling fn for each.
     // fn receives (key, value) and returns true to continue, false to stop.
@@ -372,7 +395,9 @@ private:
     seastar::future<> maybeFlushMemTable();
     seastar::future<> flushMemTable();
     seastar::future<> doFlushImmutableMemTable();  // Background flush work
-    seastar::future<> waitForFlush();              // Wait for any in-flight flush to complete
+    seastar::future<> beginMemtableFlush();        // flushMutex_ held; rotate before swapping
+    seastar::future<> finishImmutableFlush();      // sole owner or flushMutex_ held after waiting
+    seastar::future<> waitForFlush();              // flushMutex_ held; retries a failed flush
 
     // Step 4: Incremental SSTable refresh — only opens new files and closes removed ones.
     seastar::future<> refreshSSTables();
@@ -429,6 +454,10 @@ private:
     // --- Phase 2: Roaring bitmap postings ---
     LocalIdMap localIdMap_;
     uint32_t lastFlushedLocalId_ = 0;  // LOCAL_ID_FORWARD entries flushed up to (exclusive)
+    // IDs whose series-creation coroutine has not finished adding all tags.
+    // A flush must not certify them merely because an ID has been assigned.
+    std::multiset<uint32_t> pendingPostingsIds_;
+    bool postingsRepairInProgress_ = false;
 
     // Cached bitmap entry: tracks whether modified since last flush.
     struct BitmapEntry {
@@ -452,12 +481,18 @@ private:
     // set instead of walking the entire cache (up to 100K entries) per flush.
     std::unordered_set<std::string> bitmapCacheDirtyKeys_;
 
-    // Get or load a bitmap (read-only). Returns nullptr if not found anywhere.
-    // Uses pre-built cache key to avoid double string construction.
-    seastar::future<const roaring::Roaring*> getPostingsBitmapByKey(const std::string& cacheKey);
-    // Get or load a bitmap for insert (mutable). Marks entry dirty.
-    // cacheKey is consumed on cache miss (moved into map).
-    seastar::future<roaring::Roaring*> getOrLoadBitmapForInsert(std::string& cacheKey);
+    // Consume cached bitmaps synchronously, before completing the future. Even
+    // awaiting a ready future can yield; returning a pointer into robin_map
+    // would let another coroutine invalidate it before the caller resumes.
+    // Visitors must not suspend, mutate the cache, or retain the borrowed pointer.
+    // The read visitor receives nullptr for a missing key.
+    using BitmapReader = seastar::noncopyable_function<void(const roaring::Roaring*)>;
+    using BitmapWriter = seastar::noncopyable_function<void(roaring::Roaring&)>;
+    seastar::future<> withPostingsBitmap(const std::string& cacheKey, BitmapReader consume);
+    seastar::future<> withPostingsBitmapCold(const std::string& cacheKey, BitmapReader consume);
+    // Marks the entry dirty before invoking the writer.
+    seastar::future<> withBitmapForInsert(std::string& cacheKey, BitmapWriter update);
+    seastar::future<> withBitmapForInsertCold(std::string& cacheKey, BitmapWriter update);
     // Flush dirty bitmaps + batched LOCAL_ID_FORWARD entries into the KV store.
     // The flushDirty* family clears dirty state SYNCHRONOUSLY while filling the
     // batch, but nothing is durable until the caller's wal_->append() returns.
@@ -515,6 +550,8 @@ private:
         std::optional<uint32_t> dayBitmapWatermark;
     };
     void restoreAfterFailedFlush(const FlushRollback& rollback);
+    FlushRollback snapshotDirtyState() const;
+    seastar::future<> flushDirtyCachesToMemtable();  // caller holds flushMutex_
     // Step 7: Trim HLL cache after flush — evict non-dirty entries when too large
     void trimHllCache();
     static constexpr size_t MAX_HLL_CACHE_ENTRIES = 1000;
@@ -537,6 +574,9 @@ private:
     std::optional<uint32_t> dayBitmapWatermark_;
     bool openedCleanly_ = false;
     bool suppressCleanMarker_ = false;
+    std::optional<std::pair<uint32_t, uint32_t>> dayBitmapCoverage_;
+    uint64_t dayBitmapCoverageRevision_ = 0;
+    seastar::future<> setDayBitmapCoverage(uint32_t firstDay, uint32_t lastDay);
     seastar::timer<> dayBitmapFlushTimer_;
     seastar::gate dayBitmapFlushGate_;
     // Advance the "highest day recorded" mark, ignoring days implausibly far in
@@ -569,11 +609,15 @@ private:
     // clamped caches as absent, which is safe because the only thing that can
     // introduce a clamp for this shard's series is this shard.
     tsl::robin_map<std::string, std::optional<uint32_t>> clampedHistoryCache_;
+    seastar::semaphore clampedHistoryMutex_{1};
     seastar::future<> noteClampedHistory(const std::string& measurement, uint32_t droppedFromDay);
     // The last day the clamp refused to record for this measurement, if any.
     seastar::future<std::optional<uint32_t>> clampedHistoryThrough(const std::string& measurement);
-    seastar::future<roaring::Roaring*> getOrLoadDayBitmapForInsert(std::string& cacheKey);
-    seastar::future<const roaring::Roaring*> getDayBitmapByKey(const std::string& cacheKey);
+    seastar::future<> withDayBitmapForInsert(std::string& cacheKey, BitmapWriter update);
+    seastar::future<> withDayBitmapForInsertCold(std::string& cacheKey, BitmapWriter update);
+    seastar::future<bool> addDayMembership(std::string& cacheKey, uint32_t localId);
+    seastar::future<> withDayBitmap(const std::string& cacheKey, BitmapReader consume);
+    seastar::future<> withDayBitmapCold(const std::string& cacheKey, BitmapReader consume);
     // flushedKeys, when given, receives the cache keys whose dirty flag this
     // call cleared, so a caller whose write then FAILS can put them back.
     void flushDirtyDayBitmaps(IndexWriteBatch& batch, std::vector<std::string>* flushedKeys = nullptr);
