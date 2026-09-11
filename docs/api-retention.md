@@ -143,41 +143,48 @@ Duration units: `d` (days), `h` (hours), `m` (minutes), `s` (seconds), `ms`, `us
 
 ### Accuracy of cascaded aggregation
 
-Each stage folds the **previous stage's output**, not the original raw points —
-that is what makes the storage saving real. The consequence:
+Compacted TSM V4 points retain their aggregation method, sample count,
+original latest timestamp, and numeric accumulator. Each later stage combines
+that state rather than treating an earlier bucket as one raw sample.
 
 | Method | Cascaded result |
 |---|---|
-| `min`, `max`, `sum`, `latest` | **Exact.** Identical to folding the raw points straight to the final interval. |
-| `avg` | **Approximate.** The result is the *unweighted* mean of the previous stage's bucket means. |
+| `min`, `max` | Preserve extrema, including every bit of integer values. |
+| `sum` | Combines sums; integer overflow fails the compaction and retains its inputs. |
+| `latest` | Compares original observation timestamps, including delayed observations. |
+| `avg` | Weights earlier buckets by their actual sample counts, including gaps and outages. |
 
-`avg` is exact only when every bucket of the finer stage holds the same number
-of samples. It diverges when they do not — during comm gaps, outages, restarts
-and backfill, which for SCADA-style 1 Hz ingest is precisely when the per-minute
-sample count stops being 60. A minute holding one sample then carries the same
-weight in the 15-minute average as a minute holding sixty.
+Floating-point sums and averages retain normal floating-point rounding limits.
+Integer averages remain integer-valued, truncating toward zero, but a persisted
+128-bit sum and sample count prevent that truncation from compounding across
+stages. For fractional displayed averages, ingest the field as floating point.
 
-The error is bounded by the spread of the finer stage's bucket means (the
-composed value is a convex combination of exactly those means, just with equal
-weights), so it can never leave the range of the values it summarises. On
-representative gap-bearing test data the divergence is a few percent.
+Separate files can hold contributions to the same bucket. Queries and later
+compactions combine those contributions; equal bucket labels do not invoke raw
+last-write-wins deduplication. Raw samples still deduplicate by timestamp before
+folding. An aggregate NaN (for example, `sum(+Inf, -Inf)`) retains its nonzero
+sample count and survives subsequent compaction; a missing raw NaN is skipped.
 
-This is the same behaviour Graphite's cascaded retentions and InfluxDB
-continuous-query pipelines have. If a field must be exact, choose a method that
-composes: totalizers and counters should use `sum`, `max` or `latest` rather
-than `avg`. Exact cascaded averages would require storing a sample count
-alongside each downsampled point, which is a TSM format change and is not
-implemented.
+A delayed **additional** observation combines with the existing bucket. For
+`latest`, an older delayed status cannot displace a newer observation. This does
+not reconstruct deleted raw history: replaying or correcting observations that
+were already incorporated into a rollup cannot generally be undone exactly.
+In particular, sums and counts are not deduplicated against the erased raw
+samples. Such corrections require rebuilding the affected history from its
+original source. Changing the aggregation method of an existing rollup is
+rejected by compaction, preserving its input files.
 
-Two further consequences worth knowing:
+Query-time aggregates across different stored resolutions still operate on the
+stored representatives; a mixed-resolution query is not automatically a
+raw-sample-weighted average. The retained counts guarantee weighted **storage
+cascades**.
 
-- **Mixed-resolution ranges.** A query spanning a fold boundary weights the aged
-  region by its (fewer) stored points. This is inherent to storage-side
-  downsampling.
-- **Backfill into folded history** lands at raw resolution and is folded
-  together with the existing bucket point on the next compaction — for `avg`,
-  another unweighted fold. Backfill into an already-folded range is therefore
-  approximate, not lost.
+**Format compatibility:** raw flushes still write V3; compaction writes V4 with
+checksummed rollup metadata and input-file ancestry for crash recovery. This
+binary reads V2, V3, and V4. Older binaries cannot read V4 files. Already-folded
+V2/V3 data has no recoverable counts or original latest timestamps; upgrading
+cannot repair information discarded by earlier downsampling. The exact-state
+guarantees apply to data first folded by the V4 implementation.
 
 ### TTL against folded points
 
@@ -208,13 +215,16 @@ Two things trigger it.
    never be re-compacted and would stay at raw resolution forever. The sweep
    finds files holding aged, still-too-dense data and rewrites them in place.
 
-A quiet series therefore reaches each stage within roughly one sweep period of
-its threshold passing, not "never".
+Eligible data is considered each sweep, subject to the rewrite cap and available
+compaction capacity. A backlog can require multiple sweep periods.
 
 The sweep is deliberately conservative, and these limits are worth knowing:
 
-- It only acts on a series whose data lies **entirely** older than a stage
-  threshold. A series straddling the boundary is left to the merge path.
+- It uses the resident density estimate for wholly aged series. For a series
+  straddling a tier boundary, it reads block timestamps and counts occupied
+  target buckets in the affected region. Already-folded singleton buckets do
+  not dilute the reduction in the older region. This path costs additional I/O
+  but allows quiet files to cascade while retaining their newer data.
 - It requires the estimated fold to reduce the point count by at least
   `engine.downsample_rewrite_min_reduction_factor` (default 1.25x), so an
   already-folded file is not rewritten again as the threshold creeps forward.

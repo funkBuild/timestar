@@ -1946,6 +1946,32 @@ seastar::future<> Engine::sweepDownsampleRewrites() {
             }
         }
 
+        // A whole-series estimate cannot see an aged prefix in a file that
+        // also contains newer resolutions. Inspect timestamps in those files:
+        // counting occupied target buckets is exact, works across block seams,
+        // and becomes a no-op after the rewrite rather than churning forever.
+        if (pointsBefore == 0) {
+            for (const auto& [seriesId, cascade] : seriesCascade) {
+                auto density = tsmFile->getSeriesDensity(seriesId);
+                if (!density || density->pointCount == 0 ||
+                    (isNonNumericValueType(density->type) && !nonNumericFoldable.contains(seriesId)))
+                    continue;
+                bool straddles = false;
+                std::vector<std::pair<uint64_t, uint64_t>> stages;
+                for (uint8_t k = 0; k < cascade->stageCount; ++k) {
+                    const auto& stage = cascade->stages[k];
+                    stages.emplace_back(stage.threshold, stage.interval);
+                    straddles |= density->minTime < stage.threshold && density->maxTime >= stage.threshold;
+                }
+                if (!straddles)
+                    continue;
+                auto [before, after] = co_await tsmFile->estimateRollupDensity(seriesId, stages);
+                if (after && static_cast<double>(before) / after >= MIN_REDUCTION_FACTOR) {
+                    pointsBefore += before;
+                    pointsAfter += after;
+                }
+            }
+        }
         if (pointsBefore > pointsAfter) {
             ++_downsampleSweepStats.candidateFiles;
             candidates.push_back({tsmFile, pointsBefore - pointsAfter, pointsBefore});

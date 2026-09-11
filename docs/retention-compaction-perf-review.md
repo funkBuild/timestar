@@ -1,5 +1,12 @@
 # Retention compaction performance review
 
+> Historical design/performance record. The September 2026 correctness fixes
+> replace the value-only fold with persisted V4 rollup state and add reads for
+> partially aged sweep candidates. The unweighted-average decision and the
+> run-batched-fold performance figures below do not describe the current path.
+> See [Retention API](api-retention.md) for current semantics and compatibility.
+
+
 **Status:** REVIEW — measurements taken on branch `downsampling-cascade` at
 `8080797`, single machine (Ryzen 9 7950X, AVX-512, NVMe), otherwise idle.
 Nothing in this document is implemented; the one prototype built to bound the

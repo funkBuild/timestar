@@ -23,9 +23,8 @@ struct DownsamplePolicy {
     // One method per measurement destroys SCADA data: a flow totalizer averaged
     // over a 15-minute bucket is meaningless and a status word needs its last
     // value, not its mean. This is also what makes the `avg` cascade
-    // approximation defensible — sum/min/max/latest compose EXACTLY across
-    // stages (docs/api-retention.md), so routing counters to them confines the
-    // inexactness to analog averages.
+    // useful — counters and analog values need different aggregation semantics.
+    // Persisted rollup counts now preserve average weights across stages.
     //
     // OPTIONAL, not an empty map, on purpose: glaze's default
     // skip_null_members omits a disengaged optional entirely, so a policy that
@@ -115,8 +114,8 @@ inline constexpr size_t kMaxDownsampleTiers = 4;
 //
 // COUNT is deliberately absent: count-of-counts is not count, so a cascade
 // would silently report the number of stage-1 buckets rather than the number of
-// raw samples. Of the five offered, min/max/sum/latest compose EXACTLY over
-// stages; avg does not (see docs/api-retention.md).
+// raw samples. The five offered methods retain sufficient aggregate state in
+// V4 files to compose across stages (see docs/api-retention.md).
 bool isValidDownsampleMethod(std::string_view method);
 
 // A tier's per-field overrides, or a shared empty map when it names none.

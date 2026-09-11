@@ -280,7 +280,7 @@ SEASTAR_TEST_F(DownsampleCascadeTest, CascadeEqualsDirectFoldForComposableMethod
 //      combination of the same bucket means, just with 1/n weights);
 //   2. with UNIFORM per-bucket counts it is exact.
 // ===========================================================================
-SEASTAR_TEST_F(DownsampleCascadeTest, AvgCascadeIsApproximateAndBoundedByBucketMeanSpread) {
+SEASTAR_TEST_F(DownsampleCascadeTest, AvgCascadePreservesSampleWeightsAcrossGaps) {
     const std::string measurement = "scada";
     const uint64_t now = nowNs();
     const uint64_t after = 30 * ONE_DAY_NS;
@@ -304,62 +304,10 @@ SEASTAR_TEST_F(DownsampleCascadeTest, AvgCascadeIsApproximateAndBoundedByBucketM
         co_return;
     }
 
-    // Per-bucket spread of the stage-1 (1m) means, which bounds the error, and
-    // their UNWEIGHTED mean, which is what the composed value must actually be.
-    // The spread bound alone is trivially satisfied by any convex combination of
-    // the same means — including a wrongly weighted one — so it cannot on its
-    // own distinguish "mean of means" from "some other mixture".
-    std::map<uint64_t, double> minMean, maxMean, sumMean;
-    std::map<uint64_t, size_t> nMean;
-    for (const auto& [ts, v] : oneMinute.second) {
-        const uint64_t coarse = (ts / FIFTEEN_MINUTES_NS) * FIFTEEN_MINUTES_NS;
-        auto lo = minMean.find(coarse);
-        if (lo == minMean.end()) {
-            minMean[coarse] = v;
-            maxMean[coarse] = v;
-        } else {
-            lo->second = std::min(lo->second, v);
-            maxMean[coarse] = std::max(maxMean[coarse], v);
-        }
-        sumMean[coarse] += v;
-        nMean[coarse] += 1;
-    }
-
-    double worstAbs = 0.0;
-    double worstRel = 0.0;
-    bool sawDivergence = false;
     for (const auto& [ts, exact] : direct.second) {
-        const double composed = cascaded.at(ts);
-        const double err = std::abs(composed - exact);
-        const double spread = maxMean.at(ts) - minMean.at(ts);
-        EXPECT_LE(err, spread + 1e-9)
-            << "bucket=" << ts << ": the composed mean is a convex combination of the SAME stage-1 means, "
-            << "so it can never leave [min mean, max mean] — an error beyond the spread means the fold is "
-               "not doing mean-of-means at all";
-        // The exact statement of the documented approximation: EQUAL weights on
-        // the stage-1 means, regardless of how many raw samples each held.
-        const double unweighted = sumMean.at(ts) / static_cast<double>(nMean.at(ts));
-        EXPECT_NEAR(composed, unweighted, 1e-9 * std::max(1.0, std::abs(unweighted)))
-            << "bucket=" << ts
-            << ": stage 2 must be the UNWEIGHTED mean of stage 1's bucket means. Any other "
-               "mixture still sits inside the spread checked above, so this is the assertion that pins the "
-               "documented semantics rather than merely bounding them";
-        worstAbs = std::max(worstAbs, err);
-        if (std::abs(exact) > 0) {
-            worstRel = std::max(worstRel, err / std::abs(exact));
-        }
-        if (err > 1e-9) {
-            sawDivergence = true;
-        }
+        EXPECT_NEAR(cascaded.at(ts), exact, 1e-12 * std::max(1.0, std::abs(exact)))
+            << "Persisted sample counts must preserve the weights of gappy minutes";
     }
-
-    EXPECT_TRUE(sawDivergence) << "gap-bearing data MUST expose the avg approximation; if this passes exactly, "
-                                  "the test data no longer has irregular per-bucket counts and the guarantee "
-                                  "documented in docs/api-retention.md is untested";
-    // Recorded, not asserted to a magic number: the magnitude is a property of
-    // the data, and pinning it would make the test about the fixture.
-    GTEST_LOG_(INFO) << "avg cascade divergence on gap-bearing data: worst absolute " << worstAbs << ", worst relative "
-                     << (worstRel * 100.0) << "%";
 
     // --- Uniform counts: the cascade is EXACT. ---
     const std::vector<size_t> uniform{60};

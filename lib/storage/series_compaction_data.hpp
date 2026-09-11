@@ -39,6 +39,7 @@ struct SeriesCompactionData {
     // Slow path data (decompressed and merged)
     std::vector<uint64_t> timestamps;
     std::vector<T> values;
+    std::vector<RollupState> rollups;
     // True when the merged points were handed off incrementally to a sink, so
     // `timestamps`/`values` hold at most a trailing remnant and must NOT be
     // written again by the caller.

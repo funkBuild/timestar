@@ -169,7 +169,12 @@ public:
     seastar::future<bool> compactOneTier(uint64_t tier);
 
     // Allocate a globally unique sequence ID for new TSM files
-    uint64_t allocateSequenceId() { return nextSequenceId++; }
+    uint64_t allocateSequenceId(uint64_t minimum = 0) {
+        nextSequenceId = std::max(nextSequenceId, minimum);
+        if (nextSequenceId >= (uint64_t{1} << 60))
+            throw std::overflow_error("TSM sequence numbers exhausted");
+        return nextSequenceId++;
+    }
 
     // Get the compactor (for tombstone rewrites)
     TSMCompactor* getCompactor() { return compactor.get(); }

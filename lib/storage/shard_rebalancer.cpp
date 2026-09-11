@@ -301,11 +301,22 @@ seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount, [[may
 
         engine_log.info("[REBALANCE] Analyzing {} TSM files from shard {}", tsmFiles.size(), oldShard);
 
+        std::unordered_set<uint64_t> obsolete;
+        for (const auto& path : tsmFiles) {
+            auto file = seastar::make_shared<::TSM>(path);
+            co_await file->open();
+            obsolete.insert(file->replacedFileRanks().begin(), file->replacedFileRanks().end());
+            co_await file->close();
+        }
         for (const auto& tsmPath : tsmFiles) {
             // Open the TSM file (open() reads the sparse index internally)
             auto tsm = seastar::make_shared<::TSM>(tsmPath);
             co_await tsm->open();
 
+            if (obsolete.contains(tsm->rankAsInteger())) {
+                co_await tsm->close();
+                continue;
+            }
             auto seriesIds = tsm->getSeriesIds();
             if (seriesIds.empty()) {
                 co_await tsm->close();
@@ -319,7 +330,9 @@ seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount, [[may
                 shardGroups[target].push_back(id);
             }
 
-            if (shardGroups.size() == 1) {
+            // Ancestry ranks are local to the old shard. Rewrite such files
+            // with empty ancestry before moving them into a different namespace.
+            if (shardGroups.size() == 1 && tsm->replacedFileRanks().empty()) {
                 // All series go to the same shard — move the file
                 unsigned targetShard = shardGroups.begin()->first;
                 std::string destDir = shardDirNew(targetShard) + "/tsm/";
@@ -365,38 +378,29 @@ seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount, [[may
                 co_await tsm->loadTombstones();
 
                 for (auto& [targetShard, ids] : shardGroups) {
-                    auto splitStore = seastar::make_shared<::MemoryStore>(0);
-
+                    auto& seq = nextSeqPerShard[targetShard];
+                    std::string destPath = shardDirNew(targetShard) + "/tsm/0_split_" + std::to_string(seq++) + ".tsm";
+                    ::TSMWriter writer(destPath);
+                    writer.enableRollups();
+                    bool wrote = false;
                     for (const auto& seriesId : ids) {
                         auto typeOpt = tsm->getSeriesType(seriesId);
                         if (!typeOpt)
                             continue;
-
-                        // Helper: extract all data from a TSMResult into an InMemorySeries
-                        auto extractData = [&]<typename T>(::TSMResult<T>& result) {
-                            if (result.empty())
-                                return;
-                            auto [ts, vals] = result.getAllData();
-                            if (ts.empty())
-                                return;
-                            ::InMemorySeries<T> series;
-                            series.timestamps = std::move(ts);
-                            series.values = std::move(vals);
-                            splitStore->series[seriesId] = std::move(series);
-                        };
-
                         co_await timestar::dispatchValueType(*typeOpt, [&]<class T>() -> seastar::future<> {
-                            auto result =
-                                co_await tsm->queryWithTombstones<T>(seriesId, 0, std::numeric_limits<uint64_t>::max());
-                            extractData(result);
+                            auto result = co_await tsm->queryWithTombstones<T>(seriesId, 0, UINT64_MAX);
+                            for (auto& block : result.blocks) {
+                                if (block->timestamps.empty())
+                                    continue;
+                                co_await writer.appendSeriesChunk(*typeOpt, seriesId, std::move(block->timestamps),
+                                                                  std::move(block->values), std::move(block->rollups));
+                                wrote = true;
+                            }
                         });
                     }
-
-                    if (!splitStore->isEmpty()) {
-                        auto& seq = nextSeqPerShard[targetShard];
-                        std::string destPath =
-                            shardDirNew(targetShard) + "/tsm/0_split_" + std::to_string(seq++) + ".tsm";
-                        co_await ::TSMWriter::runAsync(splitStore, destPath);
+                    if (wrote) {
+                        co_await writer.writeIndexStreaming();
+                        co_await writer.closeDMA();
                         engine_log.debug("[REBALANCE] Wrote split TSM {} ({} series)", destPath, ids.size());
                     }
                 }

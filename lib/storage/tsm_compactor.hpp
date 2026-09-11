@@ -192,8 +192,17 @@ private:
     // path hands off each bounded chunk instead of accumulating the whole
     // series in SeriesCompactionData::timestamps/values.
     template <typename T>
-    using PointChunkSink =
-        std::function<seastar::future<>(std::vector<uint64_t>&& timestamps, std::vector<T>&& values)>;
+    using PointChunkSink = std::function<seastar::future<>(std::vector<uint64_t>&& timestamps, std::vector<T>&& values,
+                                                           std::vector<RollupState>&& rollups)>;
+
+    template <typename T>
+    using RollupChunkSink = PointChunkSink<T>;
+
+    template <typename T>
+    seastar::future<SeriesCompactionData<T>> processRollupSeries(const SeriesId128& seriesId,
+                                                                 const std::vector<seastar::shared_ptr<TSM>>& sources,
+                                                                 const SeriesRetentionMap& retention,
+                                                                 RollupChunkSink<T> sink);
 
     // Points buffered before a chunk is handed to the sink. 256K points is
     // ~4 MB for double (8B ts + 8B value), i.e. bounded regardless of series

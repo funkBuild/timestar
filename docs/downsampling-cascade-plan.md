@@ -1,5 +1,12 @@
 # Downsampling cascade plan
 
+> Historical design/performance record. The September 2026 correctness fixes
+> replace the value-only fold with persisted V4 rollup state and add reads for
+> partially aged sweep candidates. The unweighted-average decision and the
+> run-batched-fold performance figures below do not describe the current path.
+> See [Retention API](api-retention.md) for current semantics and compatibility.
+
+
 **Status:** IMPLEMENTED — all four phases built and adversarially reviewed.
 The body below is the original proposal, kept as written for the record; where
 the shipped code diverges from it, "Deviations from the plan as built" at the

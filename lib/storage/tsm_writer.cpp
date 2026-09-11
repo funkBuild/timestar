@@ -6,6 +6,7 @@
 #include "integer_encoder.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
+#include "rollup_codec.hpp"
 #include "series_id.hpp"
 #include "string_encoder.hpp"
 #include "tsm.hpp"
@@ -115,7 +116,7 @@ seastar::future<> TSMWriter::flushIfNeeded() {
 void TSMWriter::writeHeader() {
     std::string magic("TASM");
     buffer.write(magic);
-    buffer.write(TSM_VERSION);  // V3: uint32 per-series block count (V2 added universal block stats)
+    buffer.write(version_);  // V3: uint32 per-series block count (V2 added universal block stats)
 }
 
 // Build the series' index entry shell (and, for strings, its dictionary).
@@ -682,6 +683,8 @@ void TSMWriter::writeIndexEntryFor(const TSMIndexEntry& indexEntry) {
             // String: 32 bytes (28 base + count(4))
             buffer.write(block.blockCount);
         }
+        if (version_ >= 4)
+            buffer.write(block.rollupSize);
     }
 
     // Phase 3: Write string dictionary after block metadata for String series.
@@ -986,7 +989,8 @@ template void TSMWriter::writeSeries<int64_t>(TSMValueType seriesType, const Ser
 // Append a chunk to a series already (or not yet) present in the index.
 template <class T>
 seastar::future<> TSMWriter::appendSeriesChunk(TSMValueType seriesType, const SeriesId128& seriesId,
-                                               std::vector<uint64_t> timestamps, std::vector<T> values) {
+                                               std::vector<uint64_t> timestamps, std::vector<T> values,
+                                               std::vector<RollupState> rollups) {
     if (timestamps.size() != values.size()) {
         throw std::invalid_argument("TSMWriter::appendSeriesChunk: timestamps (" + std::to_string(timestamps.size()) +
                                     ") and values (" + std::to_string(values.size()) + ") size mismatch");
@@ -996,6 +1000,9 @@ seastar::future<> TSMWriter::appendSeriesChunk(TSMValueType seriesType, const Se
     }
 
     // Look up (or create) the entry and APPEND to it -- never replace it.
+    if (!rollups.empty() && (version_ < 4 || rollups.size() != timestamps.size())) {
+        throw std::invalid_argument("Rollup metadata requires V4 and one state per point");
+    }
     auto& indexEntry = indexEntries[seriesId];
     if (indexEntry.indexBlocks.empty()) {
         indexEntry.seriesId = seriesId;
@@ -1006,6 +1013,8 @@ seastar::future<> TSMWriter::appendSeriesChunk(TSMValueType seriesType, const Se
     for (size_t offset = 0; offset < timestamps.size(); offset += maxPointsPerBlock_) {
         const size_t end = std::min(timestamps.size(), (size_t)(offset + maxPointsPerBlock_));
         writeSeriesBlockAt<T>(seriesType, seriesId, timestamps, values, offset, end - offset, indexEntry);
+        if (!rollups.empty())
+            writeRollups(indexEntry.indexBlocks.back(), std::span(rollups).subspan(offset, end - offset));
         co_await flushIfNeeded();
     }
 }
@@ -1024,10 +1033,22 @@ template seastar::future<> TSMWriter::writeSeriesStreaming<int64_t>(TSMValueType
                                                                     const std::vector<uint64_t>&,
                                                                     const std::vector<int64_t>&);
 template seastar::future<> TSMWriter::appendSeriesChunk<double>(TSMValueType, const SeriesId128&, std::vector<uint64_t>,
-                                                                std::vector<double>);
+                                                                std::vector<double>, std::vector<RollupState>);
 template seastar::future<> TSMWriter::appendSeriesChunk<bool>(TSMValueType, const SeriesId128&, std::vector<uint64_t>,
-                                                              std::vector<bool>);
+                                                              std::vector<bool>, std::vector<RollupState>);
 template seastar::future<> TSMWriter::appendSeriesChunk<std::string>(TSMValueType, const SeriesId128&,
-                                                                     std::vector<uint64_t>, std::vector<std::string>);
+                                                                     std::vector<uint64_t>, std::vector<std::string>,
+                                                                     std::vector<RollupState>);
 template seastar::future<> TSMWriter::appendSeriesChunk<int64_t>(TSMValueType, const SeriesId128&,
-                                                                 std::vector<uint64_t>, std::vector<int64_t>);
+                                                                 std::vector<uint64_t>, std::vector<int64_t>,
+                                                                 std::vector<RollupState>);
+
+void TSMWriter::writeRollups(TSMIndexBlock& block, std::span<const RollupState> states) {
+    if (std::none_of(states.begin(), states.end(), [](const auto& state) { return state.folded(); }))
+        return;
+    auto encoded = rollup_codec::encode(states);
+    if (encoded.size() > UINT32_MAX)
+        throw std::overflow_error("Rollup metadata block too large");
+    block.rollupSize = static_cast<uint32_t>(encoded.size());
+    buffer.write_bytes(encoded.data(), encoded.size());
+}

@@ -17,6 +17,7 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/util/defer.hh>
+#include <seastar/util/later.hh>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -46,417 +47,6 @@ timestar::AggregationMethod downsampleMethodFor(const std::string& method) {
     }
     return timestar::AggregationMethod::AVG;
 }
-
-// INCREMENTAL, ASCENDING, MULTI-STAGE DOWNSAMPLE FOLD.
-//
-// Points are fed in the merged stream's own ascending timestamp order, which is
-// the whole reason this can hold O(1) live state instead of a bucket map:
-//
-//  - a bucket is FINAL the moment a timestamp at or past its end arrives, so at
-//    most one bucket is ever open;
-//  - a stage is final the moment a point belonging to a finer stage arrives,
-//    because thresholds decrease with k and the stream ascends.
-//
-// The map this replaces held one AggregationState (~112 B) per bucket for a
-// series' ENTIRE aged segment before flushing. A first fold of 83 days of 1 Hz
-// data at 1m resolution is ~120k buckets, ~14 MB resident per in-flight series,
-// multiplied by the pipeline count — and the cascade would have made it worse,
-// since a deeper history is exactly what a second tier exists to fold.
-//
-// Completed buckets are APPENDED to caller-owned vectors; the caller drains
-// them (block-aligned, through the sink) at its own suspension points. Nothing
-// here suspends: a coroutine frame per point measured ~15x slower than a plain
-// call on this path.
-//
-// NON-NUMERIC (Boolean/String) instantiations fold LATEST-PER-BUCKET in the
-// WRITTEN TYPE — never through AggregationState, which is a double pipeline and
-// would surface a boolean as 1.0/0.0. That coercion is forbidden everywhere
-// else in this engine (CLAUDE.md, dynamo-equivalence), and it must not sneak in
-// through storage. `latest` is the only method reachable here for those types:
-// the policy layer refuses any other (validateRetentionPolicy) and
-// processSeriesForCompaction declines to fold at all unless the resolved method
-// is LATEST, so the two gates agree even for a hand-built policy.
-template <typename T>
-class CascadeFolder {
-    static constexpr bool kNumeric = std::is_same_v<T, double> || std::is_same_v<T, int64_t>;
-
-public:
-    CascadeFolder(const std::array<DownsampleStage, MAX_DOWNSAMPLE_STAGES>& stages, uint8_t stageCount,
-                  timestar::AggregationMethod method, std::vector<uint64_t>& outTs, std::vector<T>& outVals)
-        : stages_(stages), stageCount_(stageCount), method_(method), outTs_(outTs), outVals_(outVals) {}
-
-    // ts must ascend across calls and satisfy ts < stages[0].threshold.
-    void add(uint64_t ts, const T& value) {
-        const size_t stage = stageFor(ts);
-        const uint64_t interval = stages_[stage].interval;
-        const uint64_t bucket = (ts / interval) * interval;
-        if (!live_ || stage != liveStage_ || bucket != liveBucket_) {
-            closeLiveBucket();
-            liveStage_ = stage;
-            liveBucket_ = bucket;
-            live_ = true;
-            if constexpr (kNumeric) {
-                state_ = timestar::AggregationState{};
-            } else {
-                nonNumericCount_ = 0;
-            }
-        }
-        if constexpr (kNumeric) {
-            state_.addValue(static_cast<double>(value), ts);
-        } else {
-            // The merged stream ascends and duplicates are already resolved, so
-            // the LAST value seen in a bucket is the greatest-timestamp one —
-            // exactly the query path's LATEST-per-bucket.
-            nonNumericValue_ = value;
-            ++nonNumericCount_;
-        }
-        ++foldedPoints_;
-    }
-
-    // BULK FORM of add(), for callers that already hold the points as flat
-    // ascending arrays -- both fold sites do.
-    //
-    // Same fold, same buckets, same values; what changes is that a whole
-    // bucket's RUN of points is folded by one flat kernel instead of driving
-    // the per-point state machine once per point: the stage scan, the divide,
-    // the live-bucket compare, the ~136 B AggregationState reset per bucket,
-    // and the Welford/min/max/latest bookkeeping that the chosen method never
-    // reads. That plumbing -- not the arithmetic -- is where the measured
-    // 5.2-7.0 ns/pt of the fold line went
-    // (docs/retention-compaction-perf-review.md).
-    //
-    // ORDERING AT THE SEAM. The merged stream ascends and the streaming writer
-    // NEVER sorts, so every bucket appended here must already be in ascending
-    // order -- including across a drainDsOut()/spill boundary, where the bucket
-    // left OPEN by the previous call is older than everything in this one, and
-    // across a stage transition. Two structural rules keep that true, rather
-    // than a check at the seam that a later edit could forget:
-    //
-    //   1. emitCompleteRun() closes the open bucket BEFORE appending its own,
-    //      so a direct emit can never overtake a pending older bucket;
-    //   2. a run that CONTINUES the open bucket, or that ends at the end of the
-    //      range (the next call may extend it), stays on the per-point path --
-    //      so a bucket is never emitted while more of its points may arrive.
-    //
-    // Together those make "one bucket at most is open, and it is the newest
-    // thing the folder has seen" an invariant of the batch path too, which is
-    // exactly what the per-point path guarantees.
-    //
-    // Takes the buffers themselves rather than pointers: std::vector<bool> has
-    // no data(), and Boolean is a legal (opt-in) fold type.
-    void addRange(const std::vector<uint64_t>& tsBuf, const std::vector<T>& valBuf, size_t n) {
-        if constexpr (!kNumeric) {
-            // Boolean/String fold latest-wins in the written type; the
-            // per-point arm is already trivial and must not route through the
-            // double kernels below.
-            for (size_t i = 0; i < n; ++i) {
-                add(tsBuf[i], valBuf[i]);
-            }
-            return;
-        } else {
-            const uint64_t* ts = tsBuf.data();
-            const T* vals = valBuf.data();
-            size_t i = 0;
-            while (i < n) {
-                const size_t stage = stageFor(ts[i]);
-                const uint64_t interval = stages_[stage].interval;
-                const uint64_t bucket = (ts[i] / interval) * interval;
-                // A run ends at its bucket's end and, defensively, at the
-                // stage's own upper bound: a point at or above
-                // stages_[stage].threshold belongs to a FINER stage, so it
-                // cannot share this bucket. Thresholds are interval-aligned
-                // (buildDownsampleStages), which makes the second clamp a
-                // no-op today -- it is here so the run is stage-homogeneous by
-                // construction rather than by that alignment holding.
-                uint64_t limit = bucket + interval;
-                if (stage > 0 && stages_[stage].threshold < limit) {
-                    limit = stages_[stage].threshold;
-                }
-                const size_t end = runEnd(ts, i, n, limit);
-
-                if (end == n || (live_ && liveStage_ == stage && liveBucket_ == bucket)) {
-                    // Trailing run (the next call may extend it) or a
-                    // continuation of the open bucket: rule 2 above.
-                    for (size_t k = i; k < end; ++k) {
-                        add(ts[k], vals[k]);
-                    }
-                } else {
-                    emitCompleteRun(bucket, ts + i, vals + i, end - i);
-                }
-                i = end;
-            }
-        }
-    }
-
-    // No more points: close whatever bucket is open.
-    void finish() { closeLiveBucket(); }
-
-    size_t foldedPoints() const { return foldedPoints_; }
-    size_t emittedBuckets() const { return emittedBuckets_; }
-
-private:
-    // The largest k with ts < threshold[k]. Thresholds are non-increasing in k,
-    // so a back-to-front scan finds it in at most MAX_DOWNSAMPLE_STAGES
-    // comparisons — and typically one, since the stream ascends through the
-    // stages in order.
-    size_t stageFor(uint64_t ts) const {
-        for (size_t k = stageCount_; k-- > 0;) {
-            if (ts < stages_[k].threshold) {
-                return k;
-            }
-        }
-        // Unreachable for a correctly partitioned prefix (every fed point is
-        // below the finest threshold); fold at the finest stage rather than
-        // read past the array if a caller ever gets the partition wrong.
-        return 0;
-    }
-
-    // First index in (i, n) whose timestamp reaches `limit`, i.e. one past the
-    // end of the run starting at i. Timestamps ascend.
-    //
-    // Galloping rather than a linear scan: a 15 m bucket of 1 Hz data is 900
-    // points and the value kernels below never read their timestamps, so a
-    // linear scan would stream 7 KB of timestamps per bucket to find one
-    // boundary. A length-1 run (the already-folded shape) costs exactly one
-    // comparison, which is why this is not a plain lower_bound over the whole
-    // remainder -- that would binary-search a 256 Ki range per point.
-    static size_t runEnd(const uint64_t* ts, size_t i, size_t n, uint64_t limit) {
-        size_t lo = i + 1;
-        if (lo >= n || ts[lo] >= limit) {
-            return std::min(lo, n);
-        }
-        // Invariant from here: ts[lo] < limit.
-        size_t step = 2;
-        size_t hi = lo + step;
-        while (hi < n && ts[hi] < limit) {
-            lo = hi;
-            step *= 2;
-            hi = lo + step;
-        }
-        if (hi > n) {
-            hi = n;
-        }
-        return static_cast<size_t>(std::lower_bound(ts + lo + 1, ts + hi, limit) - ts);
-    }
-
-    // Fold one COMPLETE run (a whole bucket's points) and append it.
-    //
-    // Closing the open bucket first is rule 1 of the ordering contract in
-    // addRange(): this is the only place a bucket is appended without having
-    // been the live one, so doing it here -- not at the call site -- is what
-    // makes ascending output a property of the class instead of a property of
-    // its callers. addRange() guarantees the open bucket (if any) is strictly
-    // older, by keeping same-bucket continuations on the per-point path.
-    void emitCompleteRun(uint64_t bucket, const uint64_t* ts, const T* vals, size_t n) {
-        closeLiveBucket();
-        double value = 0.0;
-        if (!foldRun(ts, vals, n, value)) {
-            // All-NaN run: emits nothing, exactly as an all-NaN live bucket
-            // does. A count check, never a NaN check -- a data-derived NaN
-            // (+Inf + -Inf) has real points behind it and must be emitted.
-            foldedPoints_ += n;
-            return;
-        }
-        outTs_.push_back(bucket);
-        outVals_.push_back(static_cast<T>(value));
-        ++emittedBuckets_;
-        foldedPoints_ += n;
-    }
-
-    // The run kernels. Each is BIT-IDENTICAL to feeding the same points through
-    // AggregationState::addValue() + getValue(method_) -- deliberately, because
-    // a bucket that straddles a chunk boundary still takes the per-point path
-    // and the two must not disagree about the same data:
-    //
-    //  - SUM/AVG keep the sequential Kahan recurrence, non-finite guard and
-    //    all, in the SAME order. Reassociating it over independent accumulators
-    //    is faster still, but it moves results by an ulp on pathological
-    //    buckets, which would make a fold's value depend on where the spill
-    //    boundaries fell. Kahan measured free in the review's ablations, and
-    //    the win here is the deleted plumbing, not the summation.
-    //  - MIN/MAX use four independent accumulators: min/max are associative and
-    //    commutative over non-NaN values, so reassociation is exact IN VALUE.
-    //    It is not exact in BITS, for exactly one input -- +0.0 against -0.0,
-    //    which compare equal and so let the visit order pick the sign. The
-    //    kernel restores the per-point path's first-wins tie-break explicitly;
-    //    see the note at the reduce.
-    //  - NaN is skipped by every kernel, and the return value is "this bucket
-    //    saw at least one non-NaN point" -- the emit gate.
-    //
-    // The default arm folds through AggregationState itself, so a method added
-    // to downsampleMethodFor() without a kernel here is slow, never wrong.
-    [[nodiscard]] bool foldRun(const uint64_t* ts, const T* vals, size_t n, double& out) const {
-        switch (method_) {
-            case timestar::AggregationMethod::AVG:
-            case timestar::AggregationMethod::SUM: {
-                double sum = 0.0;
-                double comp = 0.0;
-                size_t count = 0;
-                for (size_t i = 0; i < n; ++i) {
-                    const double v = static_cast<double>(vals[i]);
-                    if (std::isnan(v)) {
-                        continue;
-                    }
-                    const double y = v - comp;
-                    const double t = sum + y;
-                    // Reset the compensation once the sum goes non-finite, or
-                    // legitimate +-Inf data degenerates to NaN. Same test as
-                    // AggregationState::addValue().
-                    comp = ((t - t) == 0.0) ? (t - sum) - y : 0.0;
-                    sum = t;
-                    ++count;
-                }
-                if (count == 0) {
-                    return false;
-                }
-                out = (method_ == timestar::AggregationMethod::AVG) ? (sum + comp) / static_cast<double>(count)
-                                                                    : (sum + comp);
-                return true;
-            }
-            case timestar::AggregationMethod::MIN:
-            case timestar::AggregationMethod::MAX: {
-                const bool wantMin = (method_ == timestar::AggregationMethod::MIN);
-                // Identities are +-infinity, not DBL_MAX: +-Inf is real data
-                // and must order correctly (docs/nan_policy.md).
-                const double identity =
-                    wantMin ? std::numeric_limits<double>::infinity() : -std::numeric_limits<double>::infinity();
-                double a0 = identity, a1 = identity, a2 = identity, a3 = identity;
-                size_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-                size_t i = 0;
-                for (; i + 4 <= n; i += 4) {
-                    const double v0 = static_cast<double>(vals[i]);
-                    const double v1 = static_cast<double>(vals[i + 1]);
-                    const double v2 = static_cast<double>(vals[i + 2]);
-                    const double v3 = static_cast<double>(vals[i + 3]);
-                    // A NaN loses both comparisons, so it can never displace an
-                    // accumulator -- the skip is the comparison itself.
-                    a0 = wantMin ? (v0 < a0 ? v0 : a0) : (v0 > a0 ? v0 : a0);
-                    a1 = wantMin ? (v1 < a1 ? v1 : a1) : (v1 > a1 ? v1 : a1);
-                    a2 = wantMin ? (v2 < a2 ? v2 : a2) : (v2 > a2 ? v2 : a2);
-                    a3 = wantMin ? (v3 < a3 ? v3 : a3) : (v3 > a3 ? v3 : a3);
-                    c0 += static_cast<size_t>(!std::isnan(v0));
-                    c1 += static_cast<size_t>(!std::isnan(v1));
-                    c2 += static_cast<size_t>(!std::isnan(v2));
-                    c3 += static_cast<size_t>(!std::isnan(v3));
-                }
-                for (; i < n; ++i) {
-                    const double v = static_cast<double>(vals[i]);
-                    a0 = wantMin ? (v < a0 ? v : a0) : (v > a0 ? v : a0);
-                    c0 += static_cast<size_t>(!std::isnan(v));
-                }
-                if (c0 + c1 + c2 + c3 == 0) {
-                    return false;
-                }
-                const double m01 = wantMin ? (a1 < a0 ? a1 : a0) : (a1 > a0 ? a1 : a0);
-                const double m23 = wantMin ? (a3 < a2 ? a3 : a2) : (a3 > a2 ? a3 : a2);
-                out = wantMin ? (m23 < m01 ? m23 : m01) : (m23 > m01 ? m23 : m01);
-                // SIGNED-ZERO TIE-BREAK -- the one place min/max do NOT
-                // reassociate losslessly. +0.0 and -0.0 compare EQUAL while
-                // having different bits, so which one a reduction keeps depends
-                // on the order it visits them in. std::min/std::max keep the
-                // value they already hold, so the per-point path settles on the
-                // FIRST zero in stream order; four accumulator chains do not
-                // visit the run in that order (a zero at index 1 and one at
-                // index 4 land in different chains, and the tree reduce prefers
-                // the chain, not the earlier index).
-                //
-                // Without this a bucket that straddles a chunk boundary (which
-                // rule 2 of addRange() keeps on the per-point path) and the same
-                // bucket wholly inside one chunk can store zeros of OPPOSITE
-                // SIGN -- a placement-dependent stored value, and -0.0 is
-                // preserved bit-exactly on the read path (docs/nan_policy.md).
-                // Found by differential fuzzing against the per-point fold.
-                //
-                // Zeros are the only doubles that compare equal with different
-                // bit patterns, so this is the complete repair, and the guard is
-                // one predictable compare per bucket rather than per point.
-                if (out == 0.0) {
-                    for (size_t k = 0; k < n; ++k) {
-                        const double v = static_cast<double>(vals[k]);
-                        if (v == 0.0) {
-                            out = v;
-                            break;
-                        }
-                    }
-                }
-                return true;
-            }
-            case timestar::AggregationMethod::LATEST: {
-                // Timestamps ascend and duplicates are resolved upstream, so
-                // the LAST non-NaN value of the run is the greatest-timestamp
-                // one -- what addValue()'s `timestamp >= latestTimestamp`
-                // tie-break settles on.
-                for (size_t i = n; i-- > 0;) {
-                    const double v = static_cast<double>(vals[i]);
-                    if (!std::isnan(v)) {
-                        out = v;
-                        return true;
-                    }
-                }
-                return false;
-            }
-            default: {
-                timestar::AggregationState state;
-                for (size_t i = 0; i < n; ++i) {
-                    state.addValue(static_cast<double>(vals[i]), ts[i]);
-                }
-                if (state.count == 0) {
-                    return false;
-                }
-                out = state.getValue(method_);
-                return true;
-            }
-        }
-    }
-
-    void closeLiveBucket() {
-        if (!live_) {
-            return;
-        }
-        live_ = false;
-        // An ALL-NaN bucket must emit NOTHING. addValue() NaN-skips, so such a
-        // state has count == 0 and getValue() would return NaN at a bucket-start
-        // timestamp that never existed in the data — a fabricated point that raw
-        // reads surface as a `null`.
-        //
-        // Deliberately a COUNT check, not a NaN check on the result: a
-        // data-derived NaN (+Inf + -Inf) is the correct IEEE aggregate of real
-        // points and must still be emitted. See docs/nan_policy.md.
-        if constexpr (kNumeric) {
-            if (state_.count == 0) {
-                return;
-            }
-            outTs_.push_back(liveBucket_);
-            outVals_.push_back(static_cast<T>(state_.getValue(method_)));
-        } else {
-            // No NaN analogue for Boolean/String: every stored value is real
-            // data, so a bucket emits iff it received a point at all.
-            if (nonNumericCount_ == 0) {
-                return;
-            }
-            outTs_.push_back(liveBucket_);
-            outVals_.push_back(nonNumericValue_);
-        }
-        ++emittedBuckets_;
-    }
-
-    const std::array<DownsampleStage, MAX_DOWNSAMPLE_STAGES>& stages_;
-    uint8_t stageCount_;
-    timestar::AggregationMethod method_;
-    std::vector<uint64_t>& outTs_;
-    std::vector<T>& outVals_;
-
-    // Numeric fold state (unused, and never constructed into, for T that is
-    // Boolean/String — those carry the latest-wins pair below instead).
-    timestar::AggregationState state_;
-    T nonNumericValue_{};
-    size_t nonNumericCount_ = 0;
-    uint64_t liveBucket_ = 0;
-    size_t liveStage_ = 0;
-    bool live_ = false;
-    size_t foldedPoints_ = 0;
-    size_t emittedBuckets_ = 0;
-};
 
 }  // namespace
 
@@ -503,11 +93,167 @@ std::vector<SeriesId128> TSMCompactor::getAllSeriesIds(const std::vector<seastar
     return std::vector<SeriesId128>(uniqueIds.begin(), uniqueIds.end());
 }
 
+template <typename T>
+seastar::future<SeriesCompactionData<T>> TSMCompactor::processRollupSeries(
+    const SeriesId128& seriesId, const std::vector<seastar::shared_ptr<TSM>>& sources,
+    const SeriesRetentionMap& retention, RollupChunkSink<T> sink) {
+    SeriesCompactionData<T> result(seriesId, TSM::getValueType<T>());
+    auto context = retention.find(seriesId);
+    const SeriesRetentionContext* policy = context == retention.end() ? nullptr : context->second;
+    struct Cursor {
+        seastar::shared_ptr<TSM> file;
+        std::vector<TSMIndexBlock> blocks;
+        std::shared_ptr<const std::vector<std::string>> dictionary;
+        size_t nextBlock = 0, point = 0;
+        std::unique_ptr<TSMBlock<T>> data;
+        std::vector<std::pair<uint64_t, uint64_t>> tombstones;
+    };
+    std::vector<Cursor> cursors;
+    for (auto file : sources) {
+        auto* entry = co_await file->getFullIndexEntry(seriesId);
+        if (!entry)
+            continue;
+        Cursor cursor;
+        cursor.file = file;
+        cursor.blocks = entry->indexBlocks;
+        cursor.dictionary = entry->stringDictionary;
+        if (file->hasTombstones())
+            cursor.tombstones = file->getTombstones()->getTombstoneRanges(seriesId);
+        cursors.push_back(std::move(cursor));
+    }
+    auto refill = [&](Cursor& cursor) -> seastar::future<> {
+        while (!cursor.data && cursor.nextBlock < cursor.blocks.size()) {
+            auto block = cursor.blocks[cursor.nextBlock++];
+            cursor.data =
+                co_await cursor.file->template readSingleBlock<T>(block, 0, UINT64_MAX, cursor.dictionary.get());
+            cursor.point = 0;
+            if (cursor.data->timestamps.empty())
+                cursor.data.reset();
+        }
+    };
+    for (auto& cursor : cursors)
+        co_await refill(cursor);
+    RollupStream<T> folder;
+    uint64_t lastRawTs = 0;
+    bool haveRaw = false;
+    size_t sinceYield = 0;
+    while (true) {
+        Cursor* winner = nullptr;
+        auto stateOf = [](const Cursor& cursor) {
+            return cursor.data->rollups.empty() ? RollupState{} : cursor.data->rollups[cursor.point];
+        };
+        for (auto& cursor : cursors) {
+            if (!cursor.data)
+                continue;
+            if (!winner) {
+                winner = &cursor;
+                continue;
+            }
+            const auto ts = cursor.data->timestamps[cursor.point];
+            const auto best = winner->data->timestamps[winner->point];
+            const auto width = stateOf(cursor).interval;
+            const auto bestWidth = stateOf(*winner).interval;
+            if (ts < best ||
+                (ts == best &&
+                 (width > bestWidth || (width == bestWidth && cursor.file->dataRank() > winner->file->dataRank()))))
+                winner = &cursor;
+        }
+        if (!winner)
+            break;
+        const uint64_t ts = winner->data->timestamps[winner->point];
+        T value = winner->data->values[winner->point];
+        const auto state = stateOf(*winner);
+        auto advance = [&] {
+            if (++winner->point == winner->data->timestamps.size())
+                winner->data.reset();
+        };
+        advance();
+        if (!winner->data)
+            co_await refill(*winner);
+        while (!state.folded() && winner->data && winner->data->timestamps[winner->point] == ts &&
+               !stateOf(*winner).folded()) {
+            value = winner->data->values[winner->point];
+            ++result.pointsRead;
+            ++result.duplicatesRemoved;
+            advance();
+            if (!winner->data)
+                co_await refill(*winner);
+        }
+        bool skip = policy && ts < policy->ttlCutoff;
+        for (const auto& [begin, end] : winner->tombstones)
+            skip |= ts >= begin && ts < end;
+        ++result.pointsRead;
+        if (!state.folded()) {
+            if (haveRaw && lastRawTs == ts) {
+                skip = true;
+                ++result.duplicatesRemoved;
+            }
+            lastRawTs = ts;
+            haveRaw = true;
+        }
+        if (!skip) {
+            uint64_t interval = 0;
+            auto method = policy ? policy->downsampleMethod : timestar::AggregationMethod::AVG;
+            if (policy) {
+                if constexpr (std::is_same_v<T, double> || std::is_same_v<T, int64_t>) {
+                    for (uint8_t k = 0; k < policy->stageCount; ++k) {
+                        if (ts < policy->stages[k].threshold)
+                            interval = policy->stages[k].interval;
+                    }
+                } else if (policy->nonNumericFold && method == timestar::AggregationMethod::LATEST) {
+                    for (uint8_t k = 0; k < policy->stageCount; ++k) {
+                        if (ts < policy->stages[k].threshold)
+                            interval = policy->stages[k].interval;
+                    }
+                }
+            }
+            if (interval && state.folded() && state.aggregation() != method) {
+                throw std::runtime_error("Cannot change the method of already downsampled series " + seriesId.toHex());
+            }
+            folder.add(ts, value, state, interval, method);
+        }
+        if (sink && folder.timestamps.size() >= MERGE_CHUNK_POINTS / 8) {
+            result.pointsWritten += folder.timestamps.size();
+            co_await sink(std::move(folder.timestamps), std::move(folder.values), std::move(folder.states));
+            folder.timestamps.clear();
+            folder.values.clear();
+            folder.states.clear();
+            result.emittedViaSink = true;
+        }
+        if (++sinceYield >= 16384) {
+            sinceYield = 0;
+            co_await seastar::yield();
+        }
+    }
+    folder.finish();
+    result.pointsWritten += folder.timestamps.size();
+    if (sink) {
+        if (!folder.timestamps.empty())
+            co_await sink(std::move(folder.timestamps), std::move(folder.values), std::move(folder.states));
+        result.emittedViaSink = true;
+    } else {
+        result.timestamps = std::move(folder.timestamps);
+        result.values = std::move(folder.values);
+        result.rollups = std::move(folder.states);
+    }
+    co_return result;
+}
+
 // Phase 3: Process series for compaction without writing (enables parallel processing)
 template <typename T>
 seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompaction(
     const SeriesId128& seriesId, const std::vector<seastar::shared_ptr<TSM>>& sources,
     const SeriesRetentionMap& seriesRetention, PointChunkSink<T> sink, size_t blockAlign) {
+    auto retention = seriesRetention.find(seriesId);
+    bool rollup = retention != seriesRetention.end() && retention->second->stageCount > 0;
+    if constexpr (isNonNumericValueType(TSM::getValueType<T>())) {
+        rollup = rollup && retention->second->nonNumericFold &&
+                 retention->second->downsampleMethod == timestar::AggregationMethod::LATEST;
+    }
+    for (const auto& source : sources)
+        rollup |= source->hasRollups(seriesId);
+    if (rollup)
+        co_return co_await processRollupSeries<T>(seriesId, sources, seriesRetention, std::move(sink));
     if (blockAlign == 0) {
         blockAlign = MaxPointsPerBlock();
     }
@@ -637,34 +383,6 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
     auto retIt = seriesRetention.find(seriesId);
     bool hasRetention = (retIt != seriesRetention.end());
     uint64_t ttlCutoff = hasRetention ? retIt->second->ttlCutoff : 0;
-    // The downsample cascade, finest stage first. `dsFinestThreshold` is the
-    // boundary between "folds at some stage" and "passes through raw".
-    std::array<DownsampleStage, MAX_DOWNSAMPLE_STAGES> dsStages =
-        hasRetention ? retIt->second->stages : std::array<DownsampleStage, MAX_DOWNSAMPLE_STAGES>{};
-    uint8_t dsStageCount = hasRetention ? retIt->second->stageCount : 0;
-    auto downsampleMethod = hasRetention ? retIt->second->downsampleMethod : timestar::AggregationMethod::AVG;
-
-    // NON-NUMERIC OPT-IN. Boolean and String pass through unfolded unless the
-    // series' field carries an explicit `fieldMethods` entry of "latest"
-    // (retention_policy.hpp). Two conditions, not one:
-    //
-    //  * `nonNumericFold` — set only from an explicit override, so a
-    //    measurement-wide `"method": "latest"` leaves these types exactly as
-    //    they behaved before per-field methods existed;
-    //  * `downsampleMethod == LATEST` — the runtime backstop. The policy layer
-    //    already refuses any other method on a non-numeric field, but that
-    //    check needs the field-type index; this one needs only T, so a
-    //    hand-built policy reaching compact() directly still cannot average a
-    //    boolean as 1.0/0.0.
-    if constexpr (isNonNumericValueType(TSM::getValueType<T>())) {
-        const bool optedIn =
-            hasRetention && retIt->second->nonNumericFold && downsampleMethod == timestar::AggregationMethod::LATEST;
-        if (!optedIn) {
-            dsStageCount = 0;
-        }
-    }
-    const uint64_t dsFinestThreshold = dsStageCount > 0 ? dsStages[0].threshold : 0;
-
     // Check if we can use zero-copy fast path
     // Retention (TTL or downsampling) disables zero-copy since we need to filter/transform points
     bool allBlocksNonOverlapping =
@@ -686,7 +404,7 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
         }
     }
 
-    bool hasPerPointRetention = (ttlCutoff > 0 || dsStageCount > 0);
+    bool hasPerPointRetention = (ttlCutoff > 0);
 
     // String dictionaries (STR2 blocks store per-file dictionary IDs): the
     // zero-copy carry is only sound when the output file's index entry can
@@ -809,121 +527,10 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
     uint64_t lastTimestamp = std::numeric_limits<uint64_t>::max();
     size_t ttlFiltered = 0;
 
-    // Incremental emission state. Chunking is available whenever a sink is
-    // supplied — including under a downsample policy: the merged stream is
-    // ascending and the thresholds are fixed, so every point below the finest
-    // threshold precedes every raw one, and within the folded region the stages
-    // are traversed coarsest-first. Old points go through the cascade folder at
-    // spill time (never handed to the sink raw), and completed buckets drain
-    // through the sink as they close — with the whole cascade forced out the
-    // moment the first raw point reaches a spill, before any raw point is
-    // written, preserving ascending block order. Downsampling therefore needs
-    // neither the whole series nor the whole bucket set resident.
+    // Downsampling and persisted rollups use processRollupSeries. This raw/TTL
+    // merge retains its block-aligned, bounded output buffer.
     const bool chunkedEmit = static_cast<bool>(sink);
     size_t bufferedSinceSpill = 0;
-
-    // EVERY value type can now reach the fold: numeric types through
-    // AggregationState, Boolean/String through the folder's latest-per-bucket
-    // arm. Whether a given series actually folds is decided above, by
-    // dsStageCount — which the non-numeric gate zeroes unless the field opted
-    // in. Kept as a named constant because the fold blocks below are still
-    // `if constexpr`-guarded in shape.
-    constexpr bool kTypeSupportsDownsample = true;
-    const bool streamingDownsample = chunkedEmit && kTypeSupportsDownsample && dsStageCount > 0;
-
-    // Completed buckets waiting to be handed to the sink. Bounded: the fold
-    // below only ever consumes the buffered prefix (<= one spill window), and
-    // the drain runs at every spill, so this never accumulates the series'
-    // whole aged segment the way the old bucket map did.
-    std::vector<uint64_t> dsOutTs;
-    std::vector<T> dsOutVals;
-    CascadeFolder<T> dsFolder(dsStages, dsStageCount, downsampleMethod, dsOutTs, dsOutVals);
-    bool dsFlushed = false;  // buckets have been emitted; stream is pure recent from here
-
-    // Fold result[0..count) into the cascade and drop them from the buffers.
-    // Only ever called with count <= the deduplicated prefix (the retained
-    // last point is excluded until the series is complete), and only with
-    // points strictly below the finest threshold, so every fed point has a
-    // stage.
-    auto foldOldPrefixIntoBuckets = [&](size_t count) {
-        if constexpr (kTypeSupportsDownsample) {
-            // Run-batched: the prefix is already a flat ascending array, which
-            // is exactly what the folder's bulk form wants. Successive calls
-            // are a seam -- a bucket may be left open here and continued by the
-            // next spill's prefix -- and addRange() is written to keep that
-            // case on the per-point path (see its ordering contract).
-            dsFolder.addRange(result.timestamps, result.values, count);
-            result.timestamps.erase(result.timestamps.begin(), result.timestamps.begin() + count);
-            result.values.erase(result.values.begin(), result.values.begin() + count);
-        } else {
-            (void)count;
-        }
-    };
-
-    // Hand completed buckets to the sink. Ascending by construction: stage
-    // k+1's bucket starts all precede stage k's, which all precede the first
-    // raw point (guaranteed by threshold alignment plus interval divisibility).
-    //
-    // Sends are BLOCK-ALIGNED for the same reason raw spills are — an unaligned
-    // hand-off leaves a short tail block on every drain, systematic
-    // fragmentation the under-full coalescer never reclaims. `force` (the final
-    // drain) is the only place a short chunk is allowed.
-    auto drainDsOut = [&](bool force) -> seastar::future<> {
-        if constexpr (kTypeSupportsDownsample) {
-            if (dsOutTs.empty()) {
-                co_return;
-            }
-            const size_t send = force ? dsOutTs.size() : (dsOutTs.size() / blockAlign) * blockAlign;
-            if (send == 0) {
-                co_return;
-            }
-            std::vector<uint64_t> chunkTs;
-            std::vector<T> chunkVals;
-            if (send == dsOutTs.size()) {
-                chunkTs = std::move(dsOutTs);
-                chunkVals = std::move(dsOutVals);
-                dsOutTs = {};
-                dsOutVals = {};
-            } else {
-                // Keep the (sub-block) tail, move the aligned prefix out.
-                std::vector<uint64_t> tailTs(dsOutTs.begin() + send, dsOutTs.end());
-                std::vector<T> tailVals(std::make_move_iterator(dsOutVals.begin() + send),
-                                        std::make_move_iterator(dsOutVals.end()));
-                dsOutTs.resize(send);
-                dsOutVals.resize(send);
-                chunkTs = std::move(dsOutTs);
-                chunkVals = std::move(dsOutVals);
-                dsOutTs = std::move(tailTs);
-                dsOutVals = std::move(tailVals);
-            }
-            result.emittedViaSink = true;
-            co_await sink(std::move(chunkTs), std::move(chunkVals));
-        } else {
-            (void)force;
-            co_return;
-        }
-    };
-
-    // The old segment is complete: close the open bucket, drain everything, and
-    // fix up the point accounting. Called before any raw point is written, so
-    // block order stays ascending.
-    auto flushDsBuckets = [&]() -> seastar::future<> {
-        if constexpr (kTypeSupportsDownsample) {
-            dsFolder.finish();
-            co_await drainDsOut(true);
-            if (dsFolder.foldedPoints() > 0) {
-                // processPoint counted every folded raw point as written;
-                // replace that with the bucket count actually emitted (which
-                // excludes all-NaN buckets).
-                result.pointsWritten = result.pointsWritten - dsFolder.foldedPoints() + dsFolder.emittedBuckets();
-                timestar::compactor_log.info(
-                    "Downsample (streaming): {} old points -> {} buckets across {} stage(s) for series {}",
-                    dsFolder.foldedPoints(), dsFolder.emittedBuckets(), static_cast<unsigned>(dsStageCount),
-                    seriesId.toHex());
-            }
-        }
-        dsFlushed = true;
-    };
 
     // Hand buffered points to the sink, always RETAINING at least the final
     // point: processPoint resolves a duplicate timestamp by overwriting
@@ -950,35 +557,6 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
             co_return;
         }
 
-        if (streamingDownsample && !dsFlushed) {
-            // Fold the old-segment part of the deduplicated prefix (all but
-            // the retained last point) into the cascade instead of sending it
-            // to the sink. Each point lands in its own stage's bucket.
-            const size_t prefix = result.timestamps.size() - 1;
-            const size_t partIdx = static_cast<size_t>(
-                std::lower_bound(result.timestamps.begin(), result.timestamps.begin() + prefix, dsFinestThreshold) -
-                result.timestamps.begin());
-            if (partIdx > 0) {
-                foldOldPrefixIntoBuckets(partIdx);
-            }
-            if (!result.timestamps.empty() && result.timestamps.front() >= dsFinestThreshold) {
-                // A recent point reached a spill: the ascending stream proves
-                // the old segment is complete. Emit the buckets NOW, before
-                // any recent point is written, so block order stays ascending.
-                co_await flushDsBuckets();
-                // Fall through to the normal send below for the recent points.
-            } else {
-                // Everything spillable was old and is now folded; only the
-                // retained point remains. Hand off whatever buckets have
-                // completed so far — this is what keeps the fold's memory
-                // bounded across a deep first fold instead of accumulating
-                // every bucket of the aged segment.
-                co_await drainDsOut(false);
-                bufferedSinceSpill = result.timestamps.size();
-                co_return;
-            }
-        }
-
         // Largest block-aligned send that still retains >= 1 point.
         const size_t send = ((result.timestamps.size() - 1) / blockPoints) * blockPoints;
         if (send == 0) {
@@ -1003,7 +581,7 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
         bufferedSinceSpill = result.timestamps.size();
         result.emittedViaSink = true;
 
-        co_await sink(std::move(chunkTs), std::move(chunkVals));
+        co_await sink(std::move(chunkTs), std::move(chunkVals), {});
     };
 
     // Helper lambda: check tombstone + TTL for a single point, append if valid
@@ -1317,19 +895,6 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
         timestar::compactor_log.info("TTL: Filtered {} expired points for series {}", ttlFiltered, seriesId.toHex());
     }
 
-    // Streaming downsample completion: the series is finished, so the
-    // retained last point can be folded too (no more duplicates can arrive).
-    // Buckets are emitted BEFORE the recent tail below, keeping order.
-    if (streamingDownsample && !dsFlushed) {
-        const size_t partIdx = static_cast<size_t>(
-            std::lower_bound(result.timestamps.begin(), result.timestamps.end(), dsFinestThreshold) -
-            result.timestamps.begin());
-        if (partIdx > 0) {
-            foldOldPrefixIntoBuckets(partIdx);
-        }
-        co_await flushDsBuckets();
-    }
-
     // Hand off whatever is left. Once anything has been emitted through the sink
     // the remainder must go the same way, otherwise the tail would be dropped
     // (writeSeriesCompactionData skips a series flagged emittedViaSink).
@@ -1338,52 +903,7 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
         auto tailVals = std::move(result.values);
         result.timestamps.clear();
         result.values.clear();
-        co_await sink(std::move(tailTs), std::move(tailVals));
-    }
-
-    // Downsampling for series processed WITHOUT a sink (direct callers/tests) —
-    // sink-driven series were folded incrementally above.
-    if constexpr (kTypeSupportsDownsample) {
-        if (!streamingDownsample && dsStageCount > 0 && !result.timestamps.empty()) {
-            // Find partition point: first timestamp >= the finest threshold.
-            auto partIt = std::lower_bound(result.timestamps.begin(), result.timestamps.end(), dsFinestThreshold);
-            size_t partIdx = static_cast<size_t>(partIt - result.timestamps.begin());
-
-            if (partIdx > 0) {
-                // Old segment: timestamps[0..partIdx) — fold through the SAME
-                // cascade the streaming path uses. Sharing the folder is the
-                // point: two implementations of this would let the answer
-                // depend on whether the caller supplied a sink.
-                std::vector<uint64_t> dsTimestamps;
-                std::vector<T> dsValues;
-                CascadeFolder<T> folder(dsStages, dsStageCount, downsampleMethod, dsTimestamps, dsValues);
-                folder.addRange(result.timestamps, result.values, partIdx);
-                folder.finish();
-
-                // Buckets actually emitted (all-NaN buckets contributed none).
-                const size_t emittedBuckets = dsTimestamps.size();
-
-                // Recent segment: timestamps[partIdx..end) — keep at full resolution
-                size_t recentCount = result.timestamps.size() - partIdx;
-                dsTimestamps.reserve(dsTimestamps.size() + recentCount);
-                dsValues.reserve(dsValues.size() + recentCount);
-                for (size_t i = partIdx; i < result.timestamps.size(); ++i) {
-                    dsTimestamps.push_back(result.timestamps[i]);
-                    dsValues.push_back(result.values[i]);
-                }
-
-                size_t originalCount = result.timestamps.size();
-                result.timestamps = std::move(dsTimestamps);
-                result.values = std::move(dsValues);
-                result.pointsWritten = result.timestamps.size();
-
-                timestar::compactor_log.info(
-                    "Downsample: {} -> {} points for series {} ({} old -> {} buckets across {} stage(s), {} recent "
-                    "kept)",
-                    originalCount, result.timestamps.size(), seriesId.toHex(), partIdx, emittedBuckets,
-                    static_cast<unsigned>(dsStageCount), recentCount);
-            }
-        }
+        co_await sink(std::move(tailTs), std::move(tailVals), {});
     }
 
     co_return result;
@@ -1446,7 +966,8 @@ seastar::future<> TSMCompactor::writeSeriesCompactionData(TSMWriter& writer, Ser
             // Already written incrementally through the chunk sink; the vectors
             // hold nothing that has not been emitted.
         } else if (!data.timestamps.empty()) {
-            co_await writer.writeSeriesStreaming(data.seriesType, data.seriesId, data.timestamps, data.values);
+            co_await writer.appendSeriesChunk(data.seriesType, data.seriesId, std::move(data.timestamps),
+                                              std::move(data.values), std::move(data.rollups));
         }
     }
 
@@ -1469,12 +990,15 @@ seastar::future<CompactionResult> TSMCompactor::compact(
     // target tier from the input files and allocate a fresh sequence ID.
     // This preserves backward compatibility for direct callers (e.g. tests).
     if (targetSeq == 0) {
-        uint64_t maxTier = 0;
+        uint64_t maxTier = 0, maxSequence = 0;
         for (const auto& file : files) {
             maxTier = std::max(maxTier, file->tierNum);
+            maxSequence = std::max(maxSequence, file->seqNum);
         }
         targetTier = strategy->getTargetTier(maxTier, files.size());
-        targetSeq = fileManager->allocateSequenceId();
+        if (maxSequence >= (uint64_t{1} << 60) - 1)
+            throw std::overflow_error("TSM sequence numbers exhausted");
+        targetSeq = fileManager->allocateSequenceId(maxSequence + 1);
     }
 
     std::string outputPath = generateCompactedFilename(targetTier, targetSeq, maxDataSeqOf(files));
@@ -1485,6 +1009,15 @@ seastar::future<CompactionResult> TSMCompactor::compact(
     // its streaming file handle; it now owns an open fd for the duration of the
     // compaction rather than opening one only at close time.
     TSMWriter writer(tempPath);
+    std::vector<uint64_t> replacedFiles;
+    for (const auto& file : files) {
+        replacedFiles.push_back(file->rankAsInteger());
+        const auto& ancestors = file->replacedFileRanks();
+        replacedFiles.insert(replacedFiles.end(), ancestors.begin(), ancestors.end());
+    }
+    std::sort(replacedFiles.begin(), replacedFiles.end());
+    replacedFiles.erase(std::unique(replacedFiles.begin(), replacedFiles.end()), replacedFiles.end());
+    writer.enableRollups(replacedFiles);
     std::exception_ptr compactionError;
     CompactionResult compactionResult;
     try {
@@ -1739,13 +1272,14 @@ seastar::future<CompactionResult> TSMCompactor::compact(
                     // series interleave in the file -- which is fine, since the
                     // index records each block's absolute offset.
                     PointChunkSink<ValueType> chunkSink = [this, &writer, &writeSemaphore, seriesId](
-                                                              std::vector<uint64_t>&& ts,
-                                                              std::vector<ValueType>&& vals) -> seastar::future<> {
+                                                              std::vector<uint64_t>&& ts, std::vector<ValueType>&& vals,
+                                                              std::vector<RollupState>&& rollups) -> seastar::future<> {
                         return seastar::with_semaphore(
                             writeSemaphore, 1,
-                            [this, &writer, seriesId, ts = std::move(ts), vals = std::move(vals)]() mutable {
+                            [this, &writer, seriesId, ts = std::move(ts), vals = std::move(vals),
+                             rollups = std::move(rollups)]() mutable {
                                 return writer.appendSeriesChunk(TSM::getValueType<ValueType>(), seriesId, std::move(ts),
-                                                                std::move(vals));
+                                                                std::move(vals), std::move(rollups));
                             });
                     };
 
@@ -1871,6 +1405,10 @@ seastar::future<CompactionStats> TSMCompactor::executeCompaction(CompactionPlan 
     // Acquire semaphore to limit concurrent compactions
     auto units = co_await seastar::get_units(compactionSemaphore, 1);
 
+    for (const auto& source : plan.sourceFiles) {
+        if (isFileInActiveCompaction(source))
+            co_return CompactionStats{};
+    }
     // Track this compaction
     ActiveCompaction active;
     active.plan = plan;

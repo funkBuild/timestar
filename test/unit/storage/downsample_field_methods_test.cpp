@@ -682,8 +682,7 @@ SEASTAR_TEST_F(DownsampleFieldMethodsTest, PerFieldMethodsComposeAcrossStages) {
                "is what makes the tier-wide avg approximation acceptable";
     }
 
-    // Sanity: the same points folded with the tier's avg do NOT compose, so the
-    // equality above is a property of `sum`, not of the fixture being too easy.
+    // The default average must also compose with the persisted sample counts.
     const std::string avgKey = "scada|rtu=r3|flow_total";
     auto b3 = self->newFile();
     b3.add(avgKey, TSMValueType::Float, ts, vals);
@@ -714,14 +713,10 @@ SEASTAR_TEST_F(DownsampleFieldMethodsTest, PerFieldMethodsComposeAcrossStages) {
     auto avgDirect = co_await self->readAll<double>(avgDirectPath, avgDirectKey);
 
     CO_ASSERT_EQ(avgCascaded.size(), avgDirect.size());
-    bool anyDivergence = false;
     auto ai = avgCascaded.begin();
     auto adi = avgDirect.begin();
     for (; ai != avgCascaded.end(); ++ai, ++adi) {
-        if (std::abs(ai->second - adi->second) > 1e-9) {
-            anyDivergence = true;
-        }
+        EXPECT_NEAR(ai->second, adi->second, 1e-12 * std::max(1.0, std::abs(adi->second)))
+            << "The default average must also retain sample weights across stages";
     }
-    EXPECT_TRUE(anyDivergence) << "the fixture must be gap-bearing enough that avg genuinely does not compose; "
-                                  "otherwise the sum equality above proves nothing";
 }

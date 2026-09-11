@@ -537,7 +537,7 @@ SEASTAR_TEST_F(DownsampleSweepTest, RewriteCapBoundsOneSweep) {
 // raw reads ~30x too dense under that assumption and gets rewritten on every
 // sweep forever. This test pins the conservative choice.
 // ---------------------------------------------------------------------------
-SEASTAR_TEST_F(DownsampleSweepTest, PartiallyAgedSeriesIsNotACandidate) {
+SEASTAR_TEST_F(DownsampleSweepTest, PartiallyAgedSeriesFoldsWithoutChurn) {
     Engine engine;
     std::exception_ptr failure;
     try {
@@ -569,11 +569,14 @@ SEASTAR_TEST_F(DownsampleSweepTest, PartiallyAgedSeriesIsNotACandidate) {
         co_await engine.sweepDownsampleRewrites();
 
         EXPECT_EQ(engine.getDownsampleSweepStats().filesExamined, 1u) << "the sweep should have looked";
-        EXPECT_EQ(engine.getDownsampleSweepStats().candidateFiles, 0u)
-            << "a series straddling the threshold was proposed: its aged fraction cannot be estimated from "
-               "series-level bounds, and prorating it re-proposes the sweep's own output forever";
-        EXPECT_EQ(engine.getDownsampleSweepStats().rewrites, 0u);
-        EXPECT_EQ(co_await storedTimestamps(engine, seriesKey), before);
+        EXPECT_EQ(engine.getDownsampleSweepStats().candidateFiles, 1u);
+        EXPECT_EQ(engine.getDownsampleSweepStats().rewrites, 1u);
+        auto after = co_await storedTimestamps(engine, seriesKey);
+        EXPECT_LT(after.size(), before.size());
+        const auto identities = fileIdentities(engine);
+        co_await engine.sweepDownsampleRewrites();
+        EXPECT_EQ(fileIdentities(engine), identities);
+        EXPECT_EQ(co_await storedTimestamps(engine, seriesKey), after);
     } catch (...) {
         failure = std::current_exception();
     }
@@ -626,4 +629,110 @@ SEASTAR_TEST_F(DownsampleSweepTest, NonNumericSeriesIsNotACandidate) {
     if (failure) {
         std::rethrow_exception(failure);
     }
+}
+
+SEASTAR_TEST_F(DownsampleSweepTest, MinuteHistoryCrossesWeekTierWithoutWaitingForNewestPoint) {
+    Engine engine;
+    std::exception_ptr failure;
+    try {
+        co_await engine.init();
+        const uint64_t now = nowNanos();
+        const uint64_t start = ((now - 8 * kDay) / (15 * kMin)) * (15 * kMin);
+        TimeStarInsert<double> insert("week_boundary", "value");
+        for (size_t i = 0; i < 7 * 24 * 60; ++i)
+            insert.addValue(start + i * kMin, 1.0);
+        auto key = insert.seriesKey();
+        co_await engine.insert(std::move(insert));
+        if (!co_await rolloverAndAwaitTsmFile(engine))
+            throw std::runtime_error("Conversion timed out");
+        installCascade(engine, "week_boundary",
+                       {tier("1h", kHour, "1m", kMin), tier("7d", 7 * kDay, "15m", 15 * kMin)});
+        auto before = co_await storedTimestamps(engine, key);
+        co_await engine.sweepDownsampleRewrites();
+        auto after = co_await storedTimestamps(engine, key);
+        EXPECT_LT(after.size(), before.size() - 1000);
+        EXPECT_EQ(after.back(), before.back());
+        EXPECT_EQ(engine.getDownsampleSweepStats().rewrites, 1u);
+        auto files = fileIdentities(engine);
+        co_await engine.sweepDownsampleRewrites();
+        EXPECT_EQ(fileIdentities(engine), files);
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    co_await engine.stop();
+    if (failure)
+        std::rethrow_exception(failure);
+}
+
+SEASTAR_TEST_F(DownsampleSweepTest, EngineQueriesCombineIndependentlyRewrittenFiles) {
+    Engine engine;
+    std::exception_ptr failure;
+    try {
+        co_await engine.init();
+        const uint64_t base = ((nowNanos() - 2 * kHour) / kMin) * kMin;
+        std::string key;
+        for (size_t part = 0; part < 2; ++part) {
+            TimeStarInsert<double> insert("split_minute", "value");
+            for (size_t i = 0; i < 30; ++i)
+                insert.addValue(base + (part * 30 + i) * kSec, 1.0);
+            key = insert.seriesKey();
+            co_await engine.insert(std::move(insert));
+            if (!co_await rolloverAndAwaitTsmFile(engine))
+                throw std::runtime_error("Conversion timed out");
+        }
+        RetentionPolicy policy;
+        policy.measurement = "split_minute";
+        auto stage = tier("1h", kHour, "1m", kMin);
+        stage.method = "sum";
+        policy.downsampleTiers = {stage};
+        engine.updateRetentionPolicyCache(policy);
+        co_await engine.sweepDownsampleRewrites();
+        EXPECT_EQ(engine.getDownsampleSweepStats().rewrites, 2u);
+        auto result = co_await engine.query(key, 0, UINT64_MAX);
+        EXPECT_TRUE(result.has_value());
+        if (result)
+            EXPECT_EQ(std::get<QueryResult<double>>(*result).values, std::vector<double>{60});
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    co_await engine.stop();
+    if (failure)
+        std::rethrow_exception(failure);
+}
+
+SEASTAR_TEST_F(DownsampleSweepTest, LateStatusInMemoryDoesNotOverrideNewerFoldedStatus) {
+    Engine engine;
+    std::exception_ptr failure;
+    try {
+        co_await engine.init();
+        const uint64_t base = ((nowNanos() - 2 * kHour) / kMin) * kMin;
+        TimeStarInsert<bool> insert("late_status", "status");
+        insert.addValue(base, false);
+        insert.addValue(base + 59 * kSec, true);
+        auto key = insert.seriesKey();
+        co_await engine.insert(std::move(insert));
+        if (!co_await rolloverAndAwaitTsmFile(engine))
+            throw std::runtime_error("Conversion timed out");
+        RetentionPolicy policy;
+        policy.measurement = "late_status";
+        auto stage = tier("1h", kHour, "1m", kMin);
+        stage.method = "latest";
+        stage.fieldMethods = std::map<std::string, std::string>{{"status", "latest"}};
+        policy.downsampleTiers = {stage};
+        engine.updateRetentionPolicyCache(policy);
+        co_await engine.sweepDownsampleRewrites();
+        EXPECT_EQ(engine.getDownsampleSweepStats().rewrites, 1u);
+        TimeStarInsert<bool> late("late_status", "status");
+        late.addValue(base + 30 * kSec, false);
+        co_await engine.insert(std::move(late));
+        auto result = co_await engine.query(key, 0, UINT64_MAX);
+        EXPECT_TRUE(result.has_value());
+        if (result)
+            EXPECT_EQ(std::get<QueryResult<bool>>(*result).values, std::vector<bool>{true});
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    co_await engine.stop();
+    if (failure)
+        std::rethrow_exception(failure);
 }

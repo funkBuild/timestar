@@ -205,10 +205,13 @@ SEASTAR_TEST_F(CompactionRetentionTest, OldDataDroppedAfterCompaction) {
     EXPECT_LT(compactedSize, sourceSize1) << "Compacted file should be much smaller than source file 1 "
                                           << "(all data was expired)";
 
-    // The minimal empty TSM is exactly 13 bytes (header + index offset trailer).
-    // Confirm the compacted file has no series data blocks (size <= 13 bytes).
-    EXPECT_LE(compactedSize, 13u) << "Expected empty compacted file (<=13 bytes) when all data is expired, "
-                                  << "got " << compactedSize << " bytes";
+    // An empty V4 output still carries input ancestry so a restart cannot
+    // resurrect the expired sources. Verify content, not the old V3 byte size.
+    auto empty = seastar::make_shared<TSM>(compactedPath);
+    co_await empty->open();
+    EXPECT_EQ(empty->getSeriesCount(), 0u);
+    EXPECT_EQ(empty->replacedFileRanks().size(), 2u);
+    co_await empty->close();
 
     co_return;
 }

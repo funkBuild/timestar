@@ -326,6 +326,44 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm([[maybe_unused]] const std
             tsmSlots[myIdx] = std::move(results);
         });
 
+    const bool hasRollupData = std::any_of(candidateFiles.begin(), candidateFiles.end(),
+                                           [&](const auto& file) { return file->hasRollups(seriesId); });
+    if (hasRollupData) {
+        std::vector<TSMResult<T>> inputs;
+        for (auto& slot : tsmSlots)
+            if (slot)
+                inputs.push_back(std::move(*slot));
+        auto matches = WALFileManager::queryAllMemoryStores<T>(pinnedStores, seriesId);
+        uint64_t rank = UINT64_MAX;
+        for (const auto& match : matches) {
+            // A pinned retiring store can outlive its conversion and a later
+            // compaction. Its samples are already represented in that output.
+            bool represented = false;
+            if (match.store->reservedTsmSeq) {
+                for (const auto& file : candidateFiles) {
+                    const auto& ancestors = file->replacedFileRanks();
+                    represented |= std::binary_search(ancestors.begin(), ancestors.end(), *match.store->reservedTsmSeq);
+                }
+            }
+            if (represented)
+                continue;
+            const auto& data = *match.series;
+            auto begin = std::lower_bound(data.timestamps.begin(), data.timestamps.end(), startTime);
+            auto end = std::upper_bound(begin, data.timestamps.end(), endTime);
+            const size_t offset = begin - data.timestamps.begin();
+            const size_t count = end - begin;
+            if (!count)
+                continue;
+            TSMResult<T> memory(rank--);
+            auto block = std::make_unique<TSMBlock<T>>(count);
+            block->timestamps.assign(begin, end);
+            block->values.assign(data.values.begin() + offset, data.values.begin() + offset + count);
+            memory.blocks.push_back(std::move(block));
+            inputs.push_back(std::move(memory));
+        }
+        co_return QueryResult<T>::fromRollupResults(inputs);
+    }
+
     // Collect non-empty results from the slots, paired with sparse time bounds.
     struct TimeBoundedResult {
         TSMResult<T> result;
@@ -788,6 +826,13 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     // full non-numeric gates, so the flag is dropped rather than trusted.
     if (boolLatestAsNumeric && !(method == timestar::AggregationMethod::LATEST && aggregationInterval > 0)) {
         boolLatestAsNumeric = false;
+    }
+    // Block statistics describe stored representatives, not independent raw
+    // samples. Reconcile rollup contributions through queryTsm before any
+    // query-time aggregation or latest-value shortcut.
+    for (const auto& [rank, file] : fileManager->getSequencedTsmFiles()) {
+        if (file->hasRollups(seriesId))
+            co_return std::nullopt;
     }
     // Gate 0.5: MEDIAN and EXACT_MEDIAN need all raw values — cannot use
     // pushdown aggregation.  T-digest is used at merge time for cross-shard

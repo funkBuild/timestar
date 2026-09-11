@@ -68,6 +68,7 @@ struct TSMIndexBlock {
     double blockLatestValue = 0.0;  // Value at latest timestamp (for LATEST)
     // 4-byte fields grouped together
     uint32_t size;
+    uint32_t rollupSize = 0;     // V4: compressed metadata immediately following the value block
     uint32_t blockCount = 0;     // 0 means stats not available
     uint32_t boolTrueCount = 0;  // Number of true values in block (Boolean)
     // 1-byte fields grouped together
@@ -135,6 +136,7 @@ struct SparseIndexEntry {
     // Boolean sparse stats for zero-I/O LATEST/FIRST
     bool boolFirstValue = false;
     bool boolLatestValue = false;
+    bool hasRollups = false;
 };
 
 // The sparse index is resident for every open file, so its per-series footprint
@@ -198,7 +200,7 @@ struct CacheSizeEstimator<::TSMIndexEntry> {
 // V1: Float blocks have stats (80 bytes), non-Float blocks are base-only (28 bytes).
 // V2: All types have block stats (Float=80, Integer=72, Boolean=40, String=32).
 // V3: per-series index block count widened from uint16 to uint32.
-static constexpr uint8_t TSM_VERSION = 3;
+static constexpr uint8_t TSM_VERSION = 4;
 // Oldest version we can READ. Dropping V2 readability would orphan every
 // pre-V3 file on upgrade (data invisible to queries, file never compacted or
 // reclaimed) — V2 files stay readable and are rewritten as V3 by compaction.
@@ -257,7 +259,7 @@ inline size_t indexBlockBytes(TSMValueType type, uint8_t version) {
         // V1: only Float has stats
         return (type == TSMValueType::Float) ? 80 : 28;
     }
-    return indexBlockBytesV2(type);
+    return indexBlockBytesV2(type) + (version >= 4 ? 4 : 0);
 }
 
 class TSM {
@@ -274,6 +276,7 @@ private:
     // Defaults to the current version: a truncated header must never leave this
     // at 1 and silently select the V1 index-block layout.
     uint8_t fileVersion = TSM_VERSION;
+    std::vector<uint64_t> replacedFileRanks_;
     // Set by scheduleDelete(): the on-disk file was unlinked but the fd must
     // stay open for in-flight snapshot readers; the destructor closes it.
     bool deferCloseOnDestroy_ = false;
@@ -543,6 +546,16 @@ public:
     }
 
     // Density stats for one series, or nullopt when this file does not hold it.
+    seastar::future<std::pair<uint64_t, uint64_t>> estimateRollupDensity(
+        const SeriesId128& seriesId, const std::vector<std::pair<uint64_t, uint64_t>>& stages);
+
+    const std::vector<uint64_t>& replacedFileRanks() const { return replacedFileRanks_; }
+
+    bool hasRollups(const SeriesId128& id) const {
+        auto it = sparseIndex.find(id);
+        return it != sparseIndex.end() && it->second.hasRollups;
+    }
+
     std::optional<SeriesDensity> getSeriesDensity(const SeriesId128& seriesId) const {
         auto it = sparseIndex.find(seriesId);
         if (it == sparseIndex.end()) {

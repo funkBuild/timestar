@@ -982,16 +982,20 @@ files) and downsampling never happened at all. Full API in
   15m after 90d). `downsampleTiers` is canonical and always serialised;
   `downsample` is a legacy mirror of tier 0, so an old reader degrades to the
   *finest* tier — finer than intended, never coarser.
-- **Only COMPLETE buckets fold.** Every threshold is aligned down to its own
-  interval (`((now - after) / interval) * interval`), which is what makes
-  re-folding already-folded data byte-identical at every stage. An unaligned
-  threshold re-folds a partial bucket against its own raw remainder.
-- **An all-NaN bucket emits nothing** (`count == 0` suppression, deliberately a
-  count check and not a NaN check, so a data-derived `+Inf + -Inf` still emits).
-- **`min`/`max`/`sum`/`latest` compose exactly across stages; `avg` does not** —
-  it is an unweighted mean of bucket means, exact only under uniform per-bucket
-  counts. Per-field `fieldMethods` exist so counters and totalizers route to a
-  method that composes.
+- **Downsampling uses persisted V4 rollup state.** Counts, sums, original latest
+  timestamps and aggregation methods survive compaction. Equal aggregate bucket
+  labels are contributions to combine, while raw timestamp duplicates retain
+  last-write-wins semantics. Do not feed aggregate values through raw dedup.
+- **Age thresholds are interval-aligned.** The sweep also checks partially aged
+  files by counting target buckets from block timestamps, without repeatedly
+  rewriting already-folded regions.
+- **Averages preserve sample weights through cascade stages.** Integers use a
+  128-bit sum; integer result overflow fails without deleting inputs. Aggregate
+  NaNs retain nonzero counts and must not disappear on a later fold.
+- **V4 files carry checksummed input ancestry.** Startup excludes replaced input
+  files before serving reads; registry replacement removes all inputs before
+  suspending. Shard rebalancing must preserve rollup state and clear old shard
+  ancestry. Older binaries cannot read V4; V2/V3 raw files stay readable.
 - **Boolean/String never fold by default and are never coerced to 1.0/0.0.** The
   only opt-in is an explicit `fieldMethods` entry of `latest`, which reduces to
   LATEST-per-bucket in the written type — matching the query-time rule. A
