@@ -33,7 +33,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <seastar/core/coroutine.hh>
+#include <string>
 
 namespace fs = std::filesystem;
 
@@ -819,4 +821,114 @@ seastar::future<> testReadSingleBlockIntegerReadAsFloat(std::string filename) {
 
 TEST_F(TSMBlockCorruptionTest, ReadSingleBlock_IntegerBlockReadAsFloat_Throws) {
     testReadSingleBlockIntegerReadAsFloat(getTestFilePath("0_211.tsm")).get();
+}
+
+// ---------------------------------------------------------------------------
+// PART 3: what a decode failure tells the operator, and what it must survive.
+//
+// Production (2026-09-03) dropped two series from a query with only
+// "CompressedSlice - attempted to read beyond buffer bounds [tsm <file>]" to go
+// on: every header check had passed and the value decoder ran out of bytes,
+// which is what BOTH a wrong descriptor and wrong bytes look like. These pin
+// (a) the block identity + header facts travelling with the error, and (b) the
+// read not depending on the caller's descriptor staying put across the DMA
+// suspension — the one way a correct file yields that exact failure.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+seastar::future<TSMIndexBlock> writeThreePointFloatSeries(const std::string& filename, const SeriesId128& seriesId,
+                                                          TSM& tsm) {
+    {
+        TSMWriter writer(filename);
+        std::vector<uint64_t> ts = {1000, 2000, 3000};
+        std::vector<double> vs = {1.1, 2.2, 3.3};
+        writer.writeSeries(TSMValueType::Float, seriesId, ts, vs);
+        writer.writeIndex();
+        writer.close();
+    }
+    co_await tsm.open();
+    auto* entry = co_await tsm.getFullIndexEntry(seriesId);
+    if (!entry || entry->indexBlocks.empty()) {
+        throw std::runtime_error("test setup: series not found in the file it was just written to");
+    }
+    co_return entry->indexBlocks[0];
+}
+
+uint32_t readTimestampBytesFromDisk(const std::string& filename, uint64_t blockOffset) {
+    std::ifstream f(filename, std::ios::binary);
+    f.seekg(static_cast<std::streamoff>(blockOffset + 5));  // header: type(1) count(4) tsBytes(4)
+    uint32_t timestampBytes = 0;
+    f.read(reinterpret_cast<char*>(&timestampBytes), sizeof(timestampBytes));
+    return timestampBytes;
+}
+
+}  // namespace
+
+// A descriptor whose size stops 8 bytes into the value section: type, count and
+// timestamp checks all pass and only the value decoder runs out — the exact
+// production shape. The error must name the block and carry the header facts,
+// so the next occurrence says whether descriptor and bytes disagreed.
+seastar::future<> testDecodeErrorNamesTheBlock(std::string filename) {
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey("corrupt.float.context");
+    TSM tsm(filename);
+    TSMIndexBlock block = co_await writeThreePointFloatSeries(filename, seriesId, tsm);
+
+    const uint32_t timestampBytes = readTimestampBytesFromDisk(filename, block.offset);
+    TSMIndexBlock truncated = block;
+    truncated.size = 9 + timestampBytes + 8;
+    EXPECT_LT(truncated.size, block.size) << "test premise: the value section is longer than 8 bytes";
+
+    std::string what;
+    try {
+        co_await tsm.readSingleBlock<double>(truncated, 0, UINT64_MAX);
+    } catch (const std::exception& e) {
+        what = e.what();
+    }
+    EXPECT_FALSE(what.empty()) << "a value section cut to 8 bytes must not decode";
+    EXPECT_NE(what.find(" [block offset=" + std::to_string(block.offset) + " size=" + std::to_string(truncated.size)),
+              std::string::npos)
+        << what;
+    EXPECT_NE(what.find("hdr.count=3"), std::string::npos) << what;
+    EXPECT_NE(what.find("hdr.tsBytes=" + std::to_string(timestampBytes)), std::string::npos) << what;
+    EXPECT_NE(what.find("valueBytes=8"), std::string::npos) << what;
+    EXPECT_NE(what.find(" [tsm "), std::string::npos) << "the file path must still be appended: " << what;
+
+    co_await tsm.close();
+}
+
+TEST_F(TSMBlockCorruptionTest, ReadSingleBlock_DecodeErrorNamesTheBlock) {
+    testDecodeErrorNamesTheBlock(getTestFilePath("0_210.tsm")).get();
+}
+
+// The caller's descriptor changes while the read is suspended on its DMA. The
+// read must have taken its own copy: before it did, the resumed coroutine sized
+// the value section from whatever the reference now pointed at and failed in
+// the value decoder against perfectly good bytes.
+seastar::future<> testDescriptorMutatedDuringRead(std::string filename) {
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey("corrupt.float.mutated");
+    TSM tsm(filename);
+    TSMIndexBlock block = co_await writeThreePointFloatSeries(filename, seriesId, tsm);
+
+    auto live = std::make_unique<TSMIndexBlock>(block);
+    auto pending = tsm.readSingleBlock<double>(*live, 0, UINT64_MAX);  // suspended on the DMA read
+    EXPECT_FALSE(pending.available()) << "test premise: the read suspends before decoding";
+    *live = TSMIndexBlock{};  // size 0, offset 0 — anything but the real descriptor
+
+    auto result = co_await std::move(pending);
+    EXPECT_NE(result, nullptr);
+    if (result) {
+        EXPECT_EQ(result->timestamps.size(), 3u);
+        EXPECT_EQ(result->values.size(), 3u);
+        if (result->values.size() == 3u) {
+            EXPECT_DOUBLE_EQ(result->values[0], 1.1);
+            EXPECT_DOUBLE_EQ(result->values[2], 3.3);
+        }
+    }
+
+    co_await tsm.close();
+}
+
+TEST_F(TSMBlockCorruptionTest, ReadSingleBlock_SurvivesDescriptorMutatedDuringRead) {
+    testDescriptorMutatedDuringRead(getTestFilePath("0_211.tsm")).get();
 }

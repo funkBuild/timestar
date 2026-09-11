@@ -270,6 +270,13 @@ public:
     seastar::future<> loadAndBroadcastRetentionPolicies();
     // TTL background sweep (dispatched to all shards from shard 0 timer)
     seastar::future<> sweepExpiredFiles();
+
+    // Startup repair for time-scoped discovery. Day bitmaps are the only index
+    // structure that cannot be rebuilt from index state alone (they are a
+    // function of insert timestamps), so the timestamps come from the TSM
+    // sparse index — which means this must run AFTER tsmFileManager.init() and
+    // walFileManager.init(), not inside NativeIndex::open().
+    seastar::future<> rebuildDayBitmaps();
     // Start the periodic retention sweep timer (shard 0 only, 15min interval)
     void startRetentionSweepTimer();
     // Tombstone-triggered TSM file rewrite: identifies files with >10% estimated dead data

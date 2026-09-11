@@ -63,6 +63,18 @@ inline uint32_t dayBucketFromNs(uint64_t timestampNs) {
 
 std::string encodeDayBitmapPrefix(const std::string& measurement);
 uint32_t decodeDayFromDayBitmapKey(std::string_view key);
+std::string encodeDayBitmapWatermarkKey();
+std::string encodeCleanShutdownKey();
+std::string encodeClampedHistoryKey(const std::string& measurement);
+
+// Day bitmaps are keyed by day, so the watermark is encoded the same width as
+// a local id (4 bytes) and reuses encodeLocalId/decodeLocalId's representation.
+inline std::string encodeDay(uint32_t day) {
+    return encodeLocalId(day);
+}
+inline uint32_t decodeDay(std::string_view encoded) {
+    return decodeLocalId(encoded);
+}
 
 // --- Phase 4: Cardinality HLL + measurement bloom key encoding ---
 

@@ -1,4 +1,5 @@
 #include "../../../lib/index/native/bloom_filter.hpp"
+
 #include "../../../lib/index/native/bloom_filter_simd.hpp"
 
 #include <gtest/gtest.h>
@@ -13,8 +14,14 @@ TEST(BloomFilterTest, EmptyFilter) {
     BloomFilter bf(10);
     bf.build();
     EXPECT_EQ(bf.keyCount(), 0u);
-    // Empty filter should return false for any key
-    EXPECT_FALSE(bf.mayContain("anything"));
+    // CONTRACT CHANGE: a filter with no keys used to answer "definitely absent"
+    // for everything. A bloom is only ever consulted to SKIP work, so that let a
+    // never-populated filter veto every lookup that consulted it — on the
+    // discovery path, a measurement's series silently ceasing to exist. A filter
+    // with no bits cannot prove absence, so it now says "maybe" and is marked
+    // null. See BloomFilterEmptyFilter.* below.
+    EXPECT_TRUE(bf.isNull());
+    EXPECT_TRUE(bf.mayContain("anything"));
 }
 
 TEST(BloomFilterTest, SingleKey) {
@@ -160,8 +167,7 @@ TEST(BloomFilterTest, DifferentBitsPerKey) {
 
         // All inserted keys must be found
         for (int i = 0; i < 1000; ++i) {
-            EXPECT_TRUE(bf.mayContain(std::format("bpk:{:04d}", i)))
-                << "False negative at bpk=" << bpk << " key=" << i;
+            EXPECT_TRUE(bf.mayContain(std::format("bpk:{:04d}", i))) << "False negative at bpk=" << bpk << " key=" << i;
         }
     }
 }
@@ -332,11 +338,13 @@ TEST(BloomFilterSIMDTest, PopcountDirect) {
     EXPECT_EQ(simd::bloomPopcount(data.data(), numWords), 64u);
 
     // Set every bit in all words
-    for (auto& w : data) w = ~0ULL;
+    for (auto& w : data)
+        w = ~0ULL;
     EXPECT_EQ(simd::bloomPopcount(data.data(), numWords), 64u * numWords);
 
     // Set alternating bits: 0x5555... has 32 bits per word
-    for (auto& w : data) w = 0x5555555555555555ULL;
+    for (auto& w : data)
+        w = 0x5555555555555555ULL;
     EXPECT_EQ(simd::bloomPopcount(data.data(), numWords), 32u * numWords);
 }
 
@@ -401,4 +409,32 @@ TEST(BloomFilterSIMDTest, BinaryKeysLargeFilter) {
     for (const auto& key : keys) {
         EXPECT_TRUE(bf.mayContain(key)) << "False negative for binary key";
     }
+}
+
+// A filter with no bits must never claim a key is absent.
+//
+// A bloom is only ever consulted to SKIP work, so "definitely absent" from a
+// filter that was never populated is indistinguishable from the data not
+// existing — on the discovery path that is a measurement's series silently
+// vanishing (the 1.4.0 incident's mechanism, reached a different way).
+TEST(BloomFilterEmptyFilter, ZeroKeyFilterNeverRejects) {
+    BloomFilter bf(10);
+    bf.build();  // nothing added
+
+    EXPECT_TRUE(bf.isNull()) << "a zero-key filter must be null, not an empty authority";
+    EXPECT_TRUE(bf.mayContain("anything")) << "an empty filter cannot prove absence";
+    EXPECT_TRUE(bf.mayContain("")) << "an empty filter cannot prove absence";
+}
+
+// The same filter after a round trip through disk: a zero-length payload must
+// come back as null rather than as a real filter that rejects everything.
+TEST(BloomFilterEmptyFilter, ZeroLengthPayloadDeserializesAsNull) {
+    BloomFilter bf(10);
+    bf.build();
+    std::string serialized;
+    bf.serializeTo(serialized);
+
+    auto restored = BloomFilter::deserializeFrom(serialized);
+    EXPECT_TRUE(restored.isNull());
+    EXPECT_TRUE(restored.mayContain("anything"));
 }

@@ -11,14 +11,17 @@
  * - getSeriesGroupedByTag via bitmap prefix scan
  */
 
-#include "../../../lib/index/native/native_index.hpp"
 #include "../../../lib/core/series_id.hpp"
+#include "../../../lib/index/key_encoding.hpp"
+#include "../../../lib/index/native/bloom_filter.hpp"
+#include "../../../lib/index/native/native_index.hpp"
 #include "../../seastar_gtest.hpp"
+#include "../../test_helpers/native_index_test_access.hpp"
 
 #include <gtest/gtest.h>
-#include <seastar/core/coroutine.hh>
 
 #include <filesystem>
+#include <seastar/core/coroutine.hh>
 #include <string>
 
 using namespace timestar::index;
@@ -31,8 +34,7 @@ public:
 
 // Helper: create series and return its ID
 static seastar::future<SeriesId128> createSeries(NativeIndex& index, const std::string& measurement,
-                                                   std::map<std::string, std::string> tags,
-                                                   const std::string& field) {
+                                                 std::map<std::string, std::string> tags, const std::string& field) {
     co_return co_await index.getOrCreateSeriesId(measurement, std::move(tags), field);
 }
 
@@ -72,7 +74,8 @@ SEASTAR_TEST_F(PostingsBitmapTest, MultiTagIntersection) {
 
     // Create series with varying tags
     auto id1 = co_await createSeries(index, "cpu", {{"region", "us-west"}, {"host", "h1"}, {"env", "prod"}}, "usage");
-    auto id2 = co_await createSeries(index, "cpu", {{"region", "us-west"}, {"host", "h2"}, {"env", "staging"}}, "usage");
+    auto id2 =
+        co_await createSeries(index, "cpu", {{"region", "us-west"}, {"host", "h2"}, {"env", "staging"}}, "usage");
     auto id3 = co_await createSeries(index, "cpu", {{"region", "us-east"}, {"host", "h3"}, {"env", "prod"}}, "usage");
     auto id4 = co_await createSeries(index, "cpu", {{"region", "us-west"}, {"host", "h4"}, {"env", "prod"}}, "usage");
 
@@ -265,8 +268,11 @@ SEASTAR_TEST_F(PostingsBitmapTest, BulkInsertWithMultipleFlushes) {
             for (int f = 0; f < 8; ++f) {
                 std::string field = "f" + std::to_string(f);
                 co_await index.getOrCreateSeriesId(meas,
-                    {{"host", host}, {"region", region}, {"rack", "rack-" + std::to_string(i % 5)},
-                     {"env", (i < 10) ? "staging" : "production"}}, field);
+                                                   {{"host", host},
+                                                    {"region", region},
+                                                    {"rack", "rack-" + std::to_string(i % 5)},
+                                                    {"env", (i < 10) ? "staging" : "production"}},
+                                                   field);
             }
         }
     }
@@ -326,4 +332,101 @@ SEASTAR_TEST_F(PostingsBitmapTest, MigrationFromPhase1) {
 
         co_await index.close();
     }
+}
+
+// Regression: the measurement bloom must never acquire a false negative.
+//
+// Production (2026-08-25, 1.4.0): scoped lookups returned NO series for ~52% of
+// tag values that findSeries-by-prefix (`by {tag}`) could enumerate. Sequence:
+// a session opens with persisted postings for A; the first bloom rebuild does
+// the full KV scan and sets bloomFullyBuilt_; nothing loads A's bitmap into
+// bitmapCache_ (existing-series inserts short-circuit on the series cache, and
+// the scan itself does not populate the cache); the next rebuild trusts the
+// flag and rebuilds from the cache alone, so A's key drops out of the bloom
+// and getPostingsBitmapByKey short-circuits to "no such series" forever.
+SEASTAR_TEST_F(PostingsBitmapTest, BloomRebuildKeepsSeriesNotResidentInCache) {
+    SeriesId128 idA;
+    {
+        NativeIndex index(0);
+        co_await index.open();
+        idA = co_await createSeries(index, "deviceData", {{"deviceName", "GW85"}}, "valveSetpoint");
+        co_await index.close();  // persists postings + a bloom containing GW85
+    }
+
+    NativeIndex index(0);
+    co_await index.open();  // fresh caches: GW85's bitmap is NOT resident
+
+    // Rebuild #1 — no full-scan record yet, so it scans KV and sees GW85.
+    // Deliberately NO lookup of GW85 in between: a read would load its bitmap
+    // into the cache and mask the defect (which is exactly why tag values on
+    // a frequently viewed dashboard survived in production and the rest did not).
+    co_await createSeries(index, "deviceData", {{"deviceName", "GW001"}}, "valveSetpoint");
+    co_await index.compact();
+
+    // Rebuild #2 in the same session — was built from bitmapCache_ only.
+    co_await createSeries(index, "deviceData", {{"deviceName", "GW002"}}, "valveSetpoint");
+    co_await index.compact();
+
+    // GW85 was never loaded into the cache by anything above, so a cache-only
+    // rebuild loses it. The scoped lookup must still find it.
+    auto found2 = co_await index.findSeriesByTag("deviceData", "deviceName", "GW85");
+    EXPECT_EQ(found2.size(), 1u) << "GW85 vanished from the measurement bloom";
+    if (!found2.empty())
+        EXPECT_EQ(found2[0], idA);
+
+    // And the multi-tag intersection path, which the console's scoped queries use.
+    auto scoped = co_await index.findSeries("deviceData", {{"deviceName", "GW85"}});
+    EXPECT_TRUE(scoped.has_value());
+    if (scoped.has_value())
+        EXPECT_EQ(scoped->size(), 1u);
+
+    // Enumeration never used the bloom and always saw all three.
+    auto grouped = co_await index.getSeriesGroupedByTag("deviceData", "deviceName");
+    EXPECT_EQ(grouped.size(), 3u);
+
+    co_await index.close();
+}
+
+// A server that wrote a bloom missing persisted postings keys (any <= 1.4.0)
+// must be fully repaired by the NEXT open(), before it serves anything — not at
+// some later memtable flush that a quiet measurement may never trigger.
+SEASTAR_TEST_F(PostingsBitmapTest, OpenRepairsStalePersistedBloomImmediately) {
+    SeriesId128 idA;
+    {
+        NativeIndex index(0);
+        co_await index.open();
+        idA = co_await createSeries(index, "deviceData", {{"deviceName", "GW85"}}, "valveSetpoint");
+        co_await createSeries(index, "deviceData", {{"deviceName", "GW001"}}, "valveSetpoint");
+        co_await index.close();
+    }
+
+    // Session 2: overwrite the persisted bloom with one that only knows GW001,
+    // AFTER open() has done its repair, and shut down with nothing else dirty
+    // so the stale bloom is what remains on disk.
+    {
+        NativeIndex index(0);
+        co_await index.open();
+        auto onlyGW001 = keys::encodePostingsBitmapPrefix("deviceData", "deviceName") + "GW001";
+        co_await NativeIndexTestAccess::plantStaleBloom(index, "deviceData", {onlyGW001});
+
+        // Control: with the stale bloom in place, the scoped lookup is blind.
+        auto blind = co_await index.findSeriesByTag("deviceData", "deviceName", "GW85");
+        EXPECT_EQ(blind.size(), 0u) << "test precondition: the planted bloom should hide GW85";
+
+        co_await index.close();
+    }
+
+    // Session 3: a bare open() must have rebuilt the bloom from the persisted
+    // postings keys. No flush, no enumeration, no other activity first.
+    NativeIndex index(0);
+    co_await index.open();
+    auto found = co_await index.findSeriesByTag("deviceData", "deviceName", "GW85");
+    EXPECT_EQ(found.size(), 1u) << "open() did not repair the stale bloom";
+    if (!found.empty())
+        EXPECT_EQ(found[0], idA);
+    auto scoped = co_await index.findSeries("deviceData", {{"deviceName", "GW85"}});
+    EXPECT_TRUE(scoped.has_value());
+    if (scoped.has_value())
+        EXPECT_EQ(scoped->size(), 1u);
+    co_await index.close();
 }
