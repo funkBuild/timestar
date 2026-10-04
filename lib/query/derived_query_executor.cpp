@@ -1673,12 +1673,32 @@ seastar::future<forecast::ForecastQueryResult> DerivedQueryExecutor::executeFore
         throw DerivedQueryException("Query '" + queryRef + "' not found in queries map");
     }
 
+    // Training history and prediction horizon are independent. Fetch the
+    // requested history even when the visible dashboard window is shorter.
+    uint64_t historyNs = 0;
+    uint64_t horizonNs = 0;
+    try {
+        if (forecastFunc.history)
+            historyNs = forecast::parseDurationToNs(*forecastFunc.history);
+        if (forecastFunc.horizon)
+            horizonNs = forecast::parseDurationToNs(*forecastFunc.horizon);
+    } catch (const std::exception& error) {
+        throw DerivedQueryException("Invalid forecast duration: " + std::string(error.what()));
+    }
+    auto inputQuery = applyAggregationInterval(request, it->second);
+    if (historyNs > 0 && inputQuery.endTime > 0) {
+        const uint64_t historyStart = inputQuery.endTime > historyNs ? inputQuery.endTime - historyNs : 0;
+        // Extend when necessary, but retain groups visible in the original
+        // query so history trimming can report them as declined rather than
+        // making stopped devices disappear from the diagnostics.
+        inputQuery.startTime = std::min(inputQuery.startTime, historyStart);
+    }
+
     // Execute the sub-query at the request's aggregation interval, allowing it
     // to resolve to MANY groups: forecast() runs per group and returns one set
     // of pieces per group, each labelled with its own group_tags.  A leg that
     // resolves to exactly one group behaves exactly as it did before.
-    MultiSeriesSubQueryResult multi =
-        co_await executeSubQueryMulti(queryRef, applyAggregationInterval(request, it->second));
+    MultiSeriesSubQueryResult multi = co_await executeSubQueryMulti(queryRef, inputQuery);
 
     // Every group is projected onto ONE shared axis (ForecastQueryResult
     // carries a single `times` vector), with NaN where a group has no point.
@@ -1709,14 +1729,10 @@ seastar::future<forecast::ForecastQueryResult> DerivedQueryExecutor::executeFore
         }
     }
 
-    // Parse history parameter if provided (for linear algorithm only)
-    if (forecastFunc.history.has_value()) {
-        try {
-            config.historyDurationNs = forecast::parseDurationToNs(forecastFunc.history.value());
-        } catch (const std::exception& e) {
-            throw DerivedQueryException("Invalid history parameter: " + std::string(e.what()));
-        }
-    }
+    config.historyDurationNs = historyNs;
+    // An explicit training window must not be silently shortened again by
+    // the horizon-dependent auto-window optimization in ForecastExecutor.
+    config.disableAutoWindow = historyNs > 0;
 
     // Filter data based on the history parameter if specified.  The trim runs
     // ONCE on the SHARED axis and is applied to every group by the same offset,
@@ -1729,30 +1745,41 @@ seastar::future<forecast::ForecastQueryResult> DerivedQueryExecutor::executeFore
     std::vector<std::vector<double>> seriesValues = std::move(aligned.values);
 
     if (config.historyDurationNs > 0 && !filteredTimestamps.empty()) {
-        // Find the cutoff time (last timestamp - history duration)
-        uint64_t lastTimestamp = filteredTimestamps.back();
-        uint64_t cutoffTime = lastTimestamp > config.historyDurationNs ? lastTimestamp - config.historyDurationNs : 0;
+        // Anchor explicit history to the query end. An outage must not move
+        // the training window backwards to stale observations.
+        const uint64_t historyEnd = inputQuery.endTime > 0 ? inputQuery.endTime : filteredTimestamps.back();
+        uint64_t cutoffTime = historyEnd > config.historyDurationNs ? historyEnd - config.historyDurationNs : 0;
 
         // First index where timestamp >= cutoffTime (timestamps are sorted)
         auto cutIt = std::lower_bound(filteredTimestamps.begin(), filteredTimestamps.end(), cutoffTime);
         size_t startIdx = static_cast<size_t>(cutIt - filteredTimestamps.begin());
 
-        if (startIdx > 0 && startIdx < filteredTimestamps.size()) {
+        if (startIdx > 0) {
             filteredTimestamps.erase(filteredTimestamps.begin(),
                                      filteredTimestamps.begin() + static_cast<ptrdiff_t>(startIdx));
             for (auto& values : seriesValues) {
-                if (values.size() > startIdx) {
+                if (values.size() >= startIdx) {
                     values.erase(values.begin(), values.begin() + static_cast<ptrdiff_t>(startIdx));
                 }
             }
         }
     }
 
+    if (filteredTimestamps.empty()) {
+        forecast::ForecastQueryResult emptyResult;
+        emptyResult.success = true;
+        emptyResult.statistics.algorithm = forecastFunc.algorithm;
+        emptyResult.statistics.deviations = config.deviations;
+        emptyResult.statistics.declinedSeriesCount = seriesValues.size();
+        co_return emptyResult;
+    }
+
     // Determine forecast horizon from the query time range and the SHARED
     // axis's sampling interval, so every group is projected the same distance
     // into the future — the result carries one `times` vector for all of them.
     // Guard against unsigned underflow if endTime <= startTime
-    uint64_t duration = (request.endTime > request.startTime) ? request.endTime - request.startTime : 0;
+    uint64_t duration =
+        horizonNs > 0 ? horizonNs : ((request.endTime > request.startTime) ? request.endTime - request.startTime : 0);
     if (duration > 0 && filteredTimestamps.size() >= 2) {
         uint64_t timeSpan = (filteredTimestamps.back() > filteredTimestamps.front())
                                 ? filteredTimestamps.back() - filteredTimestamps.front()
@@ -1764,6 +1791,8 @@ seastar::future<forecast::ForecastQueryResult> DerivedQueryExecutor::executeFore
             // asked for.  It is NOT truncated here — see the output bound
             // below for why a ceiling on this number is the wrong instrument.
             config.forecastHorizon = static_cast<size_t>(duration / interval);
+            if (horizonNs > 0 && config.forecastHorizon == 0)
+                throw DerivedQueryException("Forecast horizon must be at least one sampling interval");
         }
     }
 

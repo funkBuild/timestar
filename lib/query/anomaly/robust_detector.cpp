@@ -2,138 +2,95 @@
 
 #include <algorithm>
 #include <cmath>
+#include <deque>
 #include <limits>
-#include <numeric>
 
-namespace timestar {
-namespace anomaly {
-
-void RobustDetector::computeBounds(const STLComponents& stl, std::span<const double> values,
-                                   const std::vector<double>& expected, double bounds, std::vector<double>& upper,
-                                   std::vector<double>& lower) {
-    size_t n = values.size();
-    upper.resize(n);
-    lower.resize(n);
-
-    // Compute residual statistics (using robust estimators)
-    // MAD = median(|x_i - median(x)|), NOT median(|x_i|)
-    std::vector<double> residuals;
-    residuals.reserve(n);
-
-    for (size_t i = 0; i < n; ++i) {
-        if (!std::isnan(stl.residual[i])) {
-            residuals.push_back(stl.residual[i]);
-        }
-    }
-
-    if (residuals.empty()) {
-        // No valid residuals - use infinite bounds (never flag anomalies)
-        for (size_t i = 0; i < n; ++i) {
-            upper[i] = std::numeric_limits<double>::infinity();
-            lower[i] = -std::numeric_limits<double>::infinity();
-        }
-        return;
-    }
-
-    // Step 1: Compute median of raw residuals
-    size_t sz = residuals.size();
-    size_t medianIdx = sz / 2;
-    std::nth_element(residuals.begin(), residuals.begin() + static_cast<ptrdiff_t>(medianIdx), residuals.end());
-    double residualMedian;
-    if (sz % 2 == 0 && sz >= 2) {
-        double upperMedian = residuals[medianIdx];
-        auto lowerIt = std::max_element(residuals.begin(), residuals.begin() + static_cast<ptrdiff_t>(medianIdx));
-        residualMedian = (*lowerIt + upperMedian) / 2.0;
-    } else {
-        residualMedian = residuals[medianIdx];
-    }
-
-    // Step 2: Compute |x_i - median(x)|, reusing the residuals vector in-place
-    for (size_t i = 0; i < sz; ++i) {
-        residuals[i] = std::abs(residuals[i] - residualMedian);
-    }
-
-    // Step 3: MAD = median of the absolute deviations
-    std::nth_element(residuals.begin(), residuals.begin() + static_cast<ptrdiff_t>(medianIdx), residuals.end());
-    double mad;
-    if (sz % 2 == 0 && sz >= 2) {
-        double upperMedian = residuals[medianIdx];
-        auto lowerIt = std::max_element(residuals.begin(), residuals.begin() + static_cast<ptrdiff_t>(medianIdx));
-        mad = (*lowerIt + upperMedian) / 2.0;
-    } else {
-        mad = residuals[medianIdx];
-    }
-
-    // Convert MAD to standard deviation equivalent
-    // For normal distribution: sigma ≈ 1.4826 * MAD
-    double sigma = 1.4826 * mad;
-
-    // Ensure minimum bound width
-    double minSigma = 0.0;
-    for (size_t i = 0; i < n; ++i) {
-        if (!std::isnan(values[i])) {
-            minSigma = std::max(minSigma, std::abs(values[i]) * 0.01);
-        }
-    }
-    sigma = std::max(sigma, minSigma);
-    if (sigma < 1e-10)
-        sigma = 1.0;
-
-    // Compute bounds around the precomputed expected values (trend + seasonal)
-    // using the scalar-scale overload — sigma is uniform, so no N-sized scale
-    // vector is needed.
-    simd::computeBounds(expected.data(), sigma, bounds, upper.data(), lower.data(), n);
+namespace timestar::anomaly {
+namespace {
+double median(std::vector<double> values) {
+    const size_t middle = values.size() / 2;
+    std::nth_element(values.begin(), values.begin() + middle, values.end());
+    if (values.size() % 2)
+        return values[middle];
+    return (values[middle] + *std::max_element(values.begin(), values.begin() + middle)) / 2.0;
 }
+}  // namespace
 
 AnomalyOutput RobustDetector::detect(const AnomalyInputView& input, const AnomalyConfig& config) {
     AnomalyOutput output;
-
-    if (input.empty()) {
+    const size_t n = input.size();
+    if (n == 0)
         return output;
-    }
+    const double missing = std::numeric_limits<double>::quiet_NaN();
+    output.predictions.resize(n, missing);
+    output.upper.resize(n, std::numeric_limits<double>::infinity());
+    output.lower.resize(n, -std::numeric_limits<double>::infinity());
+    output.scores.resize(n, 0.0);
 
-    size_t n = input.size();
-
-    // Configure STL decomposition
-    STLConfig stlConfig;
-    stlConfig.seasonalPeriod = seasonalityToPeriod(config.seasonality, estimateInterval(input.timestamps));
-    stlConfig.seasonalWindow = config.stlSeasonalWindow;
-    stlConfig.robust = config.stlRobust;
-
-    // Perform STL decomposition (already SIMD-optimized)
-    STLComponents stl = STLDecomposition::decompose(input.values, stlConfig);
-
-    // Store predictions (trend + seasonal) using SIMD
-    output.predictions.resize(n);
-    simd::vectorAdd(stl.trend.data(), stl.seasonal.data(), output.predictions.data(), n);
-
-    // Compute bounds based on residual distribution (SIMD-optimized).
-    // output.predictions is the trend+seasonal series computed above — pass it
-    // as the expected values instead of recomputing trend+seasonal internally.
-    computeBounds(stl, input.values, output.predictions, config.bounds, output.upper, output.lower);
-
-    // Compute anomaly scores using SIMD
-    output.scores.resize(n);
-    simd::computeAnomalyScores(input.values.data(), output.upper.data(), output.lower.data(), output.scores.data(), n);
-
-    // Fix up NaN inputs: SIMD may have produced NaN scores for NaN input values.
-    // NaN inputs are missing data, not anomalies -- ensure score is 0.
+    // Fixed-size, trailing windows make a classification independent of values
+    // appended later. Centred STL both anticipated spikes and repainted alerts;
+    // its whole-range MAD even let future spikes widen every earlier bound.
+    const size_t window = std::max(config.windowSize, config.minDataPoints);
+    const size_t period = seasonalityToPeriod(config.seasonality, estimateInterval(input.timestamps));
+    const size_t cycles = std::max<size_t>(3, config.stlSeasonalWindow);
+    std::deque<double> history;
+    std::deque<double> residuals;
+    size_t finiteCount = 0;
     for (size_t i = 0; i < n; ++i) {
-        if (std::isnan(input.values[i])) {
-            output.scores[i] = 0.0;
+        const double value = input.values[i];
+        if (!std::isfinite(value)) {
+            output.upper[i] = output.lower[i] = missing;
+            continue;
         }
-    }
-
-    // Count anomalies
-    output.anomalyCount = 0;
-    for (size_t i = 0; i < n; ++i) {
-        if (output.scores[i] > 0) {
-            ++output.anomalyCount;
+        std::vector<double> baseline;
+        if (period > 0) {
+            // Compare the same phase in previous cycles, never this/future cycle.
+            for (size_t cycle = 1; cycle <= cycles && cycle <= i / period; ++cycle) {
+                const double previous = input.values[i - cycle * period];
+                if (std::isfinite(previous))
+                    baseline.push_back(previous);
+            }
+        } else {
+            baseline.assign(history.begin(), history.end());
         }
+        const double prediction = baseline.empty() ? value : median(baseline);
+        output.predictions[i] = prediction;
+        const bool ready =
+            finiteCount >= config.minDataPoints && baseline.size() >= (period > 0 ? 2 : config.minDataPoints);
+        if (ready) {
+            // A non-seasonal MAD comes from the trailing level distribution;
+            // seasonal MAD comes from earlier one-step prediction residuals.
+            std::vector<double> errors =
+                period > 0 ? std::vector<double>(residuals.begin(), residuals.end()) : baseline;
+            double sigma = 0.0;
+            if (!errors.empty()) {
+                const double center = median(errors);
+                for (double& error : errors)
+                    error = std::abs(error - center);
+                sigma = 1.4826 * median(std::move(errors));
+            }
+            sigma = std::max(sigma, std::abs(prediction) * 0.01);
+            if (sigma < 1e-10)
+                sigma = 1.0;
+            const double margin = config.bounds * sigma;
+            output.upper[i] = prediction + margin;
+            output.lower[i] = prediction - margin;
+            output.scores[i] = std::max({value - output.upper[i], output.lower[i] - value, 0.0});
+            if (output.scores[i] > 0)
+                ++output.anomalyCount;
+        }
+        // Score before admitting the sample. Median/MAD resist isolated spikes
+        // while a sustained change can eventually establish a new baseline.
+        if (!baseline.empty()) {
+            residuals.push_back(value - prediction);
+            if (residuals.size() > window)
+                residuals.pop_front();
+        }
+        history.push_back(value);
+        if (history.size() > window)
+            history.pop_front();
+        ++finiteCount;
     }
-
     return output;
 }
-
-}  // namespace anomaly
-}  // namespace timestar
+}  // namespace timestar::anomaly

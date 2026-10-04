@@ -3971,3 +3971,86 @@ TEST_F(ForecastNumericalTest, ShortValueColumnIsClampedNotReadPastItsEnd) {
     config.linearModel = LinearModelType::DEFAULT;
     EXPECT_TRUE(forecaster.forecast(input, config, forecastTs).empty());
 }
+
+// Regression: independently stable ordinary/seasonal AR fits were added rather
+// than multiplied, giving an unstable combined recurrence on this bounded input.
+TEST_F(ForecastNumericalTest, SeasonalForecastStaysBoundedAcrossManyCycles) {
+    std::vector<double> values(336);
+    for (size_t i = 0; i < values.size(); ++i) {
+        for (size_t j = 0; j < 6; ++j) {
+            const double t = static_cast<double>(2011 + i * 6 + j);
+            values[i] += (60 + 20 * std::sin(2 * M_PI * t / 288) +
+                          0.2 * (0.5 * std::sin(t * 2.718) + 0.3 * std::cos(t * 1.414))) /
+                         6;
+        }
+    }
+    ForecastInput input{generateTimestamps(values.size(), 1800000000000ULL), values};
+    ForecastConfig config;
+    config.algorithm = Algorithm::SEASONAL;
+    config.seasonality = Seasonality::DAILY;
+    SeasonalForecaster forecaster;
+    auto result =
+        forecaster.forecast(input, config, ForecastExecutor::generateForecastTimestamps(input.timestamps, 336));
+    ASSERT_EQ(result.forecast.size(), 336);
+    double absoluteError = 0;
+    for (size_t i = 0; i < result.forecast.size(); ++i) {
+        EXPECT_TRUE(std::isfinite(result.forecast[i]));
+        EXPECT_GT(result.forecast[i], 30);
+        EXPECT_LT(result.forecast[i], 90);
+        absoluteError += std::abs(result.forecast[i] - values[values.size() - 48 + i % 48]);
+        EXPECT_LE(result.lower[i], result.forecast[i]);
+        EXPECT_GE(result.upper[i], result.forecast[i]);
+    }
+    EXPECT_LT(absoluteError / result.forecast.size(), 0.5);
+}
+
+TEST_F(ForecastNumericalTest, SeasonalInverseDifferenceAccumulatesAcrossCycles) {
+    SeasonalForecaster forecaster;
+    const auto values = forecaster.inverseSeasonalDifference({3, 3, 3, 3, 3, 3}, {10, 20, 30}, 3, 6);
+    EXPECT_EQ(values, (std::vector<double>{13, 23, 33, 16, 26, 36}));
+}
+
+TEST_F(ForecastNumericalTest, SeasonalPredictionIntervalsReflectIntegratedUncertainty) {
+    SeasonalForecaster forecaster;
+    ForecastConfig config;
+    config.algorithm = Algorithm::SEASONAL;
+    config.seasonality = Seasonality::HOURLY;
+    config.arOrder = 0;
+    config.seasonalArOrder = 0;
+    std::vector<double> values(400);
+    std::mt19937 random(918);
+    std::normal_distribution<double> noise(0, 1);
+    for (size_t i = 0; i < values.size(); ++i)
+        values[i] = 50 + 4 * std::sin(2 * M_PI * i / 60) + noise(random);
+    ForecastInput input{generateTimestamps(values.size()), values};
+    auto result =
+        forecaster.forecast(input, config, ForecastExecutor::generateForecastTimestamps(input.timestamps, 121));
+    ASSERT_EQ(result.forecast.size(), 121);
+    // (1-B^60) has impulses at lags 0, 60 and 120. Uncertainty grows
+    // with forecast cycles, not every individual step or a sqrt(h) heuristic.
+    const double firstWidth = result.upper[0] - result.forecast[0];
+    EXPECT_NEAR((result.upper[59] - result.forecast[59]) / firstWidth, 1.0, 1e-8);
+    EXPECT_NEAR((result.upper[120] - result.forecast[120]) / firstWidth, std::sqrt(3.0), 1e-8);
+}
+
+TEST_F(ForecastNumericalTest, HourlyNoiseDoesNotBecomeAnAccumulatingSeasonalTrend) {
+    SeasonalForecaster forecaster;
+    ForecastConfig config;
+    config.algorithm = Algorithm::SEASONAL;
+    config.seasonality = Seasonality::HOURLY;
+    std::vector<double> values(288);
+    for (size_t i = 0; i < values.size(); ++i)
+        values[i] = 35 + 8 * std::sin(2 * M_PI * i / 12) + 0.5 * std::sin(i * 2.718) + 0.3 * std::cos(i * 1.414);
+    ForecastInput input{generateTimestamps(values.size(), 300000000000ULL), values};
+    auto result =
+        forecaster.forecast(input, config, ForecastExecutor::generateForecastTimestamps(input.timestamps, 288));
+    ASSERT_EQ(result.forecast.size(), 288u);
+    double error = 0;
+    for (size_t i = 0; i < result.forecast.size(); ++i) {
+        const double t = i + values.size();
+        const double truth =
+            35 + 8 * std::sin(2 * M_PI * t / 12) + 0.5 * std::sin(t * 2.718) + 0.3 * std::cos(t * 1.414);
+        error += std::abs(result.forecast[i] - truth);
+    }
+    EXPECT_LT(error / result.forecast.size(), 0.8);
+}

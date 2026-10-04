@@ -77,22 +77,20 @@ Holt-Winters triple exponential smoothing with seasonal prediction.
 
 Smoothing coefficients: alpha=0.3 (level), beta=0.1 (trend), gamma=0.3 (seasonality).
 
-**Caveat:** If the data length is less than the seasonal period, seasonality is silently disabled and the detector falls back to non-seasonal Holt-Winters (effectively basic-like behavior). The warm-up period is `max(minDataPoints, seasonalPeriod)` -- points before this threshold have infinite bounds and zero scores.
+State is initialized from the first finite observation. Every point is scored against the prior state and prior residual spread, then admitted into the model. Outliers are clipped to that prior envelope for learning so a spike cannot set its own threshold or drag the next prediction towards itself. Seasonal state is learned progressively; short windows no longer change initialization when extended.
 
 Best for: metrics with seasonal patterns that may shift in level.
 
 ### Robust
 
-STL (Seasonal-Trend decomposition using Loess) based detection.
+Causal trailing median and median absolute deviation (MAD) detection.
 
-- Decomposes series into trend + seasonal + residual
-- Detects anomalies in the residual component
-- Resistant to outliers with bisquare weighting
-- Supports seasonality
+- Without seasonality, the baseline and scale use the previous `max(windowSize, minDataPoints)` finite readings.
+- With seasonality, the baseline uses the same phase in preceding cycles; the scale uses earlier prediction residuals.
+- Each point is scored before it enters either window. Appending observations cannot revise past classifications on a fixed sampling grid.
+- Isolated spikes do not anticipate neighbouring alarms. A persistent shift eventually becomes the new normal; use an explicit operating threshold when a sustained fault must stay in alarm.
 
-Parameters: `stlSeasonalWindow` (default 7, must be odd; even values are rounded up), `stlRobust` (default true; enables bisquare robustness weighting in STL iterations).
-
-**Caveat:** If the seasonal period exceeds `n/2` (half the data length), the STL decomposition silently falls back to non-seasonal mode (trend-only via moving average, with zero seasonal component). Unlike basic and agile, robust has **no `minDataPoints` warm-up** -- all points get finite bounds from the first data point onward.
+`stlSeasonalWindow` is retained for compatibility and controls the number of prior cycles (default 7, minimum 3). `stlRobust` is no longer used by this detector. The standalone STL decomposition functions are unchanged.
 
 Best for: stable metrics with consistent seasonal patterns.
 
@@ -149,12 +147,6 @@ wherever it has no sample, and those slots are not its data.
 
 ## Minimum Data
 
-At least `minDataPoints` (default 10) values are needed before bounds are produced. Earlier points will have infinite bounds and zero scores. This warm-up applies to **basic** and **agile** only. For agile, the effective warm-up is `max(minDataPoints, seasonalPeriod)`. The **robust** algorithm has no warm-up -- it runs STL decomposition over the entire series and produces finite bounds for all points.
+All three detectors wait for `minDataPoints` (default 10) finite previous observations. Warm-up bounds are infinite (serialized as null), with zero scores. Missing/non-finite readings do not advance warm-up or contaminate the state. Robust seasonal detection additionally needs two prior observations of the current phase; this avoids treating a newly seen seasonal phase as an anomaly.
 
-A **sparse** series carrying fewer than `minDataPoints` **observations** is not warmed up at all -- it is **declined**, and reported in `declined_series_count` rather than returned. The warm-up above is indexed by slot, which is only equivalent to counting observations when every slot holds one; under the per-group fan-out of `anomalies()` a group carries `null` wherever it has no sample, so a device with a single observation would otherwise leave warm-up and be given a full confidence envelope built from that one sample. See "Declined groups" in [docs/api-derived.md](api-derived.md).
-
-The decline applies only to a series **longer than** `minDataPoints`. A series at or below that length is always answered, however many of its slots are `null` -- a series that short cannot leave a slot-indexed warm-up at all, so for **basic** and **agile** there is nothing there to fabricate, and declining it would only throw away the stored values under `raw` and `predictions`. Both halves of the rule matter: judging a series on the observations it really holds is the point, and not applying that judgement below the warm-up length is what keeps a genuinely short series returnable.
-
-For **robust** the decline effectively never fires on such a series: robust has no warm-up (see above), so it produces a finite envelope at every slot however short the input is -- a dense 3-point robust series comes back with a `±0.36` band, not an all-`null` one. What the length arm of the rule preserves for robust is simply the answer it gave before per-group fan-out existed.
-
-`forecast()` and `anomalies()` **disagree** about a short dense series, and that is deliberate and pre-existing: a 5-point series is answered by `anomalies()` (its stored values are returned; only the envelope is empty) and declined by `forecast()` (a fit under `minDataPoints` has no values to lose in the first place -- see [docs/forecasting.md](forecasting.md), "Minimum Data"). Both halves are preserving the behaviour they had before the fan-out work; neither was unified with the other.
+Under grouped queries, a sparse series with fewer than `minDataPoints` real observations on a longer shared axis is declined and counted in `declined_series_count`. Short series remain returnable with their raw readings and warm-up bounds. See [declined groups](api-derived.md#declined-groups).

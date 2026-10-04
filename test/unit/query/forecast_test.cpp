@@ -942,3 +942,20 @@ TEST_F(ForecastTest, AutoDetectDailySeasonality) {
     EXPECT_GE(detectedPeriod, 20);
     EXPECT_LE(detectedPeriod, 28);
 }
+
+TEST_F(ForecastTest, IndependentHistoryAndHorizonRoundTrip) {
+    ExpressionParser parser("forecast(cpu, 'seasonal', 2, history='6w', horizon='1d')");
+    auto ast = parser.parse();
+    EXPECT_EQ(ast->asForecastFunction().history, "6w");
+    EXPECT_EQ(ast->asForecastFunction().horizon, "1d");
+    ExpressionParser again(ast->toString());
+    EXPECT_EQ(again.parse()->asForecastFunction().horizon, "1d");
+    ExpressionParser duplicate("forecast(cpu, 'linear', 2, horizon='1h', horizon='2h')");
+    EXPECT_THROW(duplicate.parse(), ExpressionParseException);
+}
+
+TEST_F(ForecastTest, DurationRejectsMalformedZeroAndOverflow) {
+    for (const auto* duration : {"0d", "-1h", "1.2.3d", "999999999999999999999d"})
+        EXPECT_THROW(parseDurationToNs(duration), std::invalid_argument) << duration;
+    EXPECT_EQ(parseDurationToNs("0.5h"), 1800000000000ULL);
+}

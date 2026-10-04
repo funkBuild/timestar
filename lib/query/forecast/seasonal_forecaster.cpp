@@ -54,11 +54,11 @@ std::vector<double> SeasonalForecaster::inverseSeasonalDifference(const std::vec
     size_t safeCount = std::min(forecastCount, diffed.size());
     for (size_t i = 0; i < safeCount; ++i) {
         ptrdiff_t baseIdx = static_cast<ptrdiff_t>(original.size()) - static_cast<ptrdiff_t>(seasonalPeriod) +
-                            static_cast<ptrdiff_t>(i % seasonalPeriod);
-        if (baseIdx >= 0 && static_cast<size_t>(baseIdx) < original.size()) {
-            result[i] = diffed[i] + original[static_cast<size_t>(baseIdx)];
-        } else if (i >= seasonalPeriod) {
+                            static_cast<ptrdiff_t>(i);
+        if (i >= seasonalPeriod) {
             result[i] = diffed[i] + result[i - seasonalPeriod];
+        } else if (baseIdx >= 0 && static_cast<size_t>(baseIdx) < original.size()) {
+            result[i] = diffed[i] + original[static_cast<size_t>(baseIdx)];
         } else {
             result[i] = diffed[i] + original.back();
         }
@@ -408,9 +408,8 @@ ForecastOutput SeasonalForecaster::forecast(const ForecastInput& input, const Fo
         }
     }
 
-    // Tracked across the differencing steps below but currently only written;
-    // kept (annotated) because each differencing branch deliberately refreshes it.
-    [[maybe_unused]] double mean = anomaly::simd::vectorMean(y.data(), y.size());
+    const double originalVariance =
+        anomaly::simd::vectorVariance(y.data(), y.size(), anomaly::simd::vectorMean(y.data(), y.size()));
 
     // Store last value for inverse differencing.  originalY is only populated
     // (via move, not copy) when seasonal differencing actually replaces y.
@@ -424,23 +423,18 @@ ForecastOutput SeasonalForecaster::forecast(const ForecastInput& input, const Fo
         originalY = std::move(y);
         y = std::move(diffed);
         usedSeasonalDiff = true;
-        if (!y.empty()) {
-            mean = anomaly::simd::vectorMean(y.data(), y.size());
-        }
     }
 
-    // Apply regular differencing (d=1).  Only the last pre-difference value is
-    // needed for inversion — capture it as a scalar instead of copying the
-    // whole series.
+    // Use regular differencing when there is no seasonal difference. Applying
+    // both unconditionally integrates the last noisy cycle-to-cycle change
+    // forever, even on a stationary seasonal series. The seasonal model instead
+    // estimates the mean cycle-to-cycle change (drift) from the training window.
     double lastBeforeRegularDiff = lastY;
     bool usedRegularDiff = false;
-    if (y.size() > 1) {
+    if (!usedSeasonalDiff && y.size() > 1) {
         lastBeforeRegularDiff = y.back();
         usedRegularDiff = true;
         y = regularDifference(y);
-        if (!y.empty()) {
-            mean = anomaly::simd::vectorMean(y.data(), y.size());
-        }
     }
 
     if (y.size() < config.minDataPoints) {
@@ -449,11 +443,8 @@ ForecastOutput SeasonalForecaster::forecast(const ForecastInput& input, const Fo
         output.upper.resize(nForecast);
         output.lower.resize(nForecast);
 
-        double lastVal = input.values.back();
-        double variance =
-            anomaly::simd::vectorVariance(input.values.data(), input.values.size(),
-                                          anomaly::simd::vectorMean(input.values.data(), input.values.size()));
-        double stddev = std::sqrt(variance);
+        double lastVal = lastY;
+        double stddev = std::sqrt(originalVariance);
 
         for (size_t i = 0; i < nForecast; ++i) {
             output.forecast[i] = lastVal;
@@ -464,6 +455,8 @@ ForecastOutput SeasonalForecaster::forecast(const ForecastInput& input, const Fo
 
         return output;
     }
+
+    const double differencedMean = anomaly::simd::vectorMean(y.data(), y.size());
 
     // Fit AR model on differenced data
     size_t arOrder = static_cast<size_t>(config.arOrder);
@@ -477,6 +470,22 @@ ForecastOutput SeasonalForecaster::forecast(const ForecastInput& input, const Fo
         sarCoeffs = fitSeasonalARCoefficients(y, sarOrder, seasonalPeriod);
     }
 
+    // SARIMA multiplies the ordinary and seasonal AR polynomials. Adding
+    // their predictions omits the cross terms and can make two individually
+    // stationary fits explosive (the regression fixture had a pole at 1.04).
+    std::vector<double> combined(
+        std::max(arCoeffs.size(), sarCoeffs.size() * seasonalPeriod) + (sarCoeffs.empty() ? 0 : arCoeffs.size()), 0.0);
+    for (size_t i = 0; i < arCoeffs.size(); ++i)
+        combined[i] += arCoeffs[i];
+    for (size_t j = 0; j < sarCoeffs.size(); ++j) {
+        const size_t lag = (j + 1) * seasonalPeriod;
+        combined[lag - 1] += sarCoeffs[j];
+        for (size_t i = 0; i < arCoeffs.size(); ++i)
+            combined[lag + i] -= arCoeffs[i] * sarCoeffs[j];
+    }
+    while (!combined.empty() && combined.back() == 0.0)
+        combined.pop_back();
+
     // Generate forecasts on differenced scale
     std::vector<double> diffForecasts(nForecast);
     std::vector<double> yExtended;
@@ -484,12 +493,7 @@ ForecastOutput SeasonalForecaster::forecast(const ForecastInput& input, const Fo
     yExtended = y;
 
     for (size_t i = 0; i < nForecast; ++i) {
-        double fc = arForecast(yExtended, arCoeffs, 0.0);  // mean=0 for differenced data
-
-        // Add seasonal AR contribution
-        if (!sarCoeffs.empty() && seasonalPeriod > 0) {
-            fc += seasonalArForecast(yExtended, sarCoeffs, seasonalPeriod, 0.0);
-        }
+        double fc = arForecast(yExtended, combined, differencedMean);
 
         diffForecasts[i] = fc;
         yExtended.push_back(fc);
@@ -497,7 +501,8 @@ ForecastOutput SeasonalForecaster::forecast(const ForecastInput& input, const Fo
 
     // Inverse regular differencing
     double lastBeforeDiff = usedRegularDiff ? lastBeforeRegularDiff : lastY;
-    std::vector<double> undiffed = inverseRegularDifference(diffForecasts, lastBeforeDiff, nForecast);
+    std::vector<double> undiffed =
+        usedRegularDiff ? inverseRegularDifference(diffForecasts, lastBeforeDiff, nForecast) : std::move(diffForecasts);
 
     // Inverse seasonal differencing
     std::vector<double> finalForecasts;
@@ -512,28 +517,64 @@ ForecastOutput SeasonalForecaster::forecast(const ForecastInput& input, const Fo
     output.upper.resize(nForecast);
     output.lower.resize(nForecast);
 
-    // Compute base residual variance once (avoid recomputing SSE per point)
-    double baseVariance = estimateForecastVariance(y, arCoeffs, 0.0, 1);
+    // Estimate innovations using the SAME combined model used for prediction.
+    // Include the same lags as the forecast recurrence; keep at least one
+    // residual for short histories rather than dividing an empty set by zero.
+    double sse = 0.0;
+    const size_t fittedLags = std::min(combined.size(), y.size() - 1);
+    for (size_t t = fittedLags; t < y.size(); ++t) {
+        double fitted = differencedMean;
+        for (size_t lag = 0; lag < combined.size() && lag < t; ++lag)
+            fitted += combined[lag] * (y[t - lag - 1] - differencedMean);
+        const double residual = y[t] - fitted;
+        sse += residual * residual;
+    }
+    const size_t residualCount = y.size() - fittedLags;
+    const size_t parameters = arCoeffs.size() + sarCoeffs.size() + 1;
+    double baseVariance =
+        sse / static_cast<double>(residualCount > parameters ? residualCount - parameters : residualCount);
+    if (!std::isfinite(baseVariance))
+        return {};  // Decline a numerically invalid fit; never publish false certainty.
     output.residualStdDev = std::sqrt(baseVariance);
+
+    // Invert the AR polynomial AND both differencing operators to obtain
+    // the original-scale impulse response. Prediction variance is sigma^2
+    // sum(psi_j^2), not a heuristic sqrt(h) multiplier on differenced errors.
+    std::vector<double> arImpulse(nForecast, 0.0);
+    std::vector<double> integratedImpulse(nForecast, 0.0);
+    double cumulative = 0.0;
+    double impulseSquares = 0.0;
 
     for (size_t i = 0; i < nForecast; ++i) {
         output.forecast[i] = finalForecasts[i];
 
-        // Scale variance by horizon factor (same formula as estimateForecastVariance)
-        double horizonFactor = 1.0 + std::sqrt(static_cast<double>(i + 1));
-        double width = config.deviations * std::sqrt(baseVariance * horizonFactor);
+        arImpulse[i] = i == 0 ? 1.0 : 0.0;
+        for (size_t lag = 0; lag < combined.size() && lag < i; ++lag)
+            arImpulse[i] += combined[lag] * arImpulse[i - lag - 1];
+        cumulative = usedRegularDiff ? cumulative + arImpulse[i] : arImpulse[i];
+        integratedImpulse[i] = cumulative;
+        if (usedSeasonalDiff && i >= seasonalPeriod)
+            integratedImpulse[i] += integratedImpulse[i - seasonalPeriod];
+        impulseSquares += integratedImpulse[i] * integratedImpulse[i];
+        double width = config.deviations * std::sqrt(baseVariance * impulseSquares);
 
         output.upper[i] = finalForecasts[i] + width;
         output.lower[i] = finalForecasts[i] - width;
+        if (!std::isfinite(output.upper[i]) || !std::isfinite(output.lower[i]))
+            return {};
     }
 
-    // Compute R-squared (on original scale)
-    double totalVar = anomaly::simd::vectorVariance(
-        input.values.data(), input.values.size(), anomaly::simd::vectorMean(input.values.data(), input.values.size()));
-    if (totalVar > 1e-10) {
-        output.rSquared = 1.0 - baseVariance / totalVar;
-        output.rSquared = std::max(0.0, output.rSquared);
-    }
+    // One-step innovations are unchanged by undoing differencing with KNOWN
+    // prior observations. Compare their SSE with SST over the matching original
+    // observations, not a degrees-of-freedom variance ratio over another window.
+    // This remains an in-sample statistic, never a measure of horizon accuracy.
+    const size_t offset = (usedSeasonalDiff ? seasonalPeriod : 0) + (usedRegularDiff ? 1 : 0);
+    const auto& original = usedSeasonalDiff ? originalY : input.values;
+    const size_t first = offset + fittedLags;
+    const double originalMean = anomaly::simd::vectorMean(original.data() + first, residualCount);
+    const double sst = anomaly::simd::vectorSumSquaredDiff(original.data() + first, residualCount, originalMean);
+    if (std::isfinite(sst) && sst > 1e-10)
+        output.rSquared = 1.0 - sse / sst;
 
     return output;
 }

@@ -895,3 +895,102 @@ TEST_F(AnomalyDetectionTest, BasicDetectorAccurateOnLongSeriesWithKnownAnomalies
         EXPECT_FALSE(std::isnan(output.scores[i])) << "NaN score at index " << i;
     }
 }
+
+TEST_F(AnomalyDetectionTest, RobustIsCausalAndDoesNotFlagNeighboursOfSpike) {
+    RobustDetector detector;
+    AnomalyConfig config;
+    AnomalyInput input;
+    input.timestamps = generateTimestamps(180);
+    input.values = generateConstant(180, 60);
+    for (size_t i = 0; i < 180; ++i)
+        input.values[i] += 0.3 * std::sin(i * 2.7);
+    auto prefix = input;
+    prefix.timestamps.resize(120);
+    prefix.values.resize(120);
+    auto before = detector.detect(prefix, config);
+    for (size_t i = 120; i < 124; ++i)
+        input.values[i] += 25;
+    auto after = detector.detect(input, config);
+    for (size_t i = 0; i < 120; ++i) {
+        EXPECT_DOUBLE_EQ(before.predictions[i], after.predictions[i]);
+        EXPECT_DOUBLE_EQ(before.upper[i], after.upper[i]);
+        EXPECT_DOUBLE_EQ(before.lower[i], after.lower[i]);
+        EXPECT_DOUBLE_EQ(before.scores[i], after.scores[i]);
+    }
+    for (size_t i = 0; i < 180; ++i) {
+        if (i >= 120 && i < 124)
+            EXPECT_GT(after.scores[i], 0) << i;
+        else
+            EXPECT_EQ(after.scores[i], 0) << i;
+    }
+}
+
+TEST_F(AnomalyDetectionTest, RobustSeasonalOutputIsPrefixInvariant) {
+    RobustDetector detector;
+    AnomalyConfig config;
+    config.seasonality = Seasonality::HOURLY;
+    AnomalyInput input;
+    input.timestamps = generateTimestamps(360);
+    input.values = generateSinusoidal(360, 50, 10, 60);
+    auto prefix = input;
+    prefix.timestamps.resize(210);
+    prefix.values.resize(210);
+    auto before = detector.detect(prefix, config);
+    input.values[210] += 50;
+    auto after = detector.detect(input, config);
+    for (size_t i = 0; i < 210; ++i) {
+        EXPECT_DOUBLE_EQ(before.predictions[i], after.predictions[i]);
+        EXPECT_DOUBLE_EQ(before.upper[i], after.upper[i]);
+        EXPECT_DOUBLE_EQ(before.scores[i], after.scores[i]);
+    }
+    EXPECT_GT(after.scores[210], 0);
+}
+
+TEST_F(AnomalyDetectionTest, AgileScoresBeforeLearningSpike) {
+    AgileDetector detector;
+    AnomalyConfig config;
+    AnomalyInput input;
+    input.timestamps = generateTimestamps(180);
+    input.values = generateConstant(180, 60);
+    input.values[100] = 1000;
+    auto result = detector.detect(input, config);
+    EXPECT_NEAR(result.upper[100], 61.2, 1e-8);
+    EXPECT_GT(result.scores[100], 900);
+    EXPECT_LT(result.predictions[101], 62);
+}
+
+TEST_F(AnomalyDetectionTest, BasicWarmupCountsFiniteObservations) {
+    BasicDetector detector;
+    AnomalyConfig config;
+    config.minDataPoints = 10;
+    std::vector<double> values(30, std::numeric_limits<double>::quiet_NaN());
+    for (size_t i = 15; i < 25; ++i)
+        values[i] = 60;
+    values[25] = std::numeric_limits<double>::infinity();
+    values[26] = 1000;
+    values[27] = 60;
+    AnomalyInput input{generateTimestamps(values.size()), values};
+    auto result = detector.detect(input, config);
+    for (size_t i = 0; i < 26; ++i)
+        EXPECT_EQ(result.scores[i], 0);
+    EXPECT_TRUE(std::isinf(result.upper[24]));
+    EXPECT_TRUE(std::isnan(result.upper[25]));
+    EXPECT_GT(result.scores[26], 900);
+    EXPECT_TRUE(std::isfinite(result.upper[27]));
+}
+
+TEST_F(AnomalyDetectionTest, AgileDoesNotUseFutureValuesDuringInitialization) {
+    AgileDetector detector;
+    AnomalyConfig config;
+    std::vector<double> values(100, 60);
+    values[25] = 1000;
+    AnomalyInput full{generateTimestamps(values.size()), values};
+    AnomalyInput prefix{generateTimestamps(20), std::vector<double>(values.begin(), values.begin() + 20)};
+    const auto before = detector.detect(prefix, config);
+    const auto after = detector.detect(full, config);
+    for (size_t i = 0; i < prefix.size(); ++i) {
+        EXPECT_EQ(before.predictions[i], after.predictions[i]);
+        EXPECT_EQ(before.upper[i], after.upper[i]);
+        EXPECT_EQ(before.scores[i], after.scores[i]);
+    }
+}

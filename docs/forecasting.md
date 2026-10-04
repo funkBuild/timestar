@@ -5,7 +5,7 @@ Predict future time series values using linear regression or seasonal decomposit
 ## Syntax
 
 ```
-forecast(query_ref, 'algorithm', deviations[, seasonality='...'][, model='...'][, history='...'])
+forecast(query_ref, 'algorithm', deviations[, seasonality='...'][, model='...'][, history='...'][, horizon='...'])
 ```
 
 | Parameter | Type | Required | Description |
@@ -15,7 +15,8 @@ forecast(query_ref, 'algorithm', deviations[, seasonality='...'][, model='...'][
 | `deviations` | number | yes | Confidence interval width in std deviations (1-4) |
 | `seasonality` | string | no | `'none'`, `'hourly'`, `'daily'`, `'weekly'`, `'auto'`, `'multi'` |
 | `model` | string | no | Linear model type: `'default'`, `'simple'`, `'reactive'` |
-| `history` | string | no | History window: `'1w'`, `'3d'`, `'12h'` |
+| `history` | string | no | Training history ending at the query end: `'1w'`, `'3d'`, `'12h'`; fetched even outside the visible window |
+| `horizon` | string | no | Future duration: `'1d'`, `'6h'`; defaults to the requested query duration |
 
 ## Examples
 
@@ -77,16 +78,15 @@ Confidence intervals are computed from residual standard deviation.
 
 Output statistics include: `slope`, `intercept`, `r_squared`, `residual_std_dev`.
 
-> **Note on `r_squared`:** For the seasonal algorithm, R-squared is computed as `1 - (AR_residual_variance / total_variance)` and clamped to a minimum of 0. Because the AR residual variance is measured on differenced data, this is an approximation of goodness-of-fit rather than a true in-sample R-squared.
+> **Note on `r_squared`:** Seasonal R² compares one-step residual SSE with original-scale SST over the same fitted observations. It is an in-sample statistic, can be negative, and does not measure multi-step forecast accuracy. Evaluate held-out periods and compare with a seasonal-naive baseline.
 
 ### Seasonal
 
-SARIMA-based seasonal forecasting with STL (Seasonal-Trend Loess) decomposition.
+The fixed-period model uses multiplicative seasonal autoregression, with default ordinary AR order `p=2` and seasonal AR order `P=1`. It fits these coefficients with Yule-Walker equations. This is an autoregressive approximation, not a full maximum-likelihood ARIMA implementation; MA terms are not fitted.
 
-- Decomposes into trend + seasonal + residual components
-- Extrapolates trend and repeats seasonal pattern
-- SARIMA parameters (defaults): p=2, d=1, q=2, P=1, D=1, Q=1. The AR order (`arOrder`), MA order (`maOrder`), seasonal AR order (`seasonalArOrder`), and seasonal MA order (`seasonalMaOrder`) are configurable in the forecast config.
-- Seasonal damping: extrapolated seasonal components are damped by 1% per cycle into the future, floored at 50% amplitude. This prevents overly confident repetition of seasonal patterns at long horizons.
+When sufficient seasonal history is available, one seasonal difference (`D=1`, `d=0`) removes the repeating cycle and the model estimates the mean cycle-to-cycle change. Without seasonal differencing, one regular difference (`d=1`, `D=0`) is used. An additional regular difference is not applied unconditionally to seasonal data: doing so turns recent cycle noise into accumulating forecast drift. Series requiring higher-order differencing or structural-change modelling need a different model or preprocessing.
+
+The separate `forecastMSTL` path decomposes multiple seasonal components and extrapolates the trend. Its seasonal components are damped by 1% per forecast cycle, with a 50% floor. This damping does not apply to the fixed-period autoregressive model.
 
 Best for: metrics with strong periodic patterns.
 
@@ -114,7 +114,15 @@ Periodicity detection uses a hybrid FFT + ACF approach:
 
 Parameters: `minPeriod` (default 4), `maxPeriod` (default n/2), `maxSeasonalComponents` (default 3), `seasonalThreshold` (default 0.2).
 
+## Seasonal reliability
+
+The ordinary and seasonal AR polynomials are multiplied, including their cross terms. Inverse seasonal differencing feeds each forecast cycle into the next. Prediction variance is the innovation variance times the cumulative squared impulse response of the combined AR and differencing operators. This propagates uncertainty on the original scale; it does not include parameter-estimation uncertainty. Numerically invalid fits are declined instead of emitting non-finite predictions or a misleading narrow band.
+
+For the mathematical convention, see [seasonal ARIMA](https://otexts.com/fpp3/seasonal-arima.html) and [ARMA impulse responses](https://www.statsmodels.org/stable/generated/statsmodels.tsa.arima_process.arma_impulse_response.html).
+
 ## Forecast Horizon
+
+Use `forecast(a, 'seasonal', 2, seasonality='weekly', history='8w', horizon='2d')` to train on eight weeks and predict two days, independently of the dashboard window. Both durations must be positive and representable in nanoseconds. The horizon must span at least one sample interval and uses whole forecast steps. It starts after the final observed timestamp, not the wall clock. Omitting `horizon` preserves the existing query-duration behavior below. Input and output limits still apply.
 
 When `forecastHorizon` is 0 (default), the system auto-computes it as:
 

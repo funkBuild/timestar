@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -154,12 +155,15 @@ inline uint64_t parseDurationToNs(const std::string& duration) {
 
     double value;
     try {
-        value = std::stod(numStr);
+        size_t consumed = 0;
+        value = std::stod(numStr, &consumed);
+        if (consumed != numStr.size())
+            throw std::invalid_argument("Invalid duration");
     } catch (const std::exception&) {
         throw std::invalid_argument("Invalid duration value: " + duration);
     }
 
-    if (value <= 0) {
+    if (!std::isfinite(value) || value <= 0) {
         throw std::invalid_argument("Duration must be positive: " + duration);
     }
 
@@ -186,6 +190,9 @@ inline uint64_t parseDurationToNs(const std::string& duration) {
     }
 
     double result = value * static_cast<double>(multiplier);
+    if (!std::isfinite(result) || result >= static_cast<double>(std::numeric_limits<int64_t>::max())) {
+        throw std::invalid_argument("Duration is too large: " + duration);
+    }
     if (result < 1.0) {
         throw std::invalid_argument("Duration resolves to less than 1 nanosecond: " + duration);
     }

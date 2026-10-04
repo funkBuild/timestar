@@ -34,9 +34,6 @@ private:
         std::vector<double> seasonal;
     };
 
-    // Initialize Holt-Winters state
-    HoltWintersState initializeState(std::span<const double> values, size_t seasonalPeriod);
-
     // Update state and predict next value
     double predictAndUpdate(HoltWintersState& state, double actualValue, size_t seasonalIndex, size_t seasonalPeriod);
 };
