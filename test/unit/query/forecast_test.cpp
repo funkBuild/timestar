@@ -948,8 +948,12 @@ TEST_F(ForecastTest, IndependentHistoryAndHorizonRoundTrip) {
     auto ast = parser.parse();
     EXPECT_EQ(ast->asForecastFunction().history, "6w");
     EXPECT_EQ(ast->asForecastFunction().horizon, "1d");
-    ExpressionParser again(ast->toString());
-    EXPECT_EQ(again.parse()->asForecastFunction().horizon, "1d");
+    // The parser borrows its input, so keep the serialized expression alive through parse().
+    const std::string serialized = ast->toString();
+    ExpressionParser again(serialized);
+    auto roundTripped = again.parse();
+    EXPECT_EQ(roundTripped->asForecastFunction().history, "6w");
+    EXPECT_EQ(roundTripped->asForecastFunction().horizon, "1d");
     ExpressionParser duplicate("forecast(cpu, 'linear', 2, horizon='1h', horizon='2h')");
     EXPECT_THROW(duplicate.parse(), ExpressionParseException);
 }
