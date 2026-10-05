@@ -311,31 +311,39 @@ TEST_F(TSMTombstoneTest, LargeTombstoneSet) {
         for (int range = 0; range < rangesPerSeries; ++range) {
             uint64_t start = range * 10000;
             uint64_t end = start + 5000;
-            tombstone->addTombstone(sid, start, end).get();
+            ASSERT_TRUE(tombstone->addTombstone(sid, start, end).get());
         }
     }
 
-    EXPECT_EQ(tombstone->getEntryCount(), numSeries * rangesPerSeries);
-    EXPECT_EQ(tombstone->getSeriesCount(), numSeries);
-
-    // Test query performance with many tombstones
-    SeriesId128 midSeries = makeSeriesId(50);
-    auto start = std::chrono::high_resolution_clock::now();
-
-    for (int i = 0; i < 10000; ++i) {
-        tombstone->isDeleted(midSeries, 25000);  // Middle series, middle time
-    }
-
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-
-    // Should be fast even with many tombstones (< 2ms per lookup, generous for CI/ASAN)
-    EXPECT_LT(duration.count() / 10000.0, 2.0);
+    // Check lookup correctness at scale in both optimized and instrumented builds.
+    // Wall-clock lookup costs belong in benchmarks, not this persistence test.
+    const auto expectLookups = [&](const TSMTombstone& current, const char* phase) {
+        SCOPED_TRACE(phase);
+        EXPECT_EQ(current.getEntryCount(), numSeries * rangesPerSeries);
+        EXPECT_EQ(current.getSeriesCount(), numSeries);
+        for (int series = 1; series <= numSeries; ++series) {
+            SeriesId128 sid = makeSeriesId(series);
+            for (int range = 0; range < rangesPerSeries; ++range) {
+                SCOPED_TRACE(::testing::Message() << "series=" << series << ", range=" << range);
+                uint64_t start = range * 10000;
+                uint64_t end = start + 5000;
+                EXPECT_TRUE(current.isDeleted(sid, start));
+                EXPECT_TRUE(current.isDeleted(sid, start + 2500));
+                EXPECT_TRUE(current.isDeleted(sid, end));
+                EXPECT_FALSE(current.isDeleted(sid, end + 1));
+                if (start > 0) {
+                    EXPECT_FALSE(current.isDeleted(sid, start - 1));
+                }
+            }
+        }
+        EXPECT_FALSE(current.isDeleted(makeSeriesId(numSeries + 1), 25000));
+    };
+    expectLookups(*tombstone, "before flush");
 
     // Test persistence
     tombstone->flush().get();
 
     auto tombstone2 = std::make_unique<TSMTombstone>(tombstonePath);
     tombstone2->load().get();
-    EXPECT_EQ(tombstone2->getEntryCount(), numSeries * rangesPerSeries);
+    expectLookups(*tombstone2, "after reload");
 }
