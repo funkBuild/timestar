@@ -1016,8 +1016,8 @@ TEST_F(ExpressionEvaluatorTest, RateFirstPointIsNaN) {
 }
 
 TEST_F(ExpressionEvaluatorTest, RateCounterReset) {
-    // Counter resets mid-series: negative diff is treated as 0 (not negative rate)
-    // Values: 100 -> 200 (diff=100) -> 50 (reset, diff=-150 -> 0) -> 80 (diff=30)
+    // A reset to zero retains the new reading as consumption since reset.
+    // Values: 100 -> 200 (100) -> 50 (reset, 50) -> 80 (30)
     // Timestamps 1 second apart
     auto series = makeSeries({1000000000ULL, 2000000000ULL, 3000000000ULL, 4000000000ULL}, {100.0, 200.0, 50.0, 80.0});
 
@@ -1026,7 +1026,7 @@ TEST_F(ExpressionEvaluatorTest, RateCounterReset) {
     EXPECT_EQ(result.size(), 4);
     EXPECT_TRUE(std::isnan(result.values[0]));
     EXPECT_DOUBLE_EQ(result.values[1], 100.0);  // (200-100) / 1s = 100/s
-    EXPECT_DOUBLE_EQ(result.values[2], 0.0);    // reset: diff treated as 0
+    EXPECT_DOUBLE_EQ(result.values[2], 50.0);   // 50 observed after reset / 1s
     EXPECT_DOUBLE_EQ(result.values[3], 30.0);   // (80-50) / 1s = 30/s
 }
 
@@ -1040,8 +1040,8 @@ TEST_F(ExpressionEvaluatorTest, RateMultipleResets) {
     EXPECT_EQ(result.size(), 5);
     EXPECT_TRUE(std::isnan(result.values[0]));
     EXPECT_DOUBLE_EQ(result.values[1], 50.0);  // (100-50) / 1s
-    EXPECT_DOUBLE_EQ(result.values[2], 0.0);   // reset: 20-100 < 0, use 0
-    EXPECT_DOUBLE_EQ(result.values[3], 0.0);   // reset: 10-20 < 0, use 0
+    EXPECT_DOUBLE_EQ(result.values[2], 20.0);  // reset: 20 observed after restart
+    EXPECT_DOUBLE_EQ(result.values[3], 10.0);  // another reset: 10 observed
     EXPECT_DOUBLE_EQ(result.values[4], 30.0);  // (40-10) / 1s
 }
 
@@ -1119,15 +1119,15 @@ TEST_F(ExpressionEvaluatorTest, IrateConstantSeriesAllSame) {
 }
 
 TEST_F(ExpressionEvaluatorTest, IrateCounterResetAtLastStep) {
-    // When the last diff is negative (counter reset), irate returns 0
+    // A final reset retains the counter increment observed after restart.
     auto series = makeSeries({1000000000ULL, 2000000000ULL, 3000000000ULL}, {100.0, 200.0, 50.0});
 
     auto result = series.irate();
 
     EXPECT_EQ(result.size(), 3);
-    // Last two: 200->50 is a reset => 0
+    // Last two: 200->50 is a reset => 50 / 1s
     for (size_t i = 0; i < result.size(); ++i) {
-        EXPECT_DOUBLE_EQ(result.values[i], 0.0);
+        EXPECT_DOUBLE_EQ(result.values[i], 50.0);
     }
 }
 
@@ -1191,35 +1191,33 @@ TEST_F(ExpressionEvaluatorTest, IncreaseBasic) {
 
 TEST_F(ExpressionEvaluatorTest, IncreaseWithReset) {
     // Values: 100, 200, 50, 80
-    // Diffs: +100 (reset diff: -150 -> 0), +30
-    // Total increase = 100 + 0 + 30 = 130
+    // Reset-adjusted increments: 100 + 50 + 30 = 180
     auto series = makeSeries({1000000000ULL, 2000000000ULL, 3000000000ULL, 4000000000ULL}, {100.0, 200.0, 50.0, 80.0});
 
     auto result = series.increase();
 
     EXPECT_EQ(result.size(), 4);
     for (size_t i = 0; i < result.size(); ++i) {
-        EXPECT_DOUBLE_EQ(result.values[i], 130.0);
+        EXPECT_DOUBLE_EQ(result.values[i], 180.0);
     }
 }
 
 TEST_F(ExpressionEvaluatorTest, IncreaseOnlyResets) {
     // All diffs are negative (series is monotonically decreasing)
-    // Total increase = 0
+    // Each decrease implies a reset: 50 + 10 = 60
     auto series = makeSeries({1000000000ULL, 2000000000ULL, 3000000000ULL}, {100.0, 50.0, 10.0});
 
     auto result = series.increase();
 
     EXPECT_EQ(result.size(), 3);
     for (size_t i = 0; i < result.size(); ++i) {
-        EXPECT_DOUBLE_EQ(result.values[i], 0.0);
+        EXPECT_DOUBLE_EQ(result.values[i], 60.0);
     }
 }
 
 TEST_F(ExpressionEvaluatorTest, IncreaseMultipleResets) {
     // Values: 10, 20, 5, 15, 3, 25
-    // Positive diffs: +10, +10 (reset:5-20<0 skip), +0 (reset:3-15<0 skip), +22
-    // Total = 10 + 10 + 22 = 42
+    // Reset-adjusted increments: 10 + 5 + 10 + 3 + 22 = 50
     auto series = makeSeries({1000000000ULL, 2000000000ULL, 3000000000ULL, 4000000000ULL, 5000000000ULL, 6000000000ULL},
                              {10.0, 20.0, 5.0, 15.0, 3.0, 25.0});
 
@@ -1227,7 +1225,7 @@ TEST_F(ExpressionEvaluatorTest, IncreaseMultipleResets) {
 
     EXPECT_EQ(result.size(), 6);
     for (size_t i = 0; i < result.size(); ++i) {
-        EXPECT_DOUBLE_EQ(result.values[i], 42.0);
+        EXPECT_DOUBLE_EQ(result.values[i], 50.0);
     }
 }
 
@@ -1255,11 +1253,49 @@ TEST_F(ExpressionEvaluatorTest, IncreaseViaParser) {
 
     auto result = evaluator.evaluate(*ast, results);
 
-    // Diffs: +5, reset(8-10=-2->0), +12 => total=17
+    // Increments: +5, reset to 8, +12 => total=25
     EXPECT_EQ(result.size(), 4);
     for (size_t i = 0; i < result.size(); ++i) {
-        EXPECT_DOUBLE_EQ(result.values[i], 17.0);
+        EXPECT_DOUBLE_EQ(result.values[i], 25.0);
     }
+}
+
+TEST_F(ExpressionEvaluatorTest, CounterResetConservesObservedConsumption) {
+    // Five-minute water readings, including two nonzero readings after resets.
+    auto series = makeSeries({0ULL, 300000000000ULL, 600000000000ULL, 900000000000ULL, 1200000000000ULL},
+                             {100.0, 120.0, 5.0, 12.0, 3.0});
+    const auto differences = series.monotonicDiff();
+    const auto rates = series.rate();
+    const auto increase = series.increase();
+    double volume = 0.0;
+    for (size_t i = 1; i < series.size(); ++i) {
+        EXPECT_NEAR(rates.values[i] * 300.0, differences.values[i], 1e-12);
+        volume += rates.values[i] * 300.0;
+    }
+    EXPECT_DOUBLE_EQ(increase.values.back(), 35.0);  // 20 + 5 + 7 + 3
+    EXPECT_NEAR(volume, increase.values.back(), 1e-12);
+    EXPECT_DOUBLE_EQ(series.irate().values.back(), 0.01);
+}
+
+TEST_F(ExpressionEvaluatorTest, CounterResetStillRequiresPositiveTimeInterval) {
+    for (const auto lastTimestamp : {1000000000ULL, 500000000ULL}) {
+        const auto series = makeSeries({1000000000ULL, lastTimestamp}, {100.0, 10.0});
+        EXPECT_TRUE(std::isnan(series.rate().values.back()));
+        EXPECT_TRUE(std::isnan(series.irate().values.back()));
+    }
+}
+
+TEST_F(ExpressionEvaluatorTest, CounterResetToZeroAndMissingReadings) {
+    const double nan = std::nan("");
+    const auto series =
+        makeSeries({0ULL, 1000000000ULL, 2000000000ULL, 3000000000ULL, 4000000000ULL}, {100.0, 0.0, 5.0, nan, 10.0});
+    const auto rates = series.rate();
+    EXPECT_DOUBLE_EQ(rates.values[1], 0.0);
+    EXPECT_DOUBLE_EQ(rates.values[2], 5.0);
+    EXPECT_TRUE(std::isnan(rates.values[3]));
+    EXPECT_TRUE(std::isnan(rates.values[4]));
+    EXPECT_TRUE(std::isnan(series.irate().values.back()));
+    EXPECT_DOUBLE_EQ(series.increase().values.back(), 5.0);
 }
 
 // ==================== Gap-Fill Function Tests ====================

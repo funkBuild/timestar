@@ -69,6 +69,8 @@ std::string ExpressionNode::toString() const {
             if (forecast.history.has_value()) {
                 result += ", history='" + forecast.history.value() + "'";
             }
+            if (forecast.horizon.has_value())
+                result += ", horizon='" + forecast.horizon.value() + "'";
             result += ")";
             return result;
         }
@@ -733,13 +735,17 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseForecastFunction() {
     std::optional<std::string> seasonality;
     std::optional<std::string> model;
     std::optional<std::string> history;
+    std::optional<std::string> horizon;
+    std::set<std::string> supplied;
 
     while (match(TokenType::COMMA)) {
         // Expect parameter name identifier
         if (!check(TokenType::IDENTIFIER)) {
-            error("Expected parameter name (seasonality, model, or history)");
+            error("Expected parameter name (seasonality, model, history, or horizon)");
         }
         std::string paramName = currentToken_.value;
+        if (!supplied.insert(paramName).second)
+            error("Duplicate forecast parameter: " + paramName);
         advance();
 
         // Expect '=' token
@@ -770,15 +776,17 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseForecastFunction() {
             // History parameter accepts duration strings like "1w", "3d", "12h"
             // Validation will be done when actually using the value
             history = paramValue;
+        } else if (paramName == "horizon") {
+            horizon = paramValue;
         } else {
             throw ExpressionParseException("Unknown parameter '" + paramName +
-                                           "'. Expected 'seasonality', 'model', or 'history'");
+                                           "'. Expected 'seasonality', 'model', 'history', or 'horizon'");
         }
     }
 
     consume(TokenType::RPAREN, "Expected ')' after forecast arguments");
 
-    return ExpressionNode::makeForecastFunction(queryRef, algorithm, deviations, seasonality, model, history);
+    return ExpressionNode::makeForecastFunction(queryRef, algorithm, deviations, seasonality, model, history, horizon);
 }
 
 std::unique_ptr<ExpressionNode> ExpressionParser::parseTimeShiftFunction() {

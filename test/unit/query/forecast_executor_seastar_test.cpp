@@ -476,3 +476,50 @@ TEST_F(ForecastExecutorSeastarTest, MultiSeriesDirectExecution) {
     // Verify timestamps include historical + forecast
     EXPECT_EQ(result.times.size(), 60u);  // 50 historical + 10 forecast
 }
+
+TEST_F(ForecastExecutorSeastarTest, ExplicitHistoryFetchesOutsideVisibleWindowAndHorizonIsIndependent) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.startWithBackground();
+        const uint64_t interval = 60000000000ULL;
+        const uint64_t start = 1704067200000000000ULL;
+        std::vector<std::pair<uint64_t, double>> points;
+        for (size_t i = 0; i < 1440; ++i)
+            points.emplace_back(start + i * interval, 10.0 + i * 0.5);
+        insertSeries(eng.eng, "history_horizon", "value", {}, points);
+        DerivedQueryExecutor executor(&eng.eng);
+        DerivedQueryRequest request;
+        request.formula = "forecast(a, 'linear', 2, model='simple', history='18h', horizon='15m')";
+        request.startTime = start + 1380 * interval;
+        request.endTime = start + 1440 * interval - 1;
+        QueryRequest qr;
+        qr.measurement = "history_horizon";
+        qr.fields = {"value"};
+        qr.startTime = request.startTime;
+        qr.endTime = request.endTime;
+        request.queries["a"] = qr;
+        auto variant = executor.executeWithAnomaly(request).get();
+        auto& result = std::get<ForecastQueryResult>(variant);
+        ASSERT_TRUE(result.success);
+        EXPECT_EQ(result.statistics.historicalPoints, 1080u);
+        EXPECT_EQ(result.statistics.forecastPoints, 15u);
+        EXPECT_NEAR(result.statistics.slope, 0.5, 1e-8);
+        request.formula = "forecast(a, 'linear', 2, horizon='1s')";
+        EXPECT_THROW(executor.executeWithAnomaly(request).get(), DerivedQueryException);
+        request.formula = "forecast(a, 'linear', 2, horizon='0d')";
+        EXPECT_THROW(executor.executeWithAnomaly(request).get(), DerivedQueryException);
+        // If the device stopped before the explicit training window, decline
+        // it instead of silently moving history backwards to its stale data.
+        request.formula = "forecast(a, 'linear', 2, history='6h', horizon='15m')";
+        request.queries["a"].startTime = start;
+        request.queries["a"].endTime = start + 72 * 60 * interval;
+        request.endTime = request.queries["a"].endTime;
+        auto staleVariant = executor.executeWithAnomaly(request).get();
+        const auto& staleResult = std::get<ForecastQueryResult>(staleVariant);
+        EXPECT_TRUE(staleResult.success);
+        EXPECT_TRUE(staleResult.series.empty());
+        EXPECT_EQ(staleResult.statistics.declinedSeriesCount, 1u);
+    })
+        .join()
+        .get();
+}

@@ -92,6 +92,9 @@ find_gcovr() {
 detect_gcov() {
   local cxx major
   cxx="$(sed -n 's/^CMAKE_CXX_COMPILER:[^=]*=//p' "${BUILD_DIR}/CMakeCache.txt" | head -1)"
+  # Reconfiguring with -DCMAKE_CXX_COMPILER=g++-14 can leave a bare command
+  # name in the cache. Resolve it through PATH before checking executability.
+  cxx="$(command -v -- "${cxx}" 2>/dev/null || true)"
   if [[ -n "${cxx}" && -x "${cxx}" ]]; then
     major="$("${cxx}" -dumpversion 2>/dev/null | cut -d. -f1)"
     if [[ -n "${major}" ]] && command -v "gcov-${major}" >/dev/null 2>&1; then

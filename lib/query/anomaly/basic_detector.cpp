@@ -25,7 +25,7 @@ AnomalyOutput BasicDetector::detectOptimized(const AnomalyInputView& input, cons
     output.scores.resize(n);
     output.predictions.resize(n);
 
-    size_t windowSize = config.windowSize;
+    size_t windowSize = std::max<size_t>(config.windowSize, 1);
     double bounds = config.bounds;
     size_t minDataPoints = config.minDataPoints;
 
@@ -34,12 +34,14 @@ AnomalyOutput BasicDetector::detectOptimized(const AnomalyInputView& input, cons
 
     // Pre-allocate scale vector for SIMD bounds computation
     std::vector<double> scale(n, 1.0);
+    std::vector<bool> ready(n, false);
+    size_t finiteCount = 0;
 
     // First pass: compute rolling stats incrementally
     for (size_t i = 0; i < n; ++i) {
         double value = input.values[i];
 
-        if (std::isnan(value)) {
+        if (!std::isfinite(value)) {
             // NaN input: not an anomaly, just missing data
             output.upper[i] = std::numeric_limits<double>::quiet_NaN();
             output.lower[i] = std::numeric_limits<double>::quiet_NaN();
@@ -50,7 +52,7 @@ AnomalyOutput BasicDetector::detectOptimized(const AnomalyInputView& input, cons
             continue;
         }
 
-        if (i < minDataPoints) {
+        if (finiteCount < minDataPoints) {
             // Not enough data yet - use wide bounds
             output.upper[i] = std::numeric_limits<double>::infinity();
             output.lower[i] = -std::numeric_limits<double>::infinity();
@@ -59,8 +61,10 @@ AnomalyOutput BasicDetector::detectOptimized(const AnomalyInputView& input, cons
 
             // Still update stats for future points
             stats.update(value);
+            ++finiteCount;
             continue;
         }
+        ready[i] = true;
 
         // Get current statistics before updating with this point
         double currentMean = stats.mean();
@@ -95,7 +99,12 @@ AnomalyOutput BasicDetector::detectOptimized(const AnomalyInputView& input, cons
     // Fix up NaN inputs: SIMD may have produced NaN scores for NaN input values.
     // NaN inputs are missing data, not anomalies -- ensure score is 0.
     for (size_t i = minDataPoints; i < n; ++i) {
-        if (std::isnan(input.values[i])) {
+        if (!std::isfinite(input.values[i])) {
+            output.upper[i] = output.lower[i] = std::numeric_limits<double>::quiet_NaN();
+            output.scores[i] = 0.0;
+        } else if (!ready[i]) {
+            output.upper[i] = std::numeric_limits<double>::infinity();
+            output.lower[i] = -std::numeric_limits<double>::infinity();
             output.scores[i] = 0.0;
         }
     }

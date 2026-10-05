@@ -56,7 +56,7 @@ enum class UnaryOpType {
     // Counter-rate functions (use timestamps alongside values)
     RATE,      // rate(a) - per-second rate from monotonically-increasing counter; handles resets
     IRATE,     // irate(a) - instantaneous rate using only the last two points
-    INCREASE,  // increase(a) - total increase over the series (sum of positive diffs)
+    INCREASE,  // increase(a) - total reset-adjusted increase over the series
     // Gap-fill / interpolation functions
     FILL_FORWARD,   // fill_forward(a) - last observation carried forward (LOCF); leading NaNs stay NaN
     FILL_BACKWARD,  // fill_backward(a) - next observation carried backward (NOCB); trailing NaNs stay NaN
@@ -180,19 +180,22 @@ struct ForecastFunction {
     double deviations;                       // Standard deviations for confidence bounds (1-4)
     std::optional<std::string> seasonality;  // "hourly", "daily", "weekly" (seasonal only)
     std::optional<std::string> model;        // "default", "simple", "reactive" (linear only)
-    std::optional<std::string> history;      // "1w", "3d", "12h", etc. (linear only)
+    std::optional<std::string> history;      // Training duration, e.g. "3d"
+    std::optional<std::string> horizon;      // Prediction duration, independent of history
 
     ForecastFunction() = default;
     ForecastFunction(std::string _queryRef, std::string _algorithm, double _deviations,
                      std::optional<std::string> _seasonality = std::nullopt,
                      std::optional<std::string> _model = std::nullopt,
-                     std::optional<std::string> _history = std::nullopt)
+                     std::optional<std::string> _history = std::nullopt,
+                     std::optional<std::string> _horizon = std::nullopt)
         : queryRef(std::move(_queryRef)),
           algorithm(std::move(_algorithm)),
           deviations(_deviations),
           seasonality(std::move(_seasonality)),
           model(std::move(_model)),
-          history(std::move(_history)) {}
+          history(std::move(_history)),
+          horizon(std::move(_horizon)) {}
 };
 
 // time_shift function node: time_shift(query, 'offset')
@@ -281,10 +284,11 @@ struct ExpressionNode {
         const std::string& queryRef, const std::string& algorithm, double deviations,
         const std::optional<std::string>& seasonality = std::nullopt,
         const std::optional<std::string>& model = std::nullopt,
-        const std::optional<std::string>& history = std::nullopt) {
+        const std::optional<std::string>& history = std::nullopt,
+        const std::optional<std::string>& horizon = std::nullopt) {
         auto node = std::make_unique<ExpressionNode>();
         node->type = ExprNodeType::FORECAST_FUNCTION;
-        node->data = ForecastFunction(queryRef, algorithm, deviations, seasonality, model, history);
+        node->data = ForecastFunction(queryRef, algorithm, deviations, seasonality, model, history, horizon);
         return node;
     }
 

@@ -29,8 +29,8 @@ A high-performance time series database built with C++23 and the Seastar framewo
 - Derived queries combining multiple sub-queries with formulas
 
 **Analytics**
-- Anomaly detection (basic rolling window, agile SARIMA, robust STL)
-- Forecasting (linear regression, seasonal STL with auto-periodicity detection)
+- Anomaly detection (basic rolling window, agile Holt-Winters, causal robust median/MAD)
+- Forecasting (linear regression, seasonal autoregression, multi-seasonal STL)
 - Confidence intervals and anomaly scoring
 
 **Streaming**

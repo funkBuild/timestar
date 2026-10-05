@@ -44,11 +44,18 @@ Functions available in derived query formulas. All functions operate element-wis
 
 | Function | Description |
 |----------|-------------|
-| `rate(a)` | Per-second rate from monotonic counter; handles resets |
+| `rate(a)` | Per-second rate between adjacent counter readings; a decrease assumes a reset to zero and counts the new reading |
 | `irate(a)` | Instantaneous rate (last two points, constant series) |
-| `increase(a)` | Total increase over the series (scalar) |
-| `per_minute(a, spp)` | Rate scaled to per-minute (rate * 60) |
-| `per_hour(a, spp)` | Rate scaled to per-hour (rate * 3600) |
+| `increase(a)` | Sum of reset-adjusted increments between adjacent readings (scalar); does not include the first reading or extrapolate beyond the samples |
+| `per_minute(a, spp)` | Signed per-second difference scaled to per-minute; does not adjust counter resets |
+| `per_hour(a, spp)` | Signed per-second difference scaled to per-hour; does not adjust counter resets |
+
+`irate(a)` uses the same reset correction as `rate(a)`, but repeats the last
+interval's rate across the result. It is a summary, not a rolling historical rate.
+For counter flow in other units use `rate(a) * 60` or `rate(a) * 3600`.
+To demonstrate the signed conversion functions on a resetting counter, first
+unwrap it: `per_minute(cumsum(monotonic_diff(a)), spp)` (or `per_hour`).
+The conversions use actual timestamp intervals; `spp` is retained for API compatibility.
 
 ## Counting Functions
 
