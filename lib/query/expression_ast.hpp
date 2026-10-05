@@ -56,7 +56,7 @@ enum class UnaryOpType {
     // Counter-rate functions (use timestamps alongside values)
     RATE,      // rate(a) - per-second rate from monotonically-increasing counter; handles resets
     IRATE,     // irate(a) - instantaneous rate using only the last two points
-    INCREASE,  // increase(a) - total increase over the series (sum of positive diffs)
+    INCREASE,  // increase(a) - total reset-adjusted increase over the series
     // Gap-fill / interpolation functions
     FILL_FORWARD,   // fill_forward(a) - last observation carried forward (LOCF); leading NaNs stay NaN
     FILL_BACKWARD,  // fill_backward(a) - next observation carried backward (NOCB); trailing NaNs stay NaN

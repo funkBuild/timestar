@@ -346,7 +346,7 @@ AlignedSeries AlignedSeries::rate() const {
     for (size_t i = 1; i < values.size(); ++i) {
         double diff = values[i] - values[i - 1];
         if (diff < 0.0)
-            diff = 0.0;  // Counter reset: treat as zero increase
+            diff = values[i];  // Reset to zero: retain the increment already observed since reset.
         uint64_t delta_ns = (ts[i] > ts[i - 1]) ? (ts[i] - ts[i - 1]) : 0ULL;
         if (delta_ns == 0ULL) {
             result[i] = nan;  // Zero or negative time delta
@@ -368,18 +368,15 @@ AlignedSeries AlignedSeries::irate() const {
     }
     size_t n = values.size();
     double diff = values[n - 1] - values[n - 2];
+    if (diff < 0.0)
+        diff = values[n - 1];
     double rate_val;
-    if (diff < 0.0) {
-        // Counter reset at the last step: rate is 0
-        rate_val = 0.0;
+    uint64_t delta_ns = (ts[n - 1] > ts[n - 2]) ? (ts[n - 1] - ts[n - 2]) : 0ULL;
+    if (delta_ns == 0ULL) {
+        rate_val = nan;
     } else {
-        uint64_t delta_ns = (ts[n - 1] > ts[n - 2]) ? (ts[n - 1] - ts[n - 2]) : 0ULL;
-        if (delta_ns == 0ULL) {
-            rate_val = nan;
-        } else {
-            double delta_seconds = static_cast<double>(delta_ns) / 1e9;
-            rate_val = diff / delta_seconds;
-        }
+        double delta_seconds = static_cast<double>(delta_ns) / 1e9;
+        rate_val = diff / delta_seconds;
     }
     // Return the instantaneous rate as a constant series at all timestamps
     std::vector<double> result(values.size(), rate_val);
@@ -390,10 +387,12 @@ AlignedSeries AlignedSeries::increase() const {
     double total = 0.0;
     for (size_t i = 1; i < values.size(); ++i) {
         double diff = values[i] - values[i - 1];
+        if (diff < 0.0)
+            diff = values[i];
         if (diff > 0.0) {
             total += diff;
         }
-        // Negative diffs (counter resets) contribute 0
+        // Same reset correction as monotonic_diff() and rate(). NaN pairs are skipped.
     }
     // Return as a constant scalar series
     std::vector<double> result(values.size(), total);

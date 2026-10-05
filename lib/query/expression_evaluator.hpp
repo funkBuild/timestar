@@ -95,7 +95,7 @@ struct AlignedSeries {
     // Counter-rate functions (require access to timestamps)
     AlignedSeries rate() const;      // Per-second rate; handles counter resets; first point NaN
     AlignedSeries irate() const;     // Instantaneous rate using last two points (constant series)
-    AlignedSeries increase() const;  // Total increase over the series (sum of positive diffs, scalar)
+    AlignedSeries increase() const;  // Total reset-adjusted increase over the series (scalar)
     // Gauge derivative / range summaries
     AlignedSeries deriv() const;    // Per-second first derivative (SIMD); negatives allowed; first point NaN
     AlignedSeries delta() const;    // Last non-NaN minus first non-NaN (constant series; NaN if no data)
