@@ -29,11 +29,20 @@ inline size_t ffor_packed_words(size_t count, uint8_t bw) {
 
 namespace detail {
 
+// Packed words may begin at any byte offset in a WAL or TSM payload.
+// Fixed-size memcpy permits native loads without an alignment requirement.
+inline uint64_t load_packed_word(const void* input, size_t index) {
+    uint64_t word;
+    std::memcpy(&word, static_cast<const uint8_t*>(input) + index * sizeof(word), sizeof(word));
+    return word;
+}
+
 // Pack values into words for a known power-of-2 bit-width.
 // Template parameter BW must be one of {1, 2, 4, 8, 16, 32}.
 // Values per word = 64 / BW.
 template <unsigned BW>
-inline void pack_pow2_u64(const uint64_t* values, size_t count, uint64_t base, uint64_t* out) {
+inline void pack_pow2_u64(const uint64_t* values, size_t count, uint64_t base, void* out) {
+    auto* bytes = static_cast<uint8_t*>(out);
     constexpr unsigned VPW = 64 / BW;  // values per word
     constexpr uint64_t mask = (1ULL << BW) - 1;
     const size_t n_words = ffor_packed_words(count, BW);
@@ -44,7 +53,7 @@ inline void pack_pow2_u64(const uint64_t* values, size_t count, uint64_t base, u
         for (unsigned j = 0; j < VPW && i < count; ++j, ++i) {
             word |= ((values[i] - base) & mask) << (j * BW);
         }
-        out[w] = word;
+        std::memcpy(bytes + w * sizeof(word), &word, sizeof(word));
     }
 }
 
@@ -66,14 +75,14 @@ inline void pack_pow2_i64(const int64_t* values, size_t count, int64_t base, uin
 
 // Unpack values from words for a known power-of-2 bit-width.
 template <unsigned BW>
-inline void unpack_pow2_u64(const uint64_t* in, size_t count, uint64_t base, uint64_t* out) {
+inline void unpack_pow2_u64(const void* in, size_t count, uint64_t base, uint64_t* out) {
     constexpr unsigned VPW = 64 / BW;
     constexpr uint64_t mask = (1ULL << BW) - 1;
     const size_t n_words = ffor_packed_words(count, BW);
 
     size_t i = 0;
     for (size_t w = 0; w < n_words && i < count; ++w) {
-        uint64_t word = in[w];
+        uint64_t word = load_packed_word(in, w);
         for (unsigned j = 0; j < VPW && i < count; ++j, ++i) {
             out[i] = base + ((word >> (j * BW)) & mask);
         }
@@ -166,14 +175,18 @@ inline void ffor_pack(const int64_t* values, size_t count, int64_t base, uint8_t
     }
 }
 
-// Unsigned variant for ALP_RD right-parts
-inline void ffor_pack_u64(const uint64_t* values, size_t count, uint64_t base, uint8_t bw, uint64_t* out) {
+// Unsigned variant for ALP_RD right-parts and timestamp WAL payloads.
+// Output may start at any byte offset. Fixed-size memcpy stores retain the
+// native word layout without imposing uint64_t alignment on byte buffers.
+inline void ffor_pack_u64(const uint64_t* values, size_t count, uint64_t base, uint8_t bw, void* out) {
+    auto* bytes = static_cast<uint8_t*>(out);
     if (bw == 0 || count == 0)
         return;
 
     if (bw >= 64) {
         for (size_t i = 0; i < count; ++i) {
-            out[i] = values[i] - base;
+            const uint64_t word = values[i] - base;
+            std::memcpy(bytes + i * sizeof(word), &word, sizeof(word));
         }
         return;
     }
@@ -215,7 +228,7 @@ inline void ffor_pack_u64(const uint64_t* values, size_t count, uint64_t base, u
         const uint64_t delta = (values[i] - base) & mask;
         acc |= delta << acc_bits;
         if (acc_bits + bw >= 64) {
-            out[w++] = acc;
+            std::memcpy(bytes + w++ * sizeof(acc), &acc, sizeof(acc));
             const unsigned consumed = 64 - acc_bits;  // in [1, 63]: bw < 64 forces acc_bits > 0 here
             acc = (consumed < bw) ? (delta >> consumed) : 0;
             acc_bits = acc_bits + bw - 64;
@@ -224,7 +237,7 @@ inline void ffor_pack_u64(const uint64_t* values, size_t count, uint64_t base, u
         }
     }
     if (acc_bits > 0) {
-        out[w] = acc;
+        std::memcpy(bytes + w * sizeof(acc), &acc, sizeof(acc));
     }
 }
 
@@ -322,8 +335,8 @@ inline void ffor_unpack(const uint64_t* in, size_t count, int64_t base, uint8_t 
     }
 }
 
-// Unsigned unpack variant for ALP_RD right-parts
-inline void ffor_unpack_u64(const uint64_t* in, size_t count, uint64_t base, uint8_t bw, uint64_t* out) {
+// Unsigned unpack variant for ALP_RD right-parts and byte-aligned timestamps.
+inline void ffor_unpack_u64(const void* in, size_t count, uint64_t base, uint8_t bw, uint64_t* out) {
     if (count == 0)
         return;
 
@@ -336,7 +349,7 @@ inline void ffor_unpack_u64(const uint64_t* in, size_t count, uint64_t base, uin
 
     if (bw >= 64) {
         for (size_t i = 0; i < count; ++i) {
-            out[i] = base + in[i];
+            out[i] = base + detail::load_packed_word(in, i);
         }
         return;
     }
@@ -373,11 +386,11 @@ inline void ffor_unpack_u64(const uint64_t* in, size_t count, uint64_t base, uin
         const size_t word_idx = bit_pos >> 6;
         const unsigned bit_idx = bit_pos & 63;
 
-        uint64_t delta = (in[word_idx] >> bit_idx) & mask;
+        uint64_t delta = (detail::load_packed_word(in, word_idx) >> bit_idx) & mask;
 
         if (bit_idx + bw > 64) {
             const unsigned overflow_bits = bit_idx + bw - 64;
-            delta |= (in[word_idx + 1] & ((1ULL << overflow_bits) - 1)) << (64 - bit_idx);
+            delta |= (detail::load_packed_word(in, word_idx + 1) & ((1ULL << overflow_bits) - 1)) << (64 - bit_idx);
         }
 
         out[i] = base + delta;

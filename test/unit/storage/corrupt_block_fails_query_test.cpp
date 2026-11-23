@@ -39,6 +39,7 @@
 #include "../../../lib/http/http_query_handler.hpp"
 #include "../../../lib/http/http_write_handler.hpp"
 #include "../../test_helpers.hpp"
+#include "request_body.hpp"
 
 #include <glaze/json.hpp>
 
@@ -61,7 +62,7 @@ constexpr uint64_t kBase = 1700000000ULL * kSec;
 
 std::unique_ptr<seastar::http::request> jsonRequest(const std::string& body) {
     auto req = std::make_unique<seastar::http::request>();
-    req->content = body;
+    timestar::http::injectedBody(*req) = body;
     req->_headers["Content-Type"] = "application/json";
     return req;
 }

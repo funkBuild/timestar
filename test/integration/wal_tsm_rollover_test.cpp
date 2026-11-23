@@ -1,3 +1,4 @@
+#include "../../lib/config/timestar_config.hpp"
 #include "../../lib/core/engine.hpp"
 #include "../../lib/query/query_runner.hpp"
 #include "../../lib/storage/tsm_file_manager.hpp"
@@ -20,9 +21,26 @@ public:
     void SetUp() override {
         // Clean up all shard directories and let Engine create its own
         cleanTestShardDirectories();
+
+        // Pin the rollover threshold instead of inheriting the server default.
+        // These tests write a fixed volume and assert that it rolls the WAL
+        // over; they were sized for the old 16MB default and stopped rolling
+        // at all when it became 64MB, and their float data also shrinks every
+        // time the encoder improves. 4MB keeps each test several segments past
+        // the threshold whatever the default or the compression ratio.
+        previousConfig_ = timestar::config();
+        auto cfg = previousConfig_;
+        cfg.storage.wal_size_threshold = kWalThreshold;
+        timestar::setGlobalConfig(cfg);
     }
 
-    void TearDown() override { cleanTestShardDirectories(); }
+    void TearDown() override {
+        timestar::setGlobalConfig(previousConfig_);
+        cleanTestShardDirectories();
+    }
+
+    static constexpr uint64_t kWalThreshold = 4 * 1024 * 1024;
+    timestar::TimestarConfig previousConfig_;
 
     size_t countTSMFiles() {
         size_t count = 0;
@@ -66,9 +84,9 @@ SEASTAR_TEST_F(WALTSMRolloverTest, TestWALToTSMRollover) {
         std::cout << "Initial state: " << self->countWALFiles() << " WAL files, " << self->countTSMFiles()
                   << " TSM files" << std::endl;
 
-        // The WAL threshold is 16MB. The WAL uses compressed encoding (XOR for
-        // floats, delta for timestamps), so we need to write enough data to
-        // exceed 16MB of actual compressed WAL data. Use many distinct series
+        // The WAL threshold is kWalThreshold (set in SetUp). The WAL stores
+        // compressed values, so the volume below is sized to exceed it several
+        // times over after compression. Use many distinct series
         // with large point counts to ensure sufficient volume.
         const size_t POINTS_PER_INSERT = 5000;
         const size_t MAX_SERIES = 500;
@@ -165,7 +183,7 @@ SEASTAR_TEST_F(WALTSMRolloverTest, TestMultipleRollovers) {
 
         // Write data in large rounds to trigger multiple rollovers.
         // Each round writes enough distinct series with enough points
-        // to exceed the 16MB WAL threshold even after compression.
+        // to exceed the WAL threshold (kWalThreshold) even after compression.
         const size_t MAX_ROUNDS = 10;
         const size_t SERIES_PER_ROUND = 300;
         const size_t POINTS_PER_SERIES = 5000;
@@ -218,7 +236,7 @@ SEASTAR_TEST_F(WALTSMRolloverTest, TestBatchedWritesWithRollover) {
 
         std::cout << "Using batched write optimizations..." << std::endl;
 
-        // Write enough data to exceed 16MB WAL threshold (compressed).
+        // Write enough data to exceed the WAL threshold (kWalThreshold, compressed).
         // The WAL uses XOR encoding for floats and delta encoding for timestamps,
         // which can achieve high compression ratios. Use many series with large
         // point counts and longer tag values to ensure sufficient volume.

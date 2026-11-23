@@ -6,6 +6,7 @@
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/core/timestar_value.hpp"
 #include "../../test_helpers.hpp"
+#include "shard_count.hpp"
 
 #include <gtest/gtest.h>
 
@@ -27,12 +28,12 @@ namespace fs = std::filesystem;
 // Multi-shard tests skip on developer boxes with a forced single shard, but
 // must never skip silently in CI (the runner pins -c 2, so a skip there means
 // the multi-shard paths lost coverage without anyone noticing).
-#define REQUIRE_MULTI_SHARD()                                                                 \
-    if (seastar::smp::count < 2) {                                                            \
-        if (std::getenv("CI")) {                                                              \
-            FAIL() << "Multi-shard test would be skipped in CI — run the suite with -c 2+";   \
-        }                                                                                     \
-        GTEST_SKIP() << "Need at least 2 shards for this test";                               \
+#define REQUIRE_MULTI_SHARD()                                                               \
+    if (timestar::shardCount() < 2) {                                                       \
+        if (std::getenv("CI")) {                                                            \
+            FAIL() << "Multi-shard test would be skipped in CI — run the suite with -c 2+"; \
+        }                                                                                   \
+        GTEST_SKIP() << "Need at least 2 shards for this test";                             \
     }
 
 // ---------------------------------------------------------------------------
@@ -125,7 +126,7 @@ TEST_F(EngineMetadataTest, NoShardedRefNoCrash) {
         rawEng.start().get();
         rawEng.invoke_on_all([](Engine& engine) { return engine.init(); }).get();
 
-        auto cleanup = seastar::defer([&rawEng] {
+        auto cleanup = seastar::defer([&rawEng] noexcept {
             rawEng.invoke_on_all([](Engine& engine) { return engine.stop(); }).get();
             rawEng.stop().get();
         });

@@ -73,6 +73,7 @@ _deps/
 
 # Benchmark result artifacts
 benchmark/*.json
+benchmark/ci_benchmark_report.md
 
 # Data files (but keep test data)
 *.tsm

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iosfwd>
+#include <limits>
 #include <memory>
 #include <new>
 #include <stdexcept>

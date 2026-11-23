@@ -9,6 +9,8 @@
 #include "http_error.hpp"
 #include "logger.hpp"
 #include "proto_converters.hpp"
+#include "request_body.hpp"
+#include "shard_count.hpp"
 #include "streaming_aggregator.hpp"
 #include "streaming_derived_evaluator.hpp"
 #include "timestar_config.hpp"
@@ -489,7 +491,7 @@ static seastar::future<> flushToSocket(seastar::output_stream<char>& body, seast
 
 // Custom handler for SSE replies. Calls the no-argument done() overload,
 // which only stamps the response line; the Content-Type header is set
-// explicitly via set_mime_type() in handleSubscribe (write_body()'s
+// explicitly via set_content_type() in handleSubscribe (write_body()'s
 // content-type parameter is treated as a file *extension* and would map
 // "text/event-stream" to the default mime type).
 class sse_handler : public seastar::httpd::handler_base {
@@ -504,7 +506,6 @@ public:
         return _parent->handleSubscribe(std::move(req)).then([](std::unique_ptr<seastar::http::reply> rep) {
             // done() without arguments only sets the response line and leaves
             // the Content-Type header (set in handleSubscribe) untouched.
-            rep->done();
             return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
         });
     }
@@ -559,7 +560,14 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
     auto resFmt = timestar::http::responseFormat(*req);
 
     // Body size limit to prevent DoS via large payloads
-    if (req->content.size() > timestar::config().http.max_query_body_size) {
+    seastar::sstring body;
+    const auto bodyStatus =
+        co_await timestar::http::readRequestBody(*req, timestar::config().http.max_query_body_size, body);
+    if (bodyStatus == timestar::http::BodyStatus::Incomplete) {
+        timestar::http::replyIncompleteBody(*rep, resFmt);
+        co_return rep;
+    }
+    if (bodyStatus == timestar::http::BodyStatus::TooLarge) {
         rep->set_status(seastar::http::reply::status_type::payload_too_large);
         rep->_content = timestar::http::jsonError("Request body too large");
         timestar::http::setContentType(*rep, resFmt);
@@ -573,7 +581,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
 
     if (timestar::http::isProtobuf(reqFmt)) {
         try {
-            auto parsed = timestar::proto::parseSubscribeRequest(req->content.data(), req->content.size());
+            auto parsed = timestar::proto::parseSubscribeRequest(body.data(), body.size());
             glazeReq.query = std::move(parsed.query);
             glazeReq.formula = std::move(parsed.formula);
             glazeReq.backfill = parsed.backfill;
@@ -593,7 +601,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
             co_return rep;
         }
     } else {
-        auto parseErr = glz::read_json(glazeReq, req->content);
+        auto parseErr = glz::read_json(glazeReq, body);
         if (parseErr) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
             rep->_content = timestar::http::jsonError("Failed to parse subscribe request", "INVALID_JSON");
@@ -769,7 +777,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
     auto* queuePtr = outputQueue.get();
 
     unsigned thisShard = seastar::this_shard_id();
-    unsigned shardCount = seastar::smp::count;
+    unsigned shardCount = timestar::shardCount();
 
     // Register a subscription for each query entry.
     // TODO: batch the invoke_on_all calls to reduce N scatter-gathers to 1.
@@ -975,7 +983,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
     // NOTE: write_body()'s content-type parameter is interpreted as a file
     // EXTENSION (reply::set_content_type -> mime_types::extension_to_type),
     // so "text/event-stream" silently maps to the fallback "text/plain".
-    // set_mime_type() below overwrites the Content-Type header directly with
+    // set_content_type() below overwrites the Content-Type header directly with
     // the real SSE mime type; sse_handler's no-arg done() leaves it intact.
     rep->write_body(
         "text/event-stream",
@@ -1196,7 +1204,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
             co_await out.close();
         });
 
-    rep->set_mime_type("text/event-stream");
+    rep->set_content_type("text/event-stream");
 
     co_return rep;
 }
@@ -1299,7 +1307,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
     }
 
     timestar::http::setContentType(*rep, resFmt);
-    rep->done();
     co_return rep;
 }
 

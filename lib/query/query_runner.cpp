@@ -348,16 +348,18 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm([[maybe_unused]] const std
             if (represented)
                 continue;
             const auto& data = *match.series;
-            auto begin = std::lower_bound(data.timestamps.begin(), data.timestamps.end(), startTime);
-            auto end = std::upper_bound(begin, data.timestamps.end(), endTime);
-            const size_t offset = begin - data.timestamps.begin();
+            const auto& dataTimestamps = data.timestamps();
+            auto begin = std::lower_bound(dataTimestamps.begin(), dataTimestamps.end(), startTime);
+            auto end = std::upper_bound(begin, dataTimestamps.end(), endTime);
+            const size_t offset = begin - dataTimestamps.begin();
             const size_t count = end - begin;
             if (!count)
                 continue;
             TSMResult<T> memory(rank--);
             auto block = std::make_unique<TSMBlock<T>>(count);
             block->timestamps.assign(begin, end);
-            block->values.assign(data.values.begin() + offset, data.values.begin() + offset + count);
+            const auto& dataValues = data.values();
+            block->values.assign(dataValues.begin() + offset, dataValues.begin() + offset + count);
             memory.blocks.push_back(std::move(block));
             inputs.push_back(std::move(memory));
         }
@@ -515,19 +517,20 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm([[maybe_unused]] const std
     // iterate in reverse so span order is oldest→newest per the contract.
     for (const auto& match : memoryMatches | std::views::reverse) {
         const auto& storeData = *match.series;
-        if (storeData.timestamps.empty())
+        if (storeData.empty())
             continue;
 
-        auto beginIt = std::lower_bound(storeData.timestamps.begin(), storeData.timestamps.end(), startTime);
-        auto endIt = std::upper_bound(beginIt, storeData.timestamps.end(), endTime);
-        size_t startIdx = static_cast<size_t>(beginIt - storeData.timestamps.begin());
-        size_t endIdx = static_cast<size_t>(endIt - storeData.timestamps.begin());
+        const auto& storeTimestamps = storeData.timestamps();
+        auto beginIt = std::lower_bound(storeTimestamps.begin(), storeTimestamps.end(), startTime);
+        auto endIt = std::upper_bound(beginIt, storeTimestamps.end(), endTime);
+        size_t startIdx = static_cast<size_t>(beginIt - storeTimestamps.begin());
+        size_t endIdx = static_cast<size_t>(endIt - storeTimestamps.begin());
         size_t count = endIdx - startIdx;
 
         if (count > 0) {
             SortedSpan<T> memSpan;
-            memSpan.tsPtr = storeData.timestamps.data() + startIdx;
-            memSpan.valVec = &storeData.values;
+            memSpan.tsPtr = storeTimestamps.data() + startIdx;
+            memSpan.valVec = &storeData.values();
             memSpan.baseIdx = startIdx;
             memSpan.pos = 0;
             memSpan.len = count;
@@ -708,7 +711,7 @@ static size_t aggregateMemoryStoresTyped(const std::vector<seastar::shared_ptr<M
     size_t totalPoints = 0;
     for (const auto& match : memoryMatches) {
         const auto& storeData = *match.series;
-        if (storeData.timestamps.empty())
+        if (storeData.empty())
             continue;
 
         // Fast path for double series: if running stats cover the query range
@@ -734,21 +737,25 @@ static size_t aggregateMemoryStoresTyped(const std::vector<seastar::shared_ptr<M
             }
         }
 
-        auto beginIt = std::lower_bound(storeData.timestamps.begin(), storeData.timestamps.end(), startTime);
-        auto endIt = std::upper_bound(beginIt, storeData.timestamps.end(), endTime);
-        size_t startIdx = static_cast<size_t>(beginIt - storeData.timestamps.begin());
-        size_t endIdx = static_cast<size_t>(endIt - storeData.timestamps.begin());
+        // The stats answer above reads no points and leaves adopted runs where
+        // they are; anything that scans consolidates the series first.
+        const auto& storeTimestamps = storeData.timestamps();
+        const auto& storeValues = storeData.values();
+        auto beginIt = std::lower_bound(storeTimestamps.begin(), storeTimestamps.end(), startTime);
+        auto endIt = std::upper_bound(beginIt, storeTimestamps.end(), endTime);
+        size_t startIdx = static_cast<size_t>(beginIt - storeTimestamps.begin());
+        size_t endIdx = static_cast<size_t>(endIt - storeTimestamps.begin());
         size_t count = endIdx - startIdx;
         if (count == 0)
             continue;
 
         if constexpr (std::is_same_v<T, double>) {
             // Float data: use zero-copy range path (enables SIMD fold + single-bucket fast path)
-            aggregator.addPointsRange(storeData.timestamps, storeData.values, startIdx, endIdx);
+            aggregator.addPointsRange(storeTimestamps, storeValues, startIdx, endIdx);
         } else {
             // Non-double types: convert to double per-point
             for (size_t i = startIdx; i < endIdx; ++i) {
-                aggregator.addPoint(storeData.timestamps[i], static_cast<double>(storeData.values[i]));
+                aggregator.addPoint(storeTimestamps[i], static_cast<double>(storeValues[i]));
             }
         }
         totalPoints += count;

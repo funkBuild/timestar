@@ -62,8 +62,8 @@ protected:
                 [&](auto&& series) {
                     using T = std::decay_t<decltype(series)>;
                     if constexpr (std::is_same_v<T, InMemorySeries<double>>) {
-                        result.timestamps = series.timestamps;
-                        result.values = series.values;
+                        result.timestamps = series.timestamps();
+                        result.values = series.values();
                     }
                 },
                 it->second);
@@ -270,7 +270,7 @@ TEST_F(QueryRealIntegrationTest, CompleteQueryPipeline) {
                     // 10-minute max aggregation
                     uint64_t interval = 10 * 60 * 1000000000ULL;
                     auto aggregated =
-                        Aggregator::aggregate(series.timestamps, series.values, AggregationMethod::MAX, interval);
+                        Aggregator::aggregate(series.timestamps(), series.values(), AggregationMethod::MAX, interval);
 
                     // Should have ~6 buckets
                     EXPECT_GE(aggregated.size(), 5);
@@ -395,7 +395,7 @@ TEST_F(QueryRealIntegrationTest, PerformanceWithRealisticData) {
             [&](auto&& series) {
                 using T = std::decay_t<decltype(series)>;
                 if constexpr (std::is_same_v<T, InMemorySeries<double>>) {
-                    totalPoints += series.timestamps.size();
+                    totalPoints += series.timestamps().size();
                 }
             },
             variantSeries);
@@ -421,7 +421,7 @@ TEST_F(QueryRealIntegrationTest, PerformanceWithRealisticData) {
                 if constexpr (std::is_same_v<T, InMemorySeries<double>>) {
                     uint64_t interval = 60000000000ULL;  // 1-minute intervals
                     auto aggregated =
-                        Aggregator::aggregate(series.timestamps, series.values, AggregationMethod::AVG, interval);
+                        Aggregator::aggregate(series.timestamps(), series.values(), AggregationMethod::AVG, interval);
 
                     EXPECT_GT(aggregated.size(), 0);
                     seriesProcessed++;

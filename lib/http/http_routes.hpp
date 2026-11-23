@@ -24,9 +24,8 @@ public:
                                                                   std::unique_ptr<seastar::http::reply> rep) override {
         return fn_(std::move(req), std::move(rep)).then([](std::unique_ptr<seastar::http::reply> innerRep) {
             if (innerRep->_headers.find("Content-Type") == innerRep->_headers.end()) {
-                innerRep->set_mime_type("application/json");
+                innerRep->set_content_type("application/json");
             }
-            innerRep->done();
             return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(innerRep));
         });
     }

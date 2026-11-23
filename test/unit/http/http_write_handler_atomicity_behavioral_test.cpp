@@ -28,10 +28,14 @@
 #include "../../../lib/http/http_write_handler.hpp"
 #include "../../../lib/utils/series_key.hpp"
 #include "../../test_helpers.hpp"
+#include "request_body.hpp"
+#include "shard_count.hpp"
 
 #include <glaze/json.hpp>
 
 #include <gtest/gtest.h>
+
+#include <cstdlib>
 
 #include <map>
 #include <memory>
@@ -51,7 +55,7 @@ protected:
 
     static std::unique_ptr<seastar::http::request> makeWriteRequest(const std::string& body) {
         auto req = std::make_unique<seastar::http::request>();
-        req->content = body;
+        timestar::http::injectedBody(*req) = body;
         req->_headers["Content-Type"] = "application/json";
         return req;
     }
@@ -61,7 +65,7 @@ protected:
                               const std::map<std::string, std::string>& tags, const std::string& field) {
         std::string seriesKey = timestar::buildSeriesKey(measurement, tags, field);
         size_t total = 0;
-        for (unsigned s = 0; s < seastar::smp::count; ++s) {
+        for (unsigned s = 0; s < timestar::shardCount(); ++s) {
             auto resultOpt =
                 eng.invoke_on(s, [seriesKey](Engine& engine) { return engine.query(seriesKey, 0, UINT64_MAX); }).get();
             if (resultOpt.has_value()) {
@@ -117,7 +121,12 @@ TEST_F(HttpWriteHandlerAtomicityBehavioralTest, ShardFailureAccountingIsConsiste
     // small series can succeed and the response is "partial" (with a single
     // shard, every point rides the failing batch and the server correctly
     // answers 413 instead).
-    if (seastar::smp::count < 2) {
+    if (timestar::shardCount() < 2) {
+        // Never skip silently in CI, which pins two shards (same convention as
+        // REQUIRE_MULTI_SHARD in engine_metadata_test.cpp).
+        if (std::getenv("CI")) {
+            FAIL() << "Multi-shard test would be skipped in CI — run the suite with -c 2+";
+        }
         GTEST_SKIP() << "requires >= 2 shards to place healthy series off the failing shard";
     }
 
@@ -131,7 +140,7 @@ TEST_F(HttpWriteHandlerAtomicityBehavioralTest, ShardFailureAccountingIsConsiste
         auto testCfg = savedCfg;
         testCfg.storage.wal_size_threshold = 16 * 1024 * 1024;
         timestar::setGlobalConfig(testCfg);
-        auto restoreCfg = seastar::defer([&] { timestar::setGlobalConfig(savedCfg); });
+        auto restoreCfg = seastar::defer([&] noexcept { timestar::setGlobalConfig(savedCfg); });
 
         ScopedShardedEngine eng;
         eng.start();
@@ -213,7 +222,7 @@ TEST_F(HttpWriteHandlerAtomicityBehavioralTest, ShardFailureAccountingIsConsiste
         // The oversized series must not have been persisted anywhere.
         std::map<std::string, std::string> tags{{"host", "h1"}};
         std::string bigKey = timestar::buildSeriesKey("atomic_big", tags, "payload");
-        for (unsigned s = 0; s < seastar::smp::count; ++s) {
+        for (unsigned s = 0; s < timestar::shardCount(); ++s) {
             auto resultOpt =
                 eng.eng.invoke_on(s, [bigKey](Engine& engine) { return engine.query(bigKey, 0, UINT64_MAX); }).get();
             if (resultOpt.has_value()) {
@@ -249,7 +258,7 @@ TEST_F(HttpWriteHandlerAtomicityBehavioralTest, InvalidBatchEntryYieldsPartialAn
         auto testCfg = savedCfg;
         testCfg.storage.wal_size_threshold = 16 * 1024 * 1024;
         timestar::setGlobalConfig(testCfg);
-        auto restoreCfg = seastar::defer([&] { timestar::setGlobalConfig(savedCfg); });
+        auto restoreCfg = seastar::defer([&] noexcept { timestar::setGlobalConfig(savedCfg); });
 
         ScopedShardedEngine eng;
         eng.start();
@@ -299,7 +308,7 @@ TEST_F(HttpWriteHandlerAtomicityBehavioralTest, LateWritesKeyBatchIsFullyProcess
         auto testCfg = savedCfg;
         testCfg.storage.wal_size_threshold = 16 * 1024 * 1024;
         timestar::setGlobalConfig(testCfg);
-        auto restoreCfg = seastar::defer([&] { timestar::setGlobalConfig(savedCfg); });
+        auto restoreCfg = seastar::defer([&] noexcept { timestar::setGlobalConfig(savedCfg); });
 
         ScopedShardedEngine eng;
         eng.start();

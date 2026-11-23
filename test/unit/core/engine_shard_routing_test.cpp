@@ -32,6 +32,8 @@
 #include "../../../lib/query/shard_query.hpp"
 #include "../../../lib/utils/series_key.hpp"
 #include "../../test_helpers.hpp"
+#include "request_body.hpp"
+#include "shard_count.hpp"
 
 #include <gtest/gtest.h>
 
@@ -49,7 +51,7 @@
 // Multi-shard tests skip on developer boxes with a forced single shard, but
 // must never skip silently in CI (see engine_metadata_test.cpp).
 #define REQUIRE_MULTI_SHARD()                                                               \
-    if (seastar::smp::count < 2) {                                                          \
+    if (timestar::shardCount() < 2) {                                                       \
         if (std::getenv("CI")) {                                                            \
             FAIL() << "Multi-shard test would be skipped in CI — run the suite with -c 2+"; \
         }                                                                                   \
@@ -138,7 +140,7 @@ TEST_F(EngineShardRoutingTest, CanonicalRoutingPlacesDataAndMetadataOnOwningShar
         insertOnOwningShard(eng.eng, measurement, tags, field);
 
         // Data on the owning shard, nowhere else.
-        for (unsigned s = 0; s < seastar::smp::count; ++s) {
+        for (unsigned s = 0; s < timestar::shardCount(); ++s) {
             size_t points = pointsOnShard(eng.eng, s, seriesKey);
             if (s == shard) {
                 EXPECT_EQ(points, 3u) << "Data must live on the canonically routed shard " << shard;
@@ -149,7 +151,7 @@ TEST_F(EngineShardRoutingTest, CanonicalRoutingPlacesDataAndMetadataOnOwningShar
 
         // Index metadata co-located with the data: only the owning shard's
         // local index resolves the series.
-        for (unsigned s = 0; s < seastar::smp::count; ++s) {
+        for (unsigned s = 0; s < timestar::shardCount(); ++s) {
             auto idOpt = eng.eng
                              .invoke_on(s,
                                         [measurement, tags, field](Engine& engine) {
@@ -203,7 +205,7 @@ TEST_F(EngineShardRoutingTest, ExecuteLocalQueryUsesLocalIndexOnly) {
         EXPECT_EQ(owningResults[0].fields.at(field).first.size(), 3u);
 
         // Every other shard: local index has no such series -> empty result.
-        const unsigned other = (shard + 1) % seastar::smp::count;
+        const unsigned other = (shard + 1) % timestar::shardCount();
         auto otherResults = runLocalQuery(other);
         EXPECT_TRUE(otherResults.empty())
             << "executeLocalQuery on a non-owning shard must not see the series (its local index is authoritative)";
@@ -228,7 +230,7 @@ TEST_F(EngineShardRoutingTest, DeleteByPatternUsesLocalIndexOnly) {
         const std::string field = "value";
         const std::string seriesKey = timestar::buildSeriesKey(measurement, tags, field);
         const unsigned shard = owningShard(measurement, tags, field);
-        const unsigned other = (shard + 1) % seastar::smp::count;
+        const unsigned other = (shard + 1) % timestar::shardCount();
 
         insertOnOwningShard(eng.eng, measurement, tags, field);
 
@@ -274,7 +276,7 @@ TEST_F(EngineShardRoutingTest, HttpWriteHandlerRoutesByCanonicalSeriesKey) {
 
         auto req = std::make_unique<seastar::http::request>();
         req->_headers["Content-Type"] = "application/json";
-        req->content = R"({
+        timestar::http::injectedBody(*req) = R"({
             "measurement": "route_http",
             "tags": {"host": "h9", "dc": "west"},
             "fields": {"value": 42.5},
@@ -288,7 +290,7 @@ TEST_F(EngineShardRoutingTest, HttpWriteHandlerRoutesByCanonicalSeriesKey) {
         const std::string seriesKey = timestar::buildSeriesKey("route_http", tags, "value");
         const unsigned expectedShard = timestar::routeToCore(SeriesId128::fromSeriesKey(seriesKey));
 
-        for (unsigned s = 0; s < seastar::smp::count; ++s) {
+        for (unsigned s = 0; s < timestar::shardCount(); ++s) {
             size_t points = pointsOnShard(eng.eng, s, seriesKey);
             if (s == expectedShard) {
                 EXPECT_EQ(points, 1u) << "HTTP write handler must route data to the canonical shard " << expectedShard

@@ -475,7 +475,7 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
         }
     }
     // Release the reservation however this coroutine exits.
-    auto releaseCoalesceBudget = seastar::defer([this, &coalesceUnderfullBlocks, coalesceBudgetKiB] {
+    auto releaseCoalesceBudget = seastar::defer([this, &coalesceUnderfullBlocks, coalesceBudgetKiB] noexcept {
         if (coalesceUnderfullBlocks) {
             coalesceBudget_.signal(coalesceBudgetKiB);
         }
@@ -700,7 +700,7 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
                 bulkReserved = true;
             }
         }
-        auto releaseBulkReserve = seastar::defer([this, &bulkReserved, &bulkReserveKiB] {
+        auto releaseBulkReserve = seastar::defer([this, &bulkReserved, &bulkReserveKiB] noexcept {
             if (bulkReserved) {
                 mergeDecodeBudget_.signal(bulkReserveKiB);
             }
@@ -1421,7 +1421,7 @@ seastar::future<CompactionStats> TSMCompactor::executeCompaction(CompactionPlan 
     // Captures targetPath by value rather than `&plan`. Safe either way now
     // that the frame owns the plan, but the guard runs after every suspension
     // point in this coroutine, so it should not depend on that subtlety.
-    auto removeActive = seastar::defer([this, targetPath = plan.targetPath] {
+    auto removeActive = seastar::defer([this, targetPath = plan.targetPath] noexcept {
         std::erase_if(activeCompactions, [&](const ActiveCompaction& a) { return a.plan.targetPath == targetPath; });
     });
 

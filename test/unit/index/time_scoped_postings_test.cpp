@@ -146,6 +146,35 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, SingleDayInsertAndQuery) {
     co_await index.close();
 }
 
+SEASTAR_TEST_F(TimeScopedPostingsTest, SharedTimestampDaysPreserveGapsAfterReopen) {
+    const auto day = ke::NS_PER_DAY;
+    {
+        NativeIndex index(0);
+        co_await index.open();
+        auto batch = std::make_shared<const SharedTimestampBatch>(
+            std::make_shared<const std::vector<uint64_t>>(
+                std::vector<uint64_t>{20002 * day, 20000 * day, 20002 * day}));
+        for (const std::string field : {"a", "b"}) {
+            TimeStarInsert<double> insert("shared_days", field);
+            insert.setSharedTimestamps(batch);
+            insert.values = {1, 2, 3};
+            co_await index.indexInsert(insert);
+        }
+        co_await index.sync();
+        co_await index.close();
+    }
+    NativeIndex reopened(0);
+    co_await reopened.open();
+    for (uint64_t d : {20000, 20001, 20002}) {
+        auto found = co_await reopened.findSeriesWithMetadataTimeScoped("shared_days", {}, {}, d * day,
+                                                                       (d + 1) * day - 1);
+        EXPECT_TRUE(found.has_value());
+        if (found.has_value())
+            EXPECT_EQ(found->size(), d == 20001 ? 0u : 2u);
+    }
+    co_await reopened.close();
+}
+
 // ── Multi-Day Insert — Narrow Range Returns Only Active ──
 
 SEASTAR_TEST_F(TimeScopedPostingsTest, MultiDayNarrowQuery) {

@@ -7,10 +7,84 @@
 
 #include <cmath>
 #include <limits>
+#include <map>
 #include <random>
 #include <vector>
 
 using namespace timestar;
+
+TEST(BlockAggregatorBucketRuns, DenseSparseAndBoundaryRunsMatchScalarRouting) {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const uint64_t maxTime = std::numeric_limits<uint64_t>::max();
+    for (uint64_t interval : {1ULL, 3ULL, 8ULL, 9ULL, 16ULL, 32ULL, 300ULL, 4096ULL}) {
+        for (uint64_t base : {uint64_t{0}, maxTime - 20000}) {
+            std::vector<uint64_t> ts;
+            std::vector<double> values;
+            for (size_t i = 0; i < 10003; ++i) {
+                // Includes duplicate timestamps, gaps and a nonzero subrange.
+                ts.push_back(base + i / 2 + i / 3);
+                values.push_back(i % 23 == 0 ? nan : static_cast<double>(i % 37) - 18);
+            }
+            ts.back() = base == 0 ? ts.back() : maxTime;
+            for (bool timestampsOnly : {false, true}) {
+                BlockAggregator agg(interval);
+                std::map<uint64_t, AggregationState> expected;
+                const size_t begin = timestampsOnly ? 0 : 7;
+                const size_t end = timestampsOnly ? ts.size() : ts.size() - 2;
+                for (size_t i = begin; i < end; ++i) {
+                    auto& state = expected[(ts[i] / interval) * interval];
+                    if (timestampsOnly)
+                        ++state.count;
+                    else
+                        state.addValue(values[i], ts[i]);
+                }
+                if (timestampsOnly)
+                    agg.addTimestampsOnly(ts);
+                else
+                    agg.addPointsRange(ts, values, begin, end);
+                auto actual = agg.takeBucketStates();
+                ASSERT_EQ(actual.size(), expected.size()) << interval << ':' << base;
+                EXPECT_EQ(agg.pointCount(), end - begin);
+                for (const auto& [key, state] : expected) {
+                    ASSERT_TRUE(actual.contains(key));
+                    const auto& got = actual.at(key);
+                    EXPECT_EQ(got.count, state.count);
+                    if (!timestampsOnly) {
+                        EXPECT_DOUBLE_EQ(got.sum, state.sum);
+                        EXPECT_DOUBLE_EQ(got.mean, state.mean);
+                        EXPECT_DOUBLE_EQ(got.m2, state.m2);
+                        EXPECT_EQ(got.firstTimestamp, state.firstTimestamp);
+                        EXPECT_EQ(got.latestTimestamp, state.latestTimestamp);
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST(BlockAggregatorBucketRuns, FinalUint64BucketKeepsSimdBatchBoundaries) {
+    const uint64_t maxTime = std::numeric_limits<uint64_t>::max();
+    const std::vector<uint64_t> ts{maxTime - 15, maxTime - 8, maxTime - 7, maxTime - 6, maxTime - 5,
+                                   maxTime - 4,  maxTime - 3, maxTime - 2, maxTime - 1, maxTime};
+    const std::vector<double> values(ts.size(), 2.5);
+    for (auto method : {AggregationMethod::AVG, AggregationMethod::COUNT, AggregationMethod::STDDEV,
+                        AggregationMethod::FIRST, AggregationMethod::LATEST}) {
+        BlockAggregator agg(10, method);
+        agg.addPoints(ts, values);
+        auto buckets = agg.takeBucketStates();
+        size_t total = 0;
+        for (auto& [key, state] : buckets) {
+            const size_t expected =
+                std::count_if(ts.begin(), ts.end(), [key](uint64_t t) { return (t / 10) * 10 == key; });
+            EXPECT_EQ(state.count, expected);
+            EXPECT_DOUBLE_EQ(state.getValue(method), method == AggregationMethod::COUNT    ? expected
+                                                     : method == AggregationMethod::STDDEV ? 0.0
+                                                                                           : 2.5);
+            total += state.count;
+        }
+        EXPECT_EQ(total, ts.size());
+    }
+}
 
 // ============================================================================
 // addBlockStats — SIMD fold path for pre-computed block statistics

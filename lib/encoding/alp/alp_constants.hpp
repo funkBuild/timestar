@@ -15,6 +15,12 @@ static constexpr size_t ALP_VECTOR_SIZE = 1024;
 // Maximum exception rate before falling back to ALP_RD
 static constexpr double ALP_RD_EXCEPTION_THRESHOLD = 0.50;
 
+// An ALP first block wider than this many bits per value is compared against
+// ALP_RD and the smaller encoding wins. Decimal data ALP is good at sits far
+// below it (1-4 bytes per value); it is only reached when the "integers" ALP
+// found are nearly as wide as the doubles themselves.
+static constexpr size_t ALP_SUSPECT_BITS_PER_VALUE = 48;
+
 // Sample size for (exp, fac) pair selection
 static constexpr size_t ALP_SAMPLE_SIZE = 256;
 

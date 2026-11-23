@@ -55,7 +55,7 @@ seastar::future<size_t> pointsOnDisk(unsigned int walSeq, const SeriesId128& ser
     WALReader reader(WAL::sequenceNumberToFilename(walSeq));
     co_await reader.readAll(store.get());
     auto* result = store->querySeries<double>(seriesId);
-    co_return result ? result->timestamps.size() : 0;
+    co_return result ? result->timestamps().size() : 0;
 }
 
 }  // namespace
@@ -134,7 +134,7 @@ SEASTAR_TEST_F(WALGroupCommitTest, AlwaysModeConcurrentWritersAllDurable) {
             ADD_FAILURE() << "writer " << w << " acked but not on disk";
             continue;
         }
-        EXPECT_EQ(res->timestamps.size(), kPointsEach) << "writer " << w;
+        EXPECT_EQ(res->timestamps().size(), kPointsEach) << "writer " << w;
     }
 
     co_await wal.close();

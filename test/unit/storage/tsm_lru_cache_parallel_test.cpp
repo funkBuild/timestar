@@ -46,6 +46,7 @@
 #include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/loop.hh>
+#include <seastar/core/reactor.hh>
 #include <seastar/core/when_all.hh>
 #include <string>
 #include <vector>
@@ -138,6 +139,26 @@ seastar::future<> testParallelGetFullIndexEntryManyDistinctSeries(std::string pa
 
 TEST_F(TSMLRUCacheParallelTest, ParallelGetFullIndexEntryManyDistinctSeries) {
     testParallelGetFullIndexEntryManyDistinctSeries(getTestFilePath("0_10.tsm")).get();
+}
+
+TEST_F(TSMLRUCacheParallelTest, RangePrefetchSkipsIOAndIncludesExactBoundary) {
+    const auto path = getTestFilePath("0_91.tsm");
+    auto ids = writeTSMWithManySeries(path, 32);
+    TSM tsm(path);
+    tsm.open().get();
+    const auto before = seastar::engine().get_io_stats().aio_read_bytes;
+    tsm.prefetchFullIndexEntries(ids, 0, 999).get();
+    EXPECT_EQ(seastar::engine().get_io_stats().aio_read_bytes, before);
+
+    // The first series starts exactly at the inclusive query end.
+    tsm.prefetchFullIndexEntries(ids, 0, 1000).get();
+    const auto included = seastar::engine().get_io_stats().aio_read_bytes;
+    EXPECT_GT(included, before);
+    auto* entry = tsm.getFullIndexEntry(ids.front()).get();
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(entry->indexBlocks.front().minTime, 1000u);
+    EXPECT_EQ(seastar::engine().get_io_stats().aio_read_bytes, included);
+    tsm.close().get();
 }
 
 // ---------------------------------------------------------------------------

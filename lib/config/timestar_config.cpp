@@ -344,7 +344,11 @@ std::string dumpDefaultConfig() {
     out += "# task_quota_ms = 0.5\n";
     out += "# overprovisioned = false\n";
     out += "# thread_affinity = true\n";
-    out += "# reactor_backend = \"linux-aio\"\n";
+    out += "# reactor_backend: io_uring | linux-aio | epoll. Seastar picks io_uring when the\n";
+    out += "# kernel permits it (Docker's default seccomp profile does not) and falls back to\n";
+    out += "# linux-aio. io_uring sleeps while disk I/O is in flight; linux-aio busy-polls, so\n";
+    out += "# an I/O-bound server shows every shard at 100% CPU under it.\n";
+    out += "# reactor_backend = \"io_uring\"\n";
     out += "# blocked_reactor_notify_ms = 25\n";
     out += "# max_networking_io_control_blocks = 10000\n";
     out += "# unsafe_bypass_fsync = false\n";
@@ -468,6 +472,7 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     envU64("TIMESTAR_HTTP_MAX_TOTAL_POINTS", cfg.http.max_total_points);
     envU32("TIMESTAR_HTTP_QUERY_TIMEOUT_SECONDS", cfg.http.query_timeout_seconds);
     envU32("TIMESTAR_HTTP_SLOW_QUERY_THRESHOLD_MS", cfg.http.slow_query_threshold_ms);
+    envU64("TIMESTAR_HTTP_STREAM_RESPONSE_MIN_POINTS", cfg.http.stream_response_min_points);
 
     // Index
     envU32("TIMESTAR_INDEX_BLOOM_FILTER_BITS", cfg.index.bloom_filter_bits);

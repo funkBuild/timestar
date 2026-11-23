@@ -109,7 +109,7 @@ SEASTAR_TEST_F(DayBitmapRecoveryTest, DisabledRepairCannotSealIncompleteDayBitma
         co_await engine.stop();
     }
     const auto previous = timestar::config();
-    auto restore = seastar::defer([&previous] { timestar::setGlobalConfig(previous); });
+    auto restore = seastar::defer([&previous] noexcept { timestar::setGlobalConfig(previous); });
     auto disabled = previous;
     disabled.index.day_bitmap_rebuild_window_days = 0;
     timestar::setGlobalConfig(disabled);

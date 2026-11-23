@@ -12,6 +12,7 @@
 // Pattern follows HttpHandlerIntegrationTest in http_handler_integration_test.cpp.
 
 #include "proto_converters.hpp"
+
 #include "timestar.pb.h"
 
 // For encoding compressed (Approach B) write requests and decoding
@@ -24,10 +25,10 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <map>
-#include <chrono>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/sleep.hh>
@@ -51,6 +52,7 @@
 #include "../../../lib/http/http_metadata_handler.hpp"
 #include "../../../lib/http/http_query_handler.hpp"
 #include "../../../lib/http/http_write_handler.hpp"
+#include "request_body.hpp"
 
 using namespace timestar;
 namespace fs = std::filesystem;
@@ -85,10 +87,10 @@ static std::string buildProtoWriteRequest(const std::string& measurement,
 }
 
 static std::string buildProtoBatchWriteRequest(
-    const std::vector<std::tuple<std::string,                               // measurement
-                                 std::map<std::string, std::string>,        // tags
-                                 std::map<std::string, std::vector<double>>,// double fields
-                                 std::vector<uint64_t>                      // timestamps
+    const std::vector<std::tuple<std::string,                                 // measurement
+                                 std::map<std::string, std::string>,          // tags
+                                 std::map<std::string, std::vector<double>>,  // double fields
+                                 std::vector<uint64_t>                        // timestamps
                                  >>& points) {
     ::timestar_pb::WriteRequest req;
     for (auto& [meas, tags, fields, timestamps] : points) {
@@ -113,8 +115,7 @@ static std::string buildProtoBatchWriteRequest(
     return bytes;
 }
 
-static std::string buildProtoQueryRequest(const std::string& query,
-                                          uint64_t startTime, uint64_t endTime,
+static std::string buildProtoQueryRequest(const std::string& query, uint64_t startTime, uint64_t endTime,
                                           const std::string& aggregationInterval = "") {
     ::timestar_pb::QueryRequest req;
     req.set_query(query);
@@ -130,8 +131,7 @@ static std::string buildProtoQueryRequest(const std::string& query,
 
 static std::string buildProtoDeleteRequest(const std::string& measurement,
                                            const std::map<std::string, std::string>& tags = {},
-                                           const std::string& field = "",
-                                           uint64_t startTime = 0,
+                                           const std::string& field = "", uint64_t startTime = 0,
                                            uint64_t endTime = UINT64_MAX) {
     ::timestar_pb::DeleteRequest req;
     req.set_measurement(measurement);
@@ -197,8 +197,7 @@ static std::vector<uint64_t> decodeFforTimestamps(const std::string& compressed)
 // the compressed_* fields (Approach B) — the repeated fields stay empty.
 static std::string buildCompressedProtoWriteRequest(const std::string& measurement,
                                                     const std::map<std::string, std::string>& tags,
-                                                    const std::string& fieldName,
-                                                    const std::vector<double>& values,
+                                                    const std::string& fieldName, const std::vector<double>& values,
                                                     const std::vector<uint64_t>& timestamps) {
     ::timestar_pb::WriteRequest req;
     auto* wp = req.add_writes();
@@ -261,7 +260,7 @@ protected:
 
     static std::unique_ptr<seastar::http::request> makeProtoWriteRequest(const std::string& protoBytes) {
         auto req = std::make_unique<seastar::http::request>();
-        req->content = protoBytes;
+        timestar::http::injectedBody(*req) = protoBytes;
         req->_headers["Content-Type"] = "application/x-protobuf";
         req->_headers["Accept"] = "application/x-protobuf";
         return req;
@@ -269,7 +268,7 @@ protected:
 
     static std::unique_ptr<seastar::http::request> makeProtoQueryRequest(const std::string& protoBytes) {
         auto req = std::make_unique<seastar::http::request>();
-        req->content = protoBytes;
+        timestar::http::injectedBody(*req) = protoBytes;
         req->_headers["Content-Type"] = "application/x-protobuf";
         req->_headers["Accept"] = "application/x-protobuf";
         return req;
@@ -277,7 +276,7 @@ protected:
 
     static std::unique_ptr<seastar::http::request> makeProtoDeleteRequest(const std::string& protoBytes) {
         auto req = std::make_unique<seastar::http::request>();
-        req->content = protoBytes;
+        timestar::http::injectedBody(*req) = protoBytes;
         req->_headers["Content-Type"] = "application/x-protobuf";
         req->_headers["Accept"] = "application/x-protobuf";
         return req;
@@ -286,7 +285,7 @@ protected:
     // Write with protobuf body but request JSON response
     static std::unique_ptr<seastar::http::request> makeProtoWriteJsonResponseRequest(const std::string& protoBytes) {
         auto req = std::make_unique<seastar::http::request>();
-        req->content = protoBytes;
+        timestar::http::injectedBody(*req) = protoBytes;
         req->_headers["Content-Type"] = "application/x-protobuf";
         req->_headers["Accept"] = "application/json";
         return req;
@@ -295,7 +294,7 @@ protected:
     // Write with JSON body but request protobuf response
     static std::unique_ptr<seastar::http::request> makeJsonWriteRequest(const std::string& jsonBody) {
         auto req = std::make_unique<seastar::http::request>();
-        req->content = jsonBody;
+        timestar::http::injectedBody(*req) = jsonBody;
         req->_headers["Content-Type"] = "application/json";
         return req;
     }
@@ -303,7 +302,7 @@ protected:
     // Query with JSON body but request protobuf response
     static std::unique_ptr<seastar::http::request> makeJsonQueryProtoResponse(const std::string& jsonBody) {
         auto req = std::make_unique<seastar::http::request>();
-        req->content = jsonBody;
+        timestar::http::injectedBody(*req) = jsonBody;
         req->_headers["Content-Type"] = "application/json";
         req->_headers["Accept"] = "application/x-protobuf";
         return req;
@@ -311,14 +310,14 @@ protected:
 
     // Metadata request with Accept: protobuf
     static std::unique_ptr<seastar::http::request> makeMetadataRequestProto(const std::string& measurement = "",
-                                                                             const std::string& tag = "") {
+                                                                            const std::string& tag = "") {
         auto req = std::make_unique<seastar::http::request>();
         req->_headers["Accept"] = "application/x-protobuf";
         if (!measurement.empty()) {
-            req->query_parameters["measurement"] = measurement;
+            req->set_query_param("measurement", measurement);
         }
         if (!tag.empty()) {
-            req->query_parameters["tag"] = tag;
+            req->set_query_param("tag", tag);
         }
         return req;
     }
@@ -357,11 +356,8 @@ TEST_F(ProtobufIntegrationTest, WriteSinglePointProto) {
 
         HttpWriteHandler handler(&eng.eng);
 
-        auto protoBytes = buildProtoWriteRequest(
-            "pb_single_temp",
-            {{"location", "us-west"}},
-            {{"value", {72.5}}},
-            {1000000000ULL});
+        auto protoBytes =
+            buildProtoWriteRequest("pb_single_temp", {{"location", "us-west"}}, {{"value", {72.5}}}, {1000000000ULL});
 
         auto req = makeProtoWriteRequest(protoBytes);
         auto rep = handler.handleWrite(std::move(req)).get();
@@ -410,11 +406,8 @@ TEST_F(ProtobufIntegrationTest, WriteArrayValuesProto) {
 
         HttpWriteHandler handler(&eng.eng);
 
-        auto protoBytes = buildProtoWriteRequest(
-            "pb_array_sensor",
-            {{"zone", "a"}},
-            {{"temp", {20.0, 21.0, 22.0}}},
-            {1000000000ULL, 2000000000ULL, 3000000000ULL});
+        auto protoBytes = buildProtoWriteRequest("pb_array_sensor", {{"zone", "a"}}, {{"temp", {20.0, 21.0, 22.0}}},
+                                                 {1000000000ULL, 2000000000ULL, 3000000000ULL});
 
         auto req = makeProtoWriteRequest(protoBytes);
         auto rep = handler.handleWrite(std::move(req)).get();
@@ -477,11 +470,8 @@ TEST_F(ProtobufIntegrationTest, WriteProtoQueryProtoRoundTrip) {
         HttpQueryHandler queryHandler(&eng.eng);
 
         // Write via protobuf
-        auto writeBytes = buildProtoWriteRequest(
-            "pb_rt_temp",
-            {{"location", "us-west"}},
-            {{"value", {72.5}}},
-            {1000000000ULL});
+        auto writeBytes =
+            buildProtoWriteRequest("pb_rt_temp", {{"location", "us-west"}}, {{"value", {72.5}}}, {1000000000ULL});
 
         auto writeReq = makeProtoWriteRequest(writeBytes);
         auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
@@ -490,8 +480,7 @@ TEST_F(ProtobufIntegrationTest, WriteProtoQueryProtoRoundTrip) {
         EXPECT_EQ(writeResp.status(), "success");
 
         // Query via protobuf
-        auto queryBytes = buildProtoQueryRequest(
-            "avg:pb_rt_temp(value){location:us-west}", 0, 2000000000ULL);
+        auto queryBytes = buildProtoQueryRequest("avg:pb_rt_temp(value){location:us-west}", 0, 2000000000ULL);
 
         auto queryReq = makeProtoQueryRequest(queryBytes);
         auto queryRep = queryHandler.handleQuery(std::move(queryReq)).get();
@@ -571,9 +560,7 @@ TEST_F(ProtobufIntegrationTest, WriteProtoQueryWithTimeFilter) {
 
         // Write 5 data points via protobuf
         auto writeBytes = buildProtoWriteRequest(
-            "pb_timefilter_metric",
-            {{"host", "h1"}},
-            {{"value", {10.0, 20.0, 30.0, 40.0, 50.0}}},
+            "pb_timefilter_metric", {{"host", "h1"}}, {{"value", {10.0, 20.0, 30.0, 40.0, 50.0}}},
             {1000000000ULL, 2000000000ULL, 3000000000ULL, 4000000000ULL, 5000000000ULL});
 
         auto writeReq = makeProtoWriteRequest(writeBytes);
@@ -581,8 +568,8 @@ TEST_F(ProtobufIntegrationTest, WriteProtoQueryWithTimeFilter) {
         ASSERT_TRUE(isOk(*writeRep));
 
         // Query only middle range via protobuf
-        auto queryBytes = buildProtoQueryRequest(
-            "avg:pb_timefilter_metric(value){host:h1}", 2000000000ULL, 4000000000ULL);
+        auto queryBytes =
+            buildProtoQueryRequest("avg:pb_timefilter_metric(value){host:h1}", 2000000000ULL, 4000000000ULL);
         auto queryReq = makeProtoQueryRequest(queryBytes);
         auto queryRep = queryHandler.handleQuery(std::move(queryReq)).get();
         ASSERT_TRUE(isOk(*queryRep));
@@ -604,9 +591,7 @@ TEST_F(ProtobufIntegrationTest, WriteProtoQueryWithAggregationInterval) {
         HttpQueryHandler queryHandler(&eng.eng);
 
         auto writeBytes = buildProtoWriteRequest(
-            "pb_aggint_metric",
-            {{"host", "h1"}},
-            {{"value", {10.0, 15.0, 20.0, 25.0, 30.0, 35.0}}},
+            "pb_aggint_metric", {{"host", "h1"}}, {{"value", {10.0, 15.0, 20.0, 25.0, 30.0, 35.0}}},
             {1000000000ULL, 1500000000ULL, 2000000000ULL, 2500000000ULL, 3000000000ULL, 3500000000ULL});
 
         auto writeReq = makeProtoWriteRequest(writeBytes);
@@ -614,8 +599,7 @@ TEST_F(ProtobufIntegrationTest, WriteProtoQueryWithAggregationInterval) {
         ASSERT_TRUE(isOk(*writeRep));
 
         // Query with 2-second aggregation interval via protobuf
-        auto queryBytes = buildProtoQueryRequest(
-            "avg:pb_aggint_metric(value){host:h1}", 0, 4000000000ULL, "2s");
+        auto queryBytes = buildProtoQueryRequest("avg:pb_aggint_metric(value){host:h1}", 0, 4000000000ULL, "2s");
         auto queryReq = makeProtoQueryRequest(queryBytes);
         auto queryRep = queryHandler.handleQuery(std::move(queryReq)).get();
         ASSERT_TRUE(isOk(*queryRep));
@@ -636,11 +620,9 @@ TEST_F(ProtobufIntegrationTest, QueryMaxAggregationProto) {
         HttpWriteHandler writeHandler(&eng.eng);
         HttpQueryHandler queryHandler(&eng.eng);
 
-        auto writeBytes = buildProtoWriteRequest(
-            "pb_sensor_max",
-            {{"zone", "a"}},
-            {{"temp", {10.0, 25.0, 15.0, 30.0, 20.0}}},
-            {1000000000ULL, 2000000000ULL, 3000000000ULL, 4000000000ULL, 5000000000ULL});
+        auto writeBytes =
+            buildProtoWriteRequest("pb_sensor_max", {{"zone", "a"}}, {{"temp", {10.0, 25.0, 15.0, 30.0, 20.0}}},
+                                   {1000000000ULL, 2000000000ULL, 3000000000ULL, 4000000000ULL, 5000000000ULL});
 
         auto writeReq = makeProtoWriteRequest(writeBytes);
         auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
@@ -683,7 +665,7 @@ TEST_F(ProtobufIntegrationTest, WriteJsonQueryProtobuf) {
 
         // Write via JSON
         auto jsonReq = std::make_unique<seastar::http::request>();
-        jsonReq->content = R"({
+        timestar::http::injectedBody(*jsonReq) = R"({
             "measurement": "pb_cross_json2pb",
             "tags": {"location": "us-west"},
             "fields": {"value": 88.5},
@@ -695,8 +677,7 @@ TEST_F(ProtobufIntegrationTest, WriteJsonQueryProtobuf) {
         ASSERT_TRUE(isOk(*writeRep));
 
         // Query via protobuf request + protobuf response
-        auto queryBytes = buildProtoQueryRequest(
-            "avg:pb_cross_json2pb(value){location:us-west}", 0, 2000000000ULL);
+        auto queryBytes = buildProtoQueryRequest("avg:pb_cross_json2pb(value){location:us-west}", 0, 2000000000ULL);
         auto queryReq = makeProtoQueryRequest(queryBytes);
         auto queryRep = queryHandler.handleQuery(std::move(queryReq)).get();
         ASSERT_TRUE(isOk(*queryRep));
@@ -722,11 +703,8 @@ TEST_F(ProtobufIntegrationTest, WriteProtobufQueryJson) {
         HttpQueryHandler queryHandler(&eng.eng);
 
         // Write via protobuf
-        auto writeBytes = buildProtoWriteRequest(
-            "pb_cross_pb2json",
-            {{"host", "h1"}},
-            {{"cpu", {55.5}}},
-            {1000000000ULL});
+        auto writeBytes =
+            buildProtoWriteRequest("pb_cross_pb2json", {{"host", "h1"}}, {{"cpu", {55.5}}}, {1000000000ULL});
 
         auto writeReq = makeProtoWriteRequest(writeBytes);
         auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
@@ -735,7 +713,8 @@ TEST_F(ProtobufIntegrationTest, WriteProtobufQueryJson) {
         // Query via JSON request + JSON response
         auto queryReq = std::make_unique<seastar::http::request>();
         queryReq->_headers["Content-Type"] = "application/json";
-        queryReq->content = R"({"query":"avg:pb_cross_pb2json(cpu){host:h1}","startTime":0,"endTime":2000000000})";
+        timestar::http::injectedBody(*queryReq) =
+            R"({"query":"avg:pb_cross_pb2json(cpu){host:h1}","startTime":0,"endTime":2000000000})";
 
         auto queryRep = queryHandler.handleQuery(std::move(queryReq)).get();
         ASSERT_TRUE(isOk(*queryRep));
@@ -762,11 +741,8 @@ TEST_F(ProtobufIntegrationTest, WriteProtobufWithJsonAcceptResponse) {
         HttpWriteHandler handler(&eng.eng);
 
         // Write via protobuf body but request JSON response
-        auto writeBytes = buildProtoWriteRequest(
-            "pb_json_accept",
-            {{"zone", "b"}},
-            {{"temp", {99.0}}},
-            {1000000000ULL});
+        auto writeBytes =
+            buildProtoWriteRequest("pb_json_accept", {{"zone", "b"}}, {{"temp", {99.0}}}, {1000000000ULL});
 
         auto req = makeProtoWriteJsonResponseRequest(writeBytes);
         auto rep = handler.handleWrite(std::move(req)).get();
@@ -793,7 +769,7 @@ TEST_F(ProtobufIntegrationTest, JsonBodyWithProtobufAcceptResponse) {
 
         // Write via JSON
         auto jsonReq = std::make_unique<seastar::http::request>();
-        jsonReq->content = R"({
+        timestar::http::injectedBody(*jsonReq) = R"({
             "measurement": "pb_json_accept_resp",
             "tags": {"host": "h1"},
             "fields": {"value": 42.0},
@@ -877,11 +853,8 @@ TEST_F(ProtobufIntegrationTest, WriteProtoThenDeleteProto) {
         HttpQueryHandler queryHandler(&eng.eng);
 
         // Write data via protobuf
-        auto writeBytes = buildProtoWriteRequest(
-            "pb_delete_test",
-            {{"host", "h1"}},
-            {{"value", {10.0, 20.0, 30.0}}},
-            {1000000000ULL, 2000000000ULL, 3000000000ULL});
+        auto writeBytes = buildProtoWriteRequest("pb_delete_test", {{"host", "h1"}}, {{"value", {10.0, 20.0, 30.0}}},
+                                                 {1000000000ULL, 2000000000ULL, 3000000000ULL});
 
         auto writeReq = makeProtoWriteRequest(writeBytes);
         auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
@@ -899,8 +872,7 @@ TEST_F(ProtobufIntegrationTest, WriteProtoThenDeleteProto) {
         // Verify the query still works after deletion (tombstones applied).
         // Note: In-memory store with tombstones may still return data until
         // TSM rollover, so we only verify the query itself succeeds.
-        auto queryBytes = buildProtoQueryRequest(
-            "avg:pb_delete_test(value){host:h1}", 0, 4000000000ULL);
+        auto queryBytes = buildProtoQueryRequest("avg:pb_delete_test(value){host:h1}", 0, 4000000000ULL);
         auto queryReq = makeProtoQueryRequest(queryBytes);
         auto queryRep = queryHandler.handleQuery(std::move(queryReq)).get();
         ASSERT_TRUE(isOk(*queryRep));
@@ -1002,10 +974,8 @@ TEST_F(ProtobufIntegrationTest, FieldsWithProtobufAccept) {
 
         // Write data with multiple fields
         auto writeBytes = buildProtoWriteRequest(
-            "pb_meta_fields_system",
-            {{"host", "h1"}},
-            {{"cpu_usage", {55.0}}, {"memory_usage", {12.5}}, {"disk_usage", {80.0}}},
-            {1000000000ULL});
+            "pb_meta_fields_system", {{"host", "h1"}},
+            {{"cpu_usage", {55.0}}, {"memory_usage", {12.5}}, {"disk_usage", {80.0}}}, {1000000000ULL});
 
         auto writeReq = makeProtoWriteRequest(writeBytes);
         auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
@@ -1249,8 +1219,7 @@ TEST_F(ProtobufIntegrationTest, WriteCompressedTimestampsAndValuesQueryableRound
         const std::vector<uint64_t> ts = {1000000000ULL, 2000000000ULL, 3000000000ULL};
         const std::vector<double> values = {10.0, 20.0, 30.0};
 
-        auto writeBytes =
-            buildCompressedProtoWriteRequest("pb_compressed_rt", {{"host", "h1"}}, "value", values, ts);
+        auto writeBytes = buildCompressedProtoWriteRequest("pb_compressed_rt", {{"host", "h1"}}, "value", values, ts);
 
         auto writeReq = makeProtoWriteRequest(writeBytes);
         auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
@@ -1339,8 +1308,7 @@ TEST_F(ProtobufIntegrationTest, WriteCompressedTimestampsPlainValuesQueryable) {
 
         // Before the fix, the server generated wall-clock default timestamps,
         // so this historical window found nothing.
-        auto queryBytes =
-            buildProtoQueryRequest("avg:pb_compressed_ts_only(value){host:h1}", 0, 4000000000ULL);
+        auto queryBytes = buildProtoQueryRequest("avg:pb_compressed_ts_only(value){host:h1}", 0, 4000000000ULL);
         auto queryReq = makeProtoQueryRequest(queryBytes);
         auto queryRep = queryHandler.handleQuery(std::move(queryReq)).get();
         ASSERT_TRUE(isOk(*queryRep));
@@ -1488,8 +1456,8 @@ TEST_F(ProtobufIntegrationTest, WriteCompressedTimestamps2000AllStoredAndQueryab
         // Every point must be stored and queryable: 1s buckets over the full
         // window -> exactly one bucket per written point (2000 points).
         // Under the old truncation bug only 1052 buckets would come back.
-        auto queryBytes = buildProtoQueryRequest("avg:pb_ts2000(value){host:h1}", 0,
-                                                 base + kCount * 1000000000ULL, "1s");
+        auto queryBytes =
+            buildProtoQueryRequest("avg:pb_ts2000(value){host:h1}", 0, base + kCount * 1000000000ULL, "1s");
         auto queryReq = makeProtoQueryRequest(queryBytes);
         auto queryRep = queryHandler.handleQuery(std::move(queryReq)).get();
         ASSERT_TRUE(isOk(*queryRep));
@@ -1555,8 +1523,7 @@ TEST_F(ProtobufIntegrationTest, WriteCompressedTimestampsOverLimitCleanPerPointE
         EXPECT_EQ(writeResp.points_written(), 0);
         EXPECT_GE(writeResp.failed_writes(), 1);
         ASSERT_GE(writeResp.errors_size(), 1);
-        EXPECT_NE(writeResp.errors(0).find("max points per write point"), std::string::npos)
-            << writeResp.errors(0);
+        EXPECT_NE(writeResp.errors(0).find("max points per write point"), std::string::npos) << writeResp.errors(0);
 
         // Nothing may have been stored (no truncated prefix).
         auto queryBytes = buildProtoQueryRequest("count:pb_ts_overlimit(value){host:h1}", 0, UINT64_MAX / 2);
@@ -1630,9 +1597,9 @@ TEST_F(ProtobufIntegrationTest, BareStructuredProtoDeletePatternAllFields) {
         HttpDeleteHandler deleteHandler(&eng.eng);
         HttpQueryHandler queryHandler(&eng.eng);
 
-        auto writeBytes = buildProtoWriteRequest("pb_bare_del_pat", {{"host", "h1"}},
-                                                 {{"value", {1.0, 2.0}}, {"other", {3.0, 4.0}}},
-                                                 {1000000000ULL, 2000000000ULL});
+        auto writeBytes =
+            buildProtoWriteRequest("pb_bare_del_pat", {{"host", "h1"}}, {{"value", {1.0, 2.0}}, {"other", {3.0, 4.0}}},
+                                   {1000000000ULL, 2000000000ULL});
         auto writeReq = makeProtoWriteRequest(writeBytes);
         auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
         ASSERT_TRUE(isOk(*writeRep));
@@ -1724,8 +1691,8 @@ TEST_F(ProtobufIntegrationTest, SeriesKeyProtoDeleteStillWorks) {
         HttpWriteHandler writeHandler(&eng.eng);
         HttpDeleteHandler deleteHandler(&eng.eng);
 
-        auto writeBytes = buildProtoWriteRequest("pb_series_del", {{"host", "h1"}}, {{"value", {5.0}}},
-                                                 {1000000000ULL});
+        auto writeBytes =
+            buildProtoWriteRequest("pb_series_del", {{"host", "h1"}}, {{"value", {5.0}}}, {1000000000ULL});
         auto writeReq = makeProtoWriteRequest(writeBytes);
         auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
         ASSERT_TRUE(isOk(*writeRep));

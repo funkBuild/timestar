@@ -1,6 +1,6 @@
 const axios = require('axios');
 const PORT = process.env.TIMESTAR_PORT || 8086;
-const BASE_URL = `http://localhost:${PORT}`;
+const BASE_URL = `http://${process.env.TIMESTAR_HOST || 'localhost'}:${PORT}`;
 
 async function testWrite() {
   // Clear and write fresh data

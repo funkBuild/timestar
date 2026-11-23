@@ -1,4 +1,4 @@
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -7,8 +7,8 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
     ninja-build \
-    gcc-14 \
-    g++-14 \
+    gcc-15 \
+    g++-15 \
     libc-ares-dev \
     libfmt-dev \
     libleveldb-dev \

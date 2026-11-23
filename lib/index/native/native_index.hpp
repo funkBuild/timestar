@@ -13,6 +13,7 @@
 #include "manifest.hpp"
 #include "memtable.hpp"
 #include "merge_iterator.hpp"
+#include "shard_count.hpp"
 #include "sstable.hpp"
 #include "timestar_config.hpp"
 #include "timestar_value.hpp"
@@ -20,7 +21,7 @@
 
 #include <map>
 #include <memory>
-#include <roaring.hh>
+#include <roaring/roaring.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
@@ -414,7 +415,8 @@ private:
     // degenerate the two-generation cache to near-zero entries, where every
     // insert would swap generations and re-run the kvExists metadata probe.
     static size_t defaultMaxSeriesCacheSize() {
-        return std::max<size_t>(1024, timestar::config().index.series_cache_size / std::max(1u, seastar::smp::count));
+        return std::max<size_t>(1024,
+                                timestar::config().index.series_cache_size / std::max(1u, timestar::shardCount()));
     }
     static constexpr size_t EVICTION_BATCH_SIZE = 256;
     size_t maxSeriesCacheSize_ = defaultMaxSeriesCacheSize();

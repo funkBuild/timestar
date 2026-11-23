@@ -101,6 +101,7 @@ struct CompressionStats {
 
 class WAL {
 private:
+    struct TimestampEncodingCache;
     // WAL segment size limit — initialized from config in init()
     size_t maxWalSize_ = 16 * 1024 * 1024;  // default 16 MiB, overridden by config
     // Identity & file
@@ -202,7 +203,8 @@ private:
     // for pre-allocating sufficient capacity.  Non-static: updates
     // _compressionStats with observed compression ratios after encoding.
     template <class T>
-    void encodeInsertEntry(AlignedBuffer& buffer, TimeStarInsert<T>& insertRequest);
+    void encodeInsertEntry(AlignedBuffer& buffer, TimeStarInsert<T>& insertRequest,
+                           TimestampEncodingCache* timestampCache = nullptr);
 
 public:
     // Delete range operation

@@ -11,6 +11,7 @@
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/core/timestar_value.hpp"
 #include "../../test_helpers.hpp"
+#include "shard_count.hpp"
 
 #include <gtest/gtest.h>
 
@@ -306,7 +307,7 @@ TEST_F(EngineShutdownTest, ShardedEngineStopIsSafe) {
             .get();
 
         // Insert on all shards before stopping.
-        for (unsigned s = 0; s < seastar::smp::count; ++s) {
+        for (unsigned s = 0; s < timestar::shardCount(); ++s) {
             rawEng
                 .invoke_on(s,
                            [s](Engine& engine) {

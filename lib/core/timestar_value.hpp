@@ -3,6 +3,7 @@
 #include "line_parser.hpp"
 #include "series_id.hpp"
 #include "series_key.hpp"
+#include "shared_timestamp_batch.hpp"
 
 #include <map>
 #include <memory>
@@ -33,7 +34,7 @@ private:
     // getTimestamps).  This allows N inserts from the same multi-field point
     // to share a single allocation instead of copying tags/timestamps N times.
     std::shared_ptr<const std::map<std::string, std::string>> _sharedTags;
-    std::shared_ptr<const std::vector<uint64_t>> _sharedTimestamps;
+    std::shared_ptr<const SharedTimestampBatch> _sharedTimestamps;
 
 public:
     // Cached estimated WAL size. Set by WAL::estimateInsertSize() on first call
@@ -91,8 +92,22 @@ public:
 
     // Set shared timestamps (refcounted, zero-copy across multi-field inserts).
     void setSharedTimestamps(std::shared_ptr<const std::vector<uint64_t>> sharedTimestamps) {
+        setSharedTimestamps(sharedTimestamps ? std::make_shared<const SharedTimestampBatch>(std::move(sharedTimestamps))
+                                             : std::shared_ptr<const SharedTimestampBatch>{});
+    }
+
+    void setSharedTimestamps(std::shared_ptr<const SharedTimestampBatch> sharedTimestamps) {
         _sharedTimestamps = std::move(sharedTimestamps);
         _cachedEstimatedSize.reset();  // timestamp count changes
+    }
+
+    const std::shared_ptr<const SharedTimestampBatch>& sharedTimestampBatch() const { return _sharedTimestamps; }
+
+    // Point at another copy of the SAME timestamps (e.g. one held in this
+    // shard's memory). Nothing derived from the timestamps changes, so cached
+    // sizes stay valid — unlike setSharedTimestamps().
+    void rebindSharedTimestamps(std::shared_ptr<const SharedTimestampBatch> sameTimestamps) {
+        _sharedTimestamps = std::move(sameTimestamps);
     }
 
     // Pre-populate the series key cache to avoid recomputation in WAL encoding.
@@ -119,7 +134,7 @@ public:
     // Read-only access to timestamps. Returns shared timestamps if set, otherwise owned.
     const std::vector<uint64_t>& getTimestamps() const {
         if (_sharedTimestamps)
-            return *_sharedTimestamps;
+            return *_sharedTimestamps->timestamps;
         return timestamps;
     }
 
@@ -128,7 +143,7 @@ public:
     std::vector<uint64_t> takeTimestamps() {
         if (_sharedTimestamps) {
             // Materialize shared data into owned member, then release the shared ref
-            timestamps = *_sharedTimestamps;
+            timestamps = *_sharedTimestamps->timestamps;
             _sharedTimestamps.reset();
         }
         return std::move(timestamps);

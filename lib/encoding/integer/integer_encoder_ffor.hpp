@@ -39,4 +39,14 @@ public:
     // (endTime inclusive) so results do not depend on data placement.
     static std::pair<size_t, size_t> decode(Slice& encoded, unsigned int timestampSize, std::vector<uint64_t>& values,
                                             uint64_t startTime = 0, uint64_t maxTime = UINT64_MAX);
+
+    // Decode signed integer values stored as ZigZag integers inside the FFOR
+    // stream. Append only the index range [skip, skip + length), clamped to
+    // valueCount, and return the number appended. All groups through valueCount
+    // are validated/consumed, including groups after the selected range. The
+    // double overload applies the same int64_t-to-double conversion as queries.
+    static size_t decodeSigned(Slice& encoded, unsigned int valueCount, size_t skip, size_t length,
+                               std::vector<int64_t>& values);
+    static size_t decodeSigned(Slice& encoded, unsigned int valueCount, size_t skip, size_t length,
+                               std::vector<double>& values);
 };

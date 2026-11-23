@@ -3,34 +3,33 @@ cmake_minimum_required(VERSION 3.20)
 # ──────────────────────────────────────────────────────────────────────────────
 #  timestar — top‑level build
 #  ---------------------------------------------------------------------------
-#  Strategy for “libstdc++ 13 + Seastar” build failures
+#  Compiler requirement
 #  ---------------------------------------------------------------------------
-#  * Clang ≤ 18 trips over several C++20/23 libstdc++ headers (chrono, ranges),
-#    regardless of the language level we feed it.
-#  * GCC 13 also fails in C++23 mode because it lacks the parenthesised‑auto
-#    placeholder accepted by libstdc++ 13 headers.
-#  * GCC 14 (released May 2024) builds Seastar fine in C++23 **and** satisfies
-#    libstdc++ 13.
+#  The vendored Seastar (external/seastar, tracking upstream master) uses C++23
+#  library features that first shipped in libstdc++ 15 (the ranges-aware
+#  container members such as `std::vector::assign_range`).  Upstream supports
+#  the two most recent GCC majors, so:
 #
-#  Therefore we try to build the whole project with **GCC ≥ 14**.  If that
-#  compiler is not available we fall back to GCC 13 + C++20 *only* for Seastar
-#  (everything else stays on C++23).  Building with Clang is blocked with an
-#  explicit diagnostic because it is known‑bad at the moment.
+#  * GCC ≥ 15 builds everything in C++23.  This is the supported toolchain.
+#  * GCC ≤ 14 cannot compile Seastar and is rejected below with a clear
+#    diagnostic instead of a template error deep inside Seastar.
+#  * Clang ≤ 18 trips over several C++20/23 libstdc++ headers (chrono, ranges)
+#    and is rejected as before; newer Clang must be paired with libstdc++ ≥ 15.
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ───────────────────────── attempt to pick a suitable compiler ───────────────
 # These variables **must** be set *before* the first `project()` call; otherwise
 # CMake has already locked in the compiler.
 
-if(NOT CMAKE_CXX_COMPILER)
-  # Prefer g++‑14 if it exists
-  find_program(_GXX14 g++-14)
-  if(_GXX14)
-    set(CMAKE_CXX_COMPILER "${_GXX14}" CACHE FILEPATH "C++ compiler" FORCE)
-    get_filename_component(_GCC_DIR "${_GXX14}" DIRECTORY)
-    set(CMAKE_C_COMPILER  "${_GCC_DIR}/gcc-14" CACHE FILEPATH "C compiler" FORCE)
-  else()
-    # Fallback to the default compiler chosen by CMake (g++‑13 or clang‑18)
+if(NOT CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX})
+  # Prefer a versioned GCC 15 if it exists: the unversioned `g++` on older
+  # distributions is too old.  Otherwise fall through to CMake's default, which
+  # the sanity check below validates.
+  find_program(_GXX15 g++-15)
+  if(_GXX15)
+    set(CMAKE_CXX_COMPILER "${_GXX15}" CACHE FILEPATH "C++ compiler" FORCE)
+    get_filename_component(_GCC_DIR "${_GXX15}" DIRECTORY)
+    set(CMAKE_C_COMPILER  "${_GCC_DIR}/gcc-15" CACHE FILEPATH "C compiler" FORCE)
   endif()
 endif()
 
@@ -50,25 +49,26 @@ include(cmake/CompilerWarnings.cmake)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19)
     message(FATAL_ERROR "Clang ${CMAKE_CXX_COMPILER_VERSION} is known to fail \n"
-                        "with libstdc++ 13 <chrono>/<ranges>.  Please install \n"
-                        "either GCC ≥ 14 or Clang ≥ 19, or pass CC/CXX to cmake.")
+                        "with libstdc++ <chrono>/<ranges>.  Please install \n"
+                        "GCC ≥ 15, or pass CC/CXX to cmake.")
   endif()
 endif()
 
-# ───────────────────── select dialect for building Seastar ───────────────────
-#  • GCC ≥ 14 or Clang ≥ 19 ⇒ we keep Seastar at its native C++23.
-#  • Otherwise (currently GCC 13) we downgrade Seastar to C++20.
-# -----------------------------------------------------------------------------
-
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 14)
-  set(SEASTAR_CXX_STANDARD 20)
-else()
-  set(SEASTAR_CXX_STANDARD 23)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 15)
+  message(FATAL_ERROR "GCC ${CMAKE_CXX_COMPILER_VERSION} cannot build the vendored Seastar: \n"
+                      "it needs C++23 library features from libstdc++ 15 \n"
+                      "(e.g. std::vector::assign_range).  Please install GCC ≥ 15 \n"
+                      "and pass -DCMAKE_C_COMPILER=gcc-15 -DCMAKE_CXX_COMPILER=g++-15.")
 endif()
 
+# ───────────────────── select dialect for building Seastar ───────────────────
+# Seastar is built at its native C++23, the same dialect as the rest of the
+# project.  Lock the choice *before* we descend into the Seastar directory.
+# -----------------------------------------------------------------------------
+
+set(SEASTAR_CXX_STANDARD 23)
 message(STATUS "Seastar will be compiled in C++${SEASTAR_CXX_STANDARD} using ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 
-# Lock the choice *before* we descend into the Seastar directory.
 set(CMAKE_CXX_STANDARD "${SEASTAR_CXX_STANDARD}" CACHE STRING "C++ standard for Seastar" FORCE)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -128,6 +128,12 @@ endif()
 
 # ───────────────────────────── build external Seastar ─────────────────────────
 
+# Seastar (post-25.05) enables LTTng-UST I/O tracepoints by default, which makes
+# lttng-ust development headers a hard build requirement. TimeStar does not use
+# them, so default the option OFF here (before Seastar declares it) to keep the
+# dependency set unchanged. Opt back in with -DSeastar_LTTNG=ON.
+set(Seastar_LTTNG OFF CACHE BOOL "Enable LTTng-UST tracepoint support for IO tracing.")
+
 add_subdirectory(external/seastar)
 
 # Consume Seastar's headers as SYSTEM includes so third-party diagnostics
@@ -147,17 +153,8 @@ foreach(_seastar_tgt seastar seastar_testing seastar_perf_testing)
 endforeach()
 
 # ───────────────────────────── project’s own targets ─────────────────────────
-# If we had to lower the standard for Seastar, raise it back again for the rest
-# of this repository.  GCC 13 + C++23 will still fail, so keep *everything*
-# on 23 only if the compiler is actually capable.
-# -----------------------------------------------------------------------------
 
-if(NOT (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 14))
-  set(CMAKE_CXX_STANDARD 23)
-else()
-  set(CMAKE_CXX_STANDARD 20)
-endif()
-
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -167,42 +164,42 @@ include(FetchContent)
 FetchContent_Declare(
   glaze
   GIT_REPOSITORY https://github.com/stephenberry/glaze.git
-  GIT_TAG v7.2.1
+  GIT_TAG v9.1.0
   GIT_SHALLOW TRUE
 )
 
 FetchContent_Declare(
   googlebenchmark
   GIT_REPOSITORY https://github.com/google/benchmark.git
-  GIT_TAG v1.8.3
+  GIT_TAG v1.10.0
   GIT_SHALLOW TRUE
 )
 
 FetchContent_Declare(
   robin-map
   GIT_REPOSITORY https://github.com/Tessil/robin-map.git
-  GIT_TAG v1.3.0
+  GIT_TAG v1.4.1
   GIT_SHALLOW TRUE
 )
 
 FetchContent_Declare(
   highway
   GIT_REPOSITORY https://github.com/google/highway.git
-  GIT_TAG 1.2.0
+  GIT_TAG 1.4.0
   GIT_SHALLOW TRUE
 )
 
 FetchContent_Declare(
   roaring
   GIT_REPOSITORY https://github.com/RoaringBitmap/CRoaring.git
-  GIT_TAG v4.1.7
+  GIT_TAG v5.5.5
   GIT_SHALLOW TRUE
 )
 
 FetchContent_Declare(
   zstd
   GIT_REPOSITORY https://github.com/facebook/zstd.git
-  GIT_TAG v1.5.6
+  GIT_TAG v1.5.7
   GIT_SHALLOW TRUE
   SOURCE_SUBDIR build/cmake
 )
@@ -226,6 +223,28 @@ set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(glaze googlebenchmark robin-map highway roaring zstd)
+
+# Consume the fetched libraries' headers as SYSTEM includes, exactly as done for
+# Seastar above, so diagnostics inside third-party headers do not count against
+# first-party code under -Werror (Highway >= 1.3 uses `unsigned __int128`, which
+# -Wpedantic rejects in every SIMD translation unit that includes it). Done via
+# the target property rather than FetchContent's SYSTEM keyword, which needs
+# CMake 3.25.
+foreach(_dep_tgt hwy roaring roaring-headers roaring-headers-cpp libzstd_static benchmark tsl::robin_map)
+  if(TARGET ${_dep_tgt})
+    get_target_property(_dep_aliased ${_dep_tgt} ALIASED_TARGET)
+    if(_dep_aliased)
+      set(_dep_real ${_dep_aliased})
+    else()
+      set(_dep_real ${_dep_tgt})
+    endif()
+    get_target_property(_dep_inc ${_dep_real} INTERFACE_INCLUDE_DIRECTORIES)
+    if(_dep_inc)
+      set_target_properties(${_dep_real} PROPERTIES
+        INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${_dep_inc}")
+    endif()
+  endif()
+endforeach()
 
 # ──────────────────────────── protobuf message library ────────────────────────
 # Must come after Seastar (which finds Protobuf) so the imported targets exist.

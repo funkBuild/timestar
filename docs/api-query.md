@@ -169,6 +169,32 @@ Decimal values are supported: `"1.5s"`, `"0.5m"`.
 }
 ```
 
+### Response framing and number text
+
+**Large JSON results are streamed.** A successful JSON result with at least
+`http.stream_response_min_points` points (default 65,536) is sent to an
+HTTP/1.1 client with `Transfer-Encoding: chunked`, written to the connection as
+it is formatted. Smaller results, every HTTP/1.0 client, error responses and
+protobuf responses carry a `Content-Length` as before. The body bytes are
+identical either way; any HTTP/1.1 client library handles this transparently.
+What it buys: the server never holds (or copies) the whole body, so a
+1M-point result costs it ~46 MB less at peak, and the first byte arrives as
+soon as the query has executed (5 ms instead of 32 ms for a 30 MB response)
+rather than after the whole body has been built. A slow reader applies
+backpressure to formatting instead of growing a buffer. Set the key to `0` to
+turn streaming off. Because the status line is sent before the body, a failure
+*while streaming* (the connection dropping) cannot become an error response —
+it ends the connection, which the client sees as a truncated chunked body.
+
+**Numbers are shortest round-trip decimals.** Every `double` is written with
+the fewest digits that parse back to exactly the same value. Magnitudes from
+`1e-4` up to (but excluding) `1e16` are written in fixed notation (`0.00025`,
+`1234567.5`); smaller and larger ones in scientific notation with an uppercase
+`E` and no `+` (`2.5E-5`, `1E16`, `1.2345E21`). `NaN` and `±Infinity` are
+`null`. Parse values as numbers; do not match on their text. (Before 1.5 the
+fixed-notation range was wider — `1E16` was written `10000000000000000` and
+`2.5E-5` as `0.000025`. The parsed values are unchanged.)
+
 ## Limits
 
 | Limit | Default | Config Key |
@@ -177,3 +203,9 @@ Decimal values are supported: `"1.5s"`, `"0.5m"`.
 | Max series | 10,000 | `http.max_series_count` |
 | Max points | 10,000,000 | `http.max_total_points` |
 | Timeout | 30s | `http.query_timeout_seconds` |
+| Streamed-response threshold | 65,536 points (`0` = never stream) | `http.stream_response_min_points` |
+
+A request body larger than the limit is refused with `413` before it is read:
+the server takes the request headers, sees the declared length, and answers
+without buffering the body (it then closes the connection rather than read the
+rest).

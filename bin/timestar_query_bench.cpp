@@ -284,9 +284,9 @@ static int extractJsonInt(std::string_view body, std::string_view key) {
 // ──────────────────────────────────────────────────────────────────────
 
 static future<QueryResult> runQuery(socket_address addr, const QueryDef& def) {
-    using http_client = http::experimental::client;
+    using http_client = http::client;
 
-    auto factory = std::make_unique<http::experimental::basic_connection_factory>(addr);
+    auto factory = std::make_unique<http::basic_connection_factory>(addr);
     auto client = std::make_unique<http_client>(std::move(factory), 1);
 
     QueryResult result;
@@ -300,7 +300,7 @@ static future<QueryResult> runQuery(socket_address addr, const QueryDef& def) {
         if (!def.body.empty()) {
             if (isProto) {
                 req.write_body("bin", sstring(def.body));
-                req.set_mime_type("application/x-protobuf");
+                req.set_content_type("application/x-protobuf");
                 req._headers["Accept"] = "application/x-protobuf";
             } else {
                 req.write_body("json", sstring(def.body));
@@ -309,14 +309,18 @@ static future<QueryResult> runQuery(socket_address addr, const QueryDef& def) {
 
         auto t0 = clk::now();
         bool ok = false;
-        sstring respBody;
+        std::string respBody;
 
         try {
             co_await client->make_request(
                 std::move(req), [&ok, &respBody](const http::reply& rep, input_stream<char>&& body_in) -> future<> {
                     auto body = std::move(body_in);
                     ok = (static_cast<int>(rep._status) >= 200 && static_cast<int>(rep._status) < 300);
-                    sstring acc;
+                    // sstring::append reallocates and copies the entire prefix
+                    // on each chunk. Use geometric growth so large-response
+                    // timings measure the query and transfer, not quadratic
+                    // copying in the benchmark client.
+                    std::string acc;
                     auto buf = co_await body.read();
                     while (!buf.empty()) {
                         acc.append(buf.get(), buf.size());
@@ -421,8 +425,8 @@ int main(int argc, char** argv) {
 
         // ── Health check ───────────────────────────────────────────
         {
-            auto factory = std::make_unique<http::experimental::basic_connection_factory>(addr);
-            auto hclient = std::make_unique<http::experimental::client>(std::move(factory));
+            auto factory = std::make_unique<http::basic_connection_factory>(addr);
+            auto hclient = std::make_unique<http::client>(std::move(factory));
             auto req = http::request::make("GET", sstring("localhost"), sstring("/health"));
             bool healthy = false;
             try {

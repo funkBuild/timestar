@@ -71,9 +71,14 @@ function runNextTest() {
 // Check if server is running
 const http = require('http');
 
+// Same variables the Jest suite honours, so every JS suite can be pointed at
+// one server without editing files.
+const HOST = process.env.TIMESTAR_HOST || 'localhost';
+const PORT = parseInt(process.env.TIMESTAR_PORT || '8086', 10);
+
 const options = {
-  hostname: 'localhost',
-  port: 8086,
+  hostname: HOST,
+  port: PORT,
   path: '/health',
   method: 'GET'
 };
@@ -82,7 +87,7 @@ console.log('Checking if TimeStar server is running...');
 
 const req = http.request(options, (res) => {
   if (res.statusCode === 200) {
-    console.log('✓ Server is running on port 8086\n');
+    console.log(`✓ Server is running on ${HOST}:${PORT}\n`);
     runNextTest();
   } else {
     console.error('✗ Server returned unexpected status:', res.statusCode);
@@ -91,7 +96,7 @@ const req = http.request(options, (res) => {
 });
 
 req.on('error', (e) => {
-  console.error('✗ Cannot connect to server on port 8086');
+  console.error(`✗ Cannot connect to server on ${HOST}:${PORT}`);
   console.error('Please start the TimeStar server first:');
   console.error('  cd build && ./bin/timestar_http_server');
   process.exit(1);

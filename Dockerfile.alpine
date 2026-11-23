@@ -12,14 +12,14 @@
 # ---------------------------------------------------------------------------
 #  Stage 1 — build (Ubuntu — Seastar needs glibc + full build toolchain)
 # ---------------------------------------------------------------------------
-FROM ubuntu:24.04 AS builder
+FROM ubuntu:26.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Seastar + TimeStar build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    g++-14 gcc-14 \
+    g++-15 gcc-15 \
     cmake \
     ninja-build \
     git \
@@ -52,7 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxxhash-dev \
     && rm -rf /var/lib/apt/lists/*
 
-ENV CC=gcc-14 CXX=g++-14
+ENV CC=gcc-15 CXX=g++-15
 
 WORKDIR /src
 COPY . .
@@ -65,8 +65,8 @@ RUN mkdir -p build && cd build && \
       -GNinja \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG" \
-      -DCMAKE_C_COMPILER=gcc-14 \
-      -DCMAKE_CXX_COMPILER=g++-14 \
+      -DCMAKE_C_COMPILER=gcc-15 \
+      -DCMAKE_CXX_COMPILER=g++-15 \
       -DTIMESTAR_ENABLE_LTO=ON \
     && ninja timestar_http_server
 

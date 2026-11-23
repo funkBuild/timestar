@@ -71,7 +71,7 @@ cd test_api/
 # Install dependencies (first time only)
 npm install
 
-# Run Jest test suite (161 tests across 10 suites)
+# Run Jest test suite (198 tests across 14 suites)
 npm test
 
 # Run standalone integration tests (8 tests)
@@ -87,6 +87,10 @@ npm run test:coverage
 npm run test:watch
 ```
 
+Both the Jest suites and the standalone tests honour `TIMESTAR_HOST` / `TIMESTAR_PORT`
+(default `localhost:8086`), so they can be pointed at a server on another port:
+`TIMESTAR_PORT=18290 npm run test:all`.
+
 Test files include:
 - `http_api_tests/comprehensive_query.test.js` - Query functionality tests
 - `http_api_tests/metadata_api.test.js` - Metadata API tests
@@ -96,9 +100,20 @@ Test files include:
 ### Expected Test Results
 
 When all tests pass, you should see:
-- **C++ Tests**: 3178+ tests across 254+ test suites, all passing
-- **Jest Tests**: 161 tests from 10 test suites, all passing
+- **C++ unit tests** (`timestar_unit_test`): 4013+ tests across 358+ test suites, all passing.
+  CI runs it as `CI=true ./test/timestar_unit_test -c 2`: with `CI` set, a multi-shard test that
+  would be skipped for lack of a second shard FAILS instead. With `-c 1` those tests (10) skip.
+- **Other C++ suites**: `timestar_perf_test` 46, `timestar_integration_test` 44,
+  `timestar_e2e_test` 45, `timestar_http_test` 38 (`timestar_test` is unit + integration + e2e +
+  perf in one binary: 4142+)
+- **Jest Tests**: 198 tests from 14 test suites, all passing
 - **Standalone Tests**: 8 tests, all passing
+- A plain `make` builds every target, including `test/benchmark/*`; `ctest -L benchmark` runs
+  those six (the compaction benchmark takes ~4 minutes)
+
+Error-level log lines in a passing run are expected: negative tests feed the server corrupt
+blocks, bad manifests and oversized batches on purpose. "Reactor stalled" notices come from test
+bodies doing CPU-bound work on the reactor thread, not from the code under test.
 
 ## Key Executables
 
@@ -141,6 +156,7 @@ The codebase is organized around these key abstractions:
    - Holds data before flushing to TSM files
    - Provides fast reads for recent data
    - Rolled over periodically to create new TSM files
+   - In-order batches are adopted rather than copied; see "Memory Store Internals"
 
 5. **Encoders** - Compression algorithms for efficient storage:
    - `integer_encoder` - Integer compression using Simple8b
@@ -170,18 +186,102 @@ The project uses Seastar for async I/O and coroutines:
 ## Compiler Requirements
 
 The build system automatically selects the appropriate compiler:
-- Prefers GCC 14+ for full C++23 support
-- Falls back to GCC 13 with C++20 for Seastar only
-- Clang < 19 is explicitly blocked due to libstdc++ 13 incompatibilities
+- Requires GCC 15+ (libstdc++ 15): the vendored Seastar tracks upstream master, which uses C++23
+  library features (`std::vector::assign_range`) that GCC 14's library lacks. The build prefers
+  `g++-15` when present and rejects older GCC at configure time with an explicit message
+- Everything, Seastar included, is built as C++23
+- Clang < 19 is explicitly blocked; newer Clang must be paired with libstdc++ 15
+- Docker and CI build on Ubuntu 26.04, whose default toolchain is GCC 15
 
 ## Dependencies
 
-- Seastar (included as submodule in `external/seastar`)
+- Seastar (included as submodule in `external/seastar`, tracking upstream master)
 - Google Test (fetched automatically for tests)
 - Glaze (fetched automatically for JSON parsing)
+- Google Highway (fetched automatically; all SIMD kernels)
 - CRoaring (fetched automatically for roaring bitmap postings)
 - Zstd (fetched automatically for compression)
 - Threads library
+
+Fetched dependencies are pinned by tag in the top-level `CMakeLists.txt` and consumed as SYSTEM
+includes, so their headers do not count against first-party code under `-Werror`.
+
+## HTTP Request and Response Bodies
+
+The HTTP server runs in Seastar's content-streaming mode, and the request's `content` member is
+deprecated upstream — handlers never touch it:
+
+- **Reading a body** goes through `timestar::http::readRequestBody(req, maxBytes, body)`
+  (`lib/http/request_body.hpp`). It enforces the endpoint's limit before buffering, and reports
+  `TooLarge` / `Incomplete` rather than handing a handler a partial body. Tests that call a
+  handler directly attach the body with `timestar::http::injectedBody(req) = ...`.
+- **Large JSON query results are streamed** with chunked transfer encoding
+  (`ResponseFormatter::streamBody`, threshold `http.stream_response_min_points`); its bytes must
+  stay identical to `ResponseFormatter::formatBody` (`response_formatter_stream_test.cpp`).
+- **Plain `{"writes":[...]}` batches skip the JSON DOM** (`lib/http/plain_write_batch.hpp`). The
+  DOM path remains the definition of what a write body means: the scanner must only ever accept
+  bodies for which it produces exactly the DOM path's result, and must answer "not plain" for
+  everything else. `plain_write_batch_test.cpp` is the differential test that holds it to that —
+  extend the test's spoiler list whenever the write format gains a feature.
+
+## Aggregation Internals (performance structures with a correctness contract)
+
+Several hot paths have two implementations of one result — a fast route and the general one. The fast
+route is only ever a performance choice; each is held to the general one by a test that compares bits,
+and must stay that way:
+
+- **Bucket states live in `BucketStateMap`** (`lib/query/bucket_map.hpp`), not `std::unordered_map`:
+  insertion-ordered blocks, stable references, no hashing for in-order inserts or sequential lookups,
+  `sortedByKey()` when filled in time order. Use it for any bucket -> `AggregationState` map on the query
+  path. It iterates in insertion order — sort (or check `sortedByKey()`) before emitting.
+- **Fold order per bucket is fixed**: the earlier series' / earlier partial's state absorbs later ones in
+  order, and a bucket new to a group starts from a default state that then absorbs the incoming one
+  (merge-into-empty is NOT bit-identical to moving the state — it collapses the Kahan pair). The routes
+  that find the target differently (`foldSeriesBucketsIntoGroup`'s in-place loop vs ordered union; the
+  coordinator's in-place fold vs sorted index in `mergePartialAggregationsGrouped`) must all perform
+  exactly those per-bucket operations. Pinned by `FoldingSeriesIntoAGroupMatchesThePlainLoop` and
+  `BucketedPartialsMatchLeftFoldOracleOnEveryRoute`.
+- **The N-way merge loop is a plain function with pinned inlining** (`heapMergeChunk` in
+  `aggregator.cpp`). Its state must not move back into the coroutine frame, and the `always_inline` /
+  `noinline` attributes on the heap operations and callbacks are deliberate: left to the compiler, the
+  loop's speed changed by 25% whenever unrelated code in the file changed. New per-element loops inside
+  coroutines should follow the same shape (plain chunk kernel, thin coroutine that yields between chunks).
+- **A timestamp with one raw contributor is finalized from closed forms** (`Aggregator::loneValueResult`),
+  which must equal a fresh `AggregationState` after one `addValue` — `LoneValueMatchesAStateOfOne`. Any
+  change to `addValue`/`getValue` has to keep that test passing or widen what falls back to the state.
+- **Short decimals are written by `writeShortDecimal`** (`lib/http/short_decimal.hpp`); its bytes must equal
+  `glz::to_chars` for every value it accepts — `ShortDecimalWriterMatchesTheGeneralWriter`.
+- Float aggregates can differ in their last bits from run to run because shard results are merged in
+  arrival order. Compare aggregated results numerically (or to ~10 significant digits), never by digest.
+
+## Memory Store Internals (a representation with a correctness contract)
+
+A memory-store series (`InMemorySeries`, `lib/storage/memory_store.hpp`) is logically one sorted,
+duplicate-free sequence, and that is how every reader sees it. Physically it is a consolidated prefix plus
+**pending runs**: sizeable batches that arrived strictly in order and were adopted instead of being copied into
+one growing vector (which cost a copy per batch plus a relocation of everything before it each time the vector
+doubled). The rules that must not drift:
+
+- **`timestamps()` / `values()` are the only way to read a series**, and they consolidate. The storage is
+  private so that a reader cannot miss the pending runs; use `size()`, `empty()`, `firstTimestamp()`,
+  `lastTimestamp()` and `stats` when the points themselves are not needed (they do not consolidate — a query
+  answered from running stats leaves the runs alone). References they return are invalidated by the next
+  insert, and must not be held across a suspension point.
+- **Only a plain in-order append is adopted** (at least `kMinAdoptedRunPoints` points, strictly increasing,
+  first timestamp after everything held, stats valid). Everything else — small batches, out-of-order or
+  duplicate timestamps, corrections — consolidates first and takes the general path, which owns last-write-wins.
+- **A run holds only this shard's memory.** Write batches are parsed on the connection's shard and *moved* to
+  the shard that owns the series; Seastar's per-shard pools are fixed and never rebalanced, so keeping such a
+  buffer would make one shard pay for another's memory store (with one ingest connection, for all of them).
+  `timestar::isShardLocalMemory()` (`lib/utils/shard_memory.hpp`) decides: a local batch is adopted as it
+  stands, a foreign one is copied once into exact-size local storage, and `MemoryStore` makes one local copy
+  of a write's shared timestamps for all of its fields on the shard. Apply the same rule to any new
+  long-lived structure that takes ownership of request buffers.
+- **Flush writes the runs where they are** (`TSMWriter::writeSeriesRuns`), with the same block boundaries as
+  `writeSeries` over the concatenation, so the file does not depend on how the series was split.
+- All of it is held to the copying path by `memory_store_runs_test.cpp`, which replays the same writes with
+  adoption on, with every batch treated as foreign, and with adoption off (the `RunAdoption` seam), and
+  requires identical series, bit-identical running stats and byte-identical TSM files.
 
 ## Data Storage
 
@@ -372,17 +472,13 @@ ctest
 ```
 
 #### API Tests
-The `test_api/` directory contains JavaScript and Python API tests:
+The `test_api/` directory contains the JavaScript API tests (see "API Integration Tests" above):
 ```bash
-# Run functional tests
-python test_api/test_http_write.py
-
-# Run stress test (1000 points in batches of 100)
-python test_api/test_http_write.py --stress
-
-# Test against custom host/port
-python test_api/test_http_write.py --host localhost --port 8086
+cd test_api && npm run test:all                      # standalone + Jest, server on :8086
+TIMESTAR_PORT=18290 npm run test:all                 # against a server on another port
 ```
+`test_api/equivalence_test.py` is not a suite: it compares TimeStar against a running
+InfluxDB 2.7 and needs both.
 
 ### Starting the Server
 

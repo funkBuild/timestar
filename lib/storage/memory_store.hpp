@@ -2,6 +2,7 @@
 
 #include "logger.hpp"
 #include "series_id.hpp"
+#include "shard_memory.hpp"
 #include "timestar_config.hpp"
 #include "timestar_value.hpp"
 #include "tsm.hpp"
@@ -51,19 +52,110 @@ struct InMemorySeriesStats {
     // Compensated sum accessor matching AggregationState convention
     double compensatedSum() const { return sum + sumCompensation; }
 
-    void update(const double* values, const uint64_t* timestamps, size_t n);
+    void update(const double* values, const uint64_t* timestamps, size_t n, bool sorted = false);
 };
 
+namespace timestar::memory_store_detail {
+// Test seam for how InMemorySeries takes a sizeable in-order batch.
+//   Auto     production: adopt it, copying any part that is not this shard's
+//            memory.
+//   Off      copy it into the consolidated vectors — the representation the
+//            class had before pending runs existed, and still the definition
+//            of what a series holds.
+//   Foreign  adopt it as if all of it were another shard's memory.
+// memory_store_runs_test.cpp replays the same writes every way and requires
+// identical series, identical running stats and identical TSM files. Only
+// tests change it.
+enum class RunAdoption : uint8_t { Auto, Off, Foreign };
+inline RunAdoption runAdoption = RunAdoption::Auto;
+}  // namespace timestar::memory_store_detail
+
+// One series' points in a memory store.
+//
+// Logically this is a single sorted, duplicate-free sequence of (timestamp,
+// value) — which is how every reader sees it, through timestamps()/values().
+// Physically it is that sequence's consolidated prefix plus a list of
+// "pending runs": batches that arrived strictly after everything already
+// held, in strictly increasing order, and were simply adopted — the request's
+// value vector moved in, its timestamps kept by reference when they are shared
+// across the fields of one write.
+//
+// Why: appending each batch to one growing vector cost a copy of the batch and,
+// as the vector doubled, a second copy of everything before it (11-14% of
+// ingest CPU, the relocations touching cold memory), left up to 2x capacity
+// slack, and gave every field of a write its own copy of the timestamps. A
+// store that is only written to — the normal state of an ingest-heavy shard —
+// now never relocates a point, and the flush reads the runs where they are
+// (forEachRun).
+//
+// A run only ever holds this shard's memory. A batch parsed on this shard is
+// adopted as it stands; one that was parsed on another shard and moved here is
+// copied once into exact-size local storage instead (timestar::
+// isShardLocalMemory explains why keeping it would be wrong). String payloads
+// are the exception, as they always were: the strings themselves are moved.
+//
+// The first read through timestamps()/values() merges the pending runs into
+// the prefix (one append each, exactly what the insert used to do, just
+// later), so a series that is queried while being written behaves as before.
+// Anything that is not a plain in-order append of a sizeable batch — a small
+// batch, out-of-order or duplicate timestamps, a correction of existing
+// points — consolidates first and takes the general path, which is unchanged.
+//
+// References returned by timestamps()/values() are invalidated by the next
+// insert, as the public vectors always were. Consolidation happens inside
+// const accessors (the storage is mutable): a store is only ever touched from
+// its own shard.
 template <class T>
 class InMemorySeries {
 public:
-    std::vector<uint64_t> timestamps;
-    std::vector<T> values;
-
     // Running stats — only valid for double series, updated on each insert.
     // Used by pushdown aggregation to skip per-point scanning when query
     // covers the entire series time range.
     InMemorySeriesStats stats;
+
+    // The whole series, consolidated. See the class comment.
+    const std::vector<uint64_t>& timestamps() const {
+        consolidate();
+        return timestamps_;
+    }
+    const std::vector<T>& values() const {
+        consolidate();
+        return values_;
+    }
+    std::vector<uint64_t>& timestamps() {
+        consolidate();
+        return timestamps_;
+    }
+    std::vector<T>& values() {
+        consolidate();
+        return values_;
+    }
+
+    // Point count, emptiness and time bounds, without consolidating.
+    size_t size() const noexcept { return timestamps_.size() + pendingPoints_; }
+    bool empty() const noexcept { return size() == 0; }
+    uint64_t firstTimestamp() const noexcept {
+        return !timestamps_.empty() ? timestamps_.front() : pending_.front().timestamps().front();
+    }
+    uint64_t lastTimestamp() const noexcept {
+        return !pending_.empty() ? pending_.back().timestamps().back() : timestamps_.back();
+    }
+
+    // Visit the series as its contiguous runs, in time order, without
+    // consolidating: fn(const std::vector<uint64_t>& timestamps,
+    // const std::vector<T>& values) is called once per run. Concatenated, the
+    // runs are the series. The consolidated prefix must already be sorted
+    // (sort() guarantees it).
+    template <class Fn>
+    void forEachRun(Fn&& fn) const {
+        if (!timestamps_.empty()) {
+            fn(timestamps_, values_);
+        }
+        for (const auto& run : pending_) {
+            fn(run.timestamps(), run.values);
+        }
+    }
+    size_t runCount() const noexcept { return (timestamps_.empty() ? 0 : 1) + pending_.size(); }
 
     void insert(TimeStarInsert<T>&& insertRequest);
 
@@ -72,10 +164,13 @@ public:
     // The insert path maintains sortedness (is_sorted fast paths + suffix
     // sort + merge), so at flush time the data is almost always already
     // sorted — an O(N) sequential check avoids the O(N log N) index sort
-    // plus full gather/copy-back permutation.
+    // plus full gather/copy-back permutation. Pending runs are sorted and
+    // follow the prefix by construction, so only the prefix is checked and
+    // nothing is consolidated.
     void sort() {
-        if (!std::ranges::is_sorted(timestamps)) [[unlikely]] {
-            sortPaired(0, timestamps.size());
+        if (!std::ranges::is_sorted(timestamps_)) [[unlikely]] {
+            consolidate();
+            sortPaired(0, timestamps_.size());
         }
     }
 
@@ -102,6 +197,37 @@ public:
     // Needed after an overwrite: incremental stats can't cheaply un-count a
     // replaced value (Kahan sum, Welford M2, min/max).
     void recomputeStats();
+
+    // Batches at least this large are adopted as pending runs when they are
+    // plain in-order appends; smaller ones are copied into the prefix, where a
+    // run's bookkeeping would outweigh the copy it saves.
+    static constexpr size_t kMinAdoptedRunPoints = 1024;
+
+private:
+    struct PendingRun {
+        // Exactly one of these holds the run's timestamps: shared when the
+        // write's fields share one timestamp vector, owned otherwise.
+        std::shared_ptr<const std::vector<uint64_t>> sharedTimestamps;
+        std::vector<uint64_t> ownedTimestamps;
+        std::vector<T> values;
+
+        const std::vector<uint64_t>& timestamps() const noexcept {
+            return sharedTimestamps ? *sharedTimestamps : ownedTimestamps;
+        }
+    };
+
+    // Merge every pending run into the prefix.
+    void consolidate() const {
+        if (!pending_.empty()) [[unlikely]] {
+            consolidateSlow();
+        }
+    }
+    void consolidateSlow() const;
+
+    mutable std::vector<uint64_t> timestamps_;
+    mutable std::vector<T> values_;
+    mutable std::vector<PendingRun> pending_;
+    mutable size_t pendingPoints_ = 0;
 };
 
 // Order of variants must match TSMValueType order
@@ -131,6 +257,17 @@ private:
     // resident while the estimate stayed under 1 MB and the store never rolled
     // over at all. Rollover now triggers on whichever estimate crosses first.
     size_t residentBytesEstimate = 0;
+
+    // The fields of one write share a timestamp vector and arrive here one
+    // after another. When that vector is another shard's memory a series may
+    // not keep it (see InMemorySeries), and each would take its own copy; this
+    // remembers the copy made for the previous field so the write's remaining
+    // fields on this shard share it. The weak reference only identifies the
+    // batch the copy was made from.
+    std::weak_ptr<const SharedTimestampBatch> lastForeignTimestamps_;
+    std::shared_ptr<const SharedTimestampBatch> lastLocalTimestamps_;
+    std::shared_ptr<const SharedTimestampBatch> localTimestampBatch(
+        const std::shared_ptr<const SharedTimestampBatch>& foreign);
 
     // Rough per-series bookkeeping cost: robin_map slot (key + variant payload,
     // at ~0.5 load factor) plus the two heap vector allocations.
@@ -239,11 +376,12 @@ public:
                 if constexpr (std::is_same_v<SeriesType, InMemorySeries<std::string>>) {
                     return std::nullopt;
                 } else {
-                    if (s.timestamps.empty()) {
+                    if (s.empty()) {
                         return std::nullopt;
                     }
-                    auto lo = std::lower_bound(s.timestamps.begin(), s.timestamps.end(), startTime);
-                    if (lo != s.timestamps.end() && *lo < endTime) {
+                    const auto& ts = s.timestamps();
+                    auto lo = std::lower_bound(ts.begin(), ts.end(), startTime);
+                    if (lo != ts.end() && *lo < endTime) {
                         return *lo;
                     }
                     return std::nullopt;
@@ -263,11 +401,12 @@ public:
         }
         return std::visit(
             [&](const auto& s) -> std::optional<std::pair<uint64_t, uint64_t>> {
-                if (s.timestamps.empty()) {
+                if (s.empty()) {
                     return std::nullopt;
                 }
-                auto lo = std::lower_bound(s.timestamps.begin(), s.timestamps.end(), startTime);
-                auto hi = std::upper_bound(lo, s.timestamps.end(), endTime);
+                const auto& ts = s.timestamps();
+                auto lo = std::lower_bound(ts.begin(), ts.end(), startTime);
+                auto hi = std::upper_bound(lo, ts.end(), endTime);
                 if (lo == hi) {
                     return std::nullopt;
                 }

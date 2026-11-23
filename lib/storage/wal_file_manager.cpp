@@ -531,7 +531,7 @@ seastar::future<> WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStor
 
 #if TIMESTAR_LOG_INSERT_PATH
     for (const auto& [key, series] : store->series) {
-        size_t seriesPoints = std::visit([](const auto& s) { return s.timestamps.size(); }, series);
+        size_t seriesPoints = std::visit([](const auto& s) { return s.size(); }, series);
         totalPoints += seriesPoints;
 
         if (seriesPoints > largestSeriesPoints) {
@@ -542,7 +542,7 @@ seastar::future<> WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStor
         // Estimate memory usage for this series
         size_t seriesMemory = std::visit(
             [&seriesPoints](const auto& s) -> size_t {
-                using T = typename std::decay_t<decltype(s.values)>::value_type;
+                using T = typename std::decay_t<decltype(s.values())>::value_type;
                 size_t mem = seriesPoints * sizeof(uint64_t);  // timestamps
                 if constexpr (std::is_same_v<T, double>) {
                     mem += seriesPoints * sizeof(double);
@@ -551,7 +551,7 @@ seastar::future<> WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStor
                 } else if constexpr (std::is_same_v<T, std::string>) {
                     // Estimate string memory
                     size_t stringMem = 0;
-                    for (const auto& str : s.values) {
+                    for (const auto& str : s.values()) {
                         stringMem += str.size() + sizeof(std::string);
                     }
                     mem += stringMem;

@@ -250,3 +250,53 @@ TEST_F(ResponseFormatterTagEscapeTest, NormalTagsStillWorkAfterFix) {
     EXPECT_EQ(recovered["host"], "server-01");
     EXPECT_EQ(recovered["region"], "us-east-1");
 }
+
+TEST_F(ResponseFormatterTagEscapeTest, NumericSlicesRoundTripPastYieldBoundary) {
+    auto response = buildResponseWithTags({});
+    auto& field = response.series[0].fields.at("value");
+    field.first.clear();
+    std::vector<double> values;
+    for (size_t i = 0; i < 65539; ++i) {
+        field.first.push_back(UINT64_MAX - i);
+        values.push_back(i % 2 ? -1e308 : std::numeric_limits<double>::denorm_min());
+    }
+    field.second = values;
+    // Deliberately underestimate: bounded appends must grow safely as well.
+    response.statistics.pointCount = 0;
+    const auto json = ResponseFormatter::format(response).get();
+    FullResponseParsed parsed;
+    ASSERT_FALSE(glz::read_json(parsed, json));
+    ASSERT_EQ(parsed.series.size(), 1u);
+    EXPECT_EQ(parsed.series[0].fields.at("value").timestamps, field.first);
+    EXPECT_EQ(parsed.series[0].fields.at("value").values, values);
+    EXPECT_EQ(json.find('\0'), std::string::npos);
+}
+
+TEST_F(ResponseFormatterTagEscapeTest, MixedTypesAndEscapingGrowBeyondInitialReserve) {
+    auto response = buildResponseWithTags({{"long", std::string(3000, '\n')}});
+    auto& fields = response.series[0].fields;
+    fields.clear();
+    const std::string text = std::string(10000, '\1') + "quoted\"\\\n";
+    fields["strings"] = {{1, 2}, std::vector<std::string>{"", text}};
+    fields["bools"] = {{1, 2}, std::vector<bool>{true, false}};
+    fields["integers"] = {{1, 2}, std::vector<int64_t>{INT64_MIN, INT64_MAX}};
+    fields["empty"] = {{}, std::vector<double>{}};
+    fields["nonfinite"] = {
+        {1, 2, 3},
+        std::vector<double>{std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity(),
+                            -std::numeric_limits<double>::infinity()}};
+    auto json = ResponseFormatter::format(response).get();
+    glz::generic parsed;
+    ASSERT_FALSE(glz::read_json(parsed, json));
+    auto& series = parsed.get<glz::generic::object_t>()["series"].get<glz::generic::array_t>();
+    auto& parsedFields = series[0].get<glz::generic::object_t>()["fields"].get<glz::generic::object_t>();
+    auto& strings = parsedFields["strings"].get<glz::generic::object_t>()["values"].get<glz::generic::array_t>();
+    ASSERT_EQ(strings.size(), 2u);
+    EXPECT_EQ(strings[0].get<std::string>(), "");
+    EXPECT_EQ(strings[1].get<std::string>(), text);
+    EXPECT_NE(json.find("[true,false]"), std::string::npos);
+    EXPECT_NE(json.find("[-9223372036854775808,9223372036854775807]"), std::string::npos);
+    EXPECT_NE(json.find("[null,null,null]"), std::string::npos);
+    EXPECT_NE(json.find("\"empty\":{\"timestamps\":[],\"values\":[]}"), std::string::npos);
+    EXPECT_EQ(json.find('\0'), std::string::npos);
+}

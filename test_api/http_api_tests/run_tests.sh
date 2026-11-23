@@ -6,6 +6,9 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/../../build"
 SERVER_PID=""
+# Same variables the tests honour.
+HOST="${TIMESTAR_HOST:-localhost}"
+PORT="${TIMESTAR_PORT:-8086}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -15,7 +18,7 @@ NC='\033[0m' # No Color
 
 # Function to check if server is running
 check_server() {
-    curl -s http://localhost:8086/health > /dev/null 2>&1
+    curl -s "http://$HOST:$PORT/health" > /dev/null 2>&1
     return $?
 }
 
@@ -40,7 +43,7 @@ start_server() {
     fi
     
     # Start the server in background
-    cd "$BUILD_DIR" && ./bin/timestar_http_server > /tmp/timestar_server.log 2>&1 &
+    cd "$BUILD_DIR" && ./bin/timestar_http_server --port "$PORT" > /tmp/timestar_server.log 2>&1 &
     SERVER_PID=$!
     echo "Server started with PID: $SERVER_PID"
     

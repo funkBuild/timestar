@@ -7,8 +7,10 @@
 #include "logger.hpp"
 #include "placement_table.hpp"
 #include "proto_converters.hpp"
+#include "request_body.hpp"
 #include "scatter_gather.hpp"
 #include "series_key.hpp"
+#include "shard_count.hpp"
 
 #include <seastar/core/smp.hh>
 #include <seastar/core/when_all.hh>
@@ -175,7 +177,14 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
     }
 
     // Body size limit to prevent DoS via large payloads
-    if (req->content.size() > timestar::config().http.max_query_body_size) {
+    seastar::sstring body;
+    const auto bodyStatus =
+        co_await timestar::http::readRequestBody(*req, timestar::config().http.max_query_body_size, body);
+    if (bodyStatus == timestar::http::BodyStatus::Incomplete) {
+        timestar::http::replyIncompleteBody(*reply, resFmt);
+        co_return reply;
+    }
+    if (bodyStatus == timestar::http::BodyStatus::TooLarge) {
         reply->set_status(seastar::http::reply::status_type::payload_too_large);
         if (timestar::http::isProtobuf(resFmt)) {
             reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, "Request body too large");
@@ -219,7 +228,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
                 timestar::http::setContentType(*reply, resFmt);
             };
 
-            if (req->content.empty()) {
+            if (body.empty()) {
                 rejectBadRequest("Empty delete request body: at least one delete must be specified");
                 co_return reply;
             }
@@ -251,7 +260,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             std::string batchError;
             bool parsedAsBatch = false;
             try {
-                auto parsedList = timestar::proto::parseBatchDeleteRequest(req->content.data(), req->content.size());
+                auto parsedList = timestar::proto::parseBatchDeleteRequest(body.data(), body.size());
                 if (!parsedList.empty()) {
                     if (parsedList.size() > MAX_BATCH_DELETE_SIZE) {
                         rejectBadRequest("Batch delete exceeds maximum size of " +
@@ -275,8 +284,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             // failure, or batch entries that failed validation).
             if (!parsedAsBatch) {
                 try {
-                    deleteRequests.push_back(convertAndValidate(
-                        timestar::proto::parseSingleDeleteRequest(req->content.data(), req->content.size())));
+                    deleteRequests.push_back(
+                        convertAndValidate(timestar::proto::parseSingleDeleteRequest(body.data(), body.size())));
                 } catch (const std::exception& e) {
                     timestar::http_log.debug("Single delete parse failed: {}", e.what());
                     // Prefer the batch-side error when there was one — it came
@@ -290,7 +299,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             // Parse JSON body using Glaze
             // Try to parse as batch delete first
             GlazeBatchDelete batchDelete;
-            auto batch_error = glz::read_json(batchDelete, req->content);
+            auto batch_error = glz::read_json(batchDelete, body);
 
             static constexpr size_t MAX_BATCH_DELETE_SIZE = 10'000;
             if (!batch_error && !batchDelete.deletes.empty()) {
@@ -315,7 +324,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             } else {
                 // Try single delete request
                 GlazeDeleteRequest singleDelete;
-                auto single_error = glz::read_json(singleDelete, req->content);
+                auto single_error = glz::read_json(singleDelete, body);
 
                 if (single_error) {
                     reply->set_status(seastar::http::reply::status_type::bad_request);
@@ -358,7 +367,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
         };
 
         // Group targeted deletes by shard; collect pattern deletes separately.
-        std::vector<std::vector<TargetedDelete>> perShard(seastar::smp::count);
+        std::vector<std::vector<TargetedDelete>> perShard(timestar::shardCount());
         std::vector<size_t> patternDeleteIndices;  // indices into deleteRequests
 
         for (size_t i = 0; i < deleteRequests.size(); ++i) {
@@ -387,7 +396,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
         std::vector<seastar::future<ShardResult>> allFutures;
 
         // 1) Per-shard targeted deletes — one future per shard that has work.
-        for (unsigned s = 0; s < seastar::smp::count; ++s) {
+        for (unsigned s = 0; s < timestar::shardCount(); ++s) {
             if (perShard[s].empty())
                 continue;
 

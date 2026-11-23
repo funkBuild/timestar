@@ -4,6 +4,7 @@
 // values (they are excluded from SUM, AVG, COUNT, MIN, MAX, etc.). See
 // docs/nan_policy.md for the full cross-subsystem policy.
 
+#include "bucket_map.hpp"
 #include "query_parser.hpp"
 
 #include <algorithm>
@@ -15,6 +16,7 @@
 #include <seastar/core/future.hh>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace timestar {
@@ -95,6 +97,17 @@ struct AggregationState {
     mutable std::vector<double> rawValues;
     bool rawValuesSaturated = false;
     bool collectRaw = false;  // Set to true only for EXACT_MEDIAN queries
+
+    // Give back the only thing a state can own (the raw values the median
+    // methods keep), leaving it with a destructor that has nothing to do. For
+    // a consumer about to drop a whole map of states it has just visited: the
+    // map can then be freed without touching every state a second time
+    // (BucketMap::releaseWithoutDestroying).
+    void releaseStorage() noexcept {
+        if (rawValues.capacity() != 0) {
+            std::vector<double>().swap(rawValues);
+        }
+    }
 
     // Add a single value to this state (incremental aggregation)
     void addValue(double value, uint64_t timestamp) {
@@ -414,6 +427,32 @@ public:
 };
 
 // Structure to hold aggregated data points
+// Per-bucket states for one series or group: bucket start -> state. See
+// bucket_map.hpp for why this is not a std::unordered_map.
+using BucketStateMap = BucketMap<AggregationState>;
+
+// Fold one series' bucket states into its group's, consuming them.
+//
+// `consume` selects which merge runs per bucket — the rvalue one (the series'
+// states are moved from) or the const one — matching what each caller did
+// before this helper existed, since the two are not bit-for-bit
+// interchangeable. Either way a bucket new to the group starts from a
+// default state that then absorbs the series' state, and a bucket the group
+// already has absorbs it in place: per bucket, exactly the operations the
+// plain loop `group[bucket].mergeForMethod(state)` performs.
+//
+// What varies is how the group's entry is found. Both maps are normally in
+// bucket order (see BucketMap). When the series' buckets are ones the group
+// already has — many series, coarse buckets — the in-place loop finds each
+// one right after the last. When they mostly are NOT (series active at
+// different times, fine buckets) every in-place lookup would miss and append
+// out of order, which costs a hash-index insert per bucket and leaves the
+// group unsorted for everything downstream; there the two ordered sequences
+// are merged into a new ordered map instead. That moves the group's states,
+// so it is only done when the series is at least an eighth of the group's
+// size, which bounds the moving to a constant per incoming bucket.
+void foldSeriesBucketsIntoGroup(BucketStateMap& group, BucketStateMap& series, AggregationMethod method, bool consume);
+
 struct AggregatedPoint {
     uint64_t timestamp;  // Bucket start time for interval aggregation
     double value;
@@ -445,7 +484,7 @@ struct PartialAggregationResult {
 
     // TWO-PHASE AGGREGATION: Store pre-aggregated states instead of raw values
     // Key: bucket timestamp, Value: aggregation state for that bucket
-    std::unordered_map<uint64_t, AggregationState> bucketStates;
+    BucketStateMap bucketStates;
 
     // For non-bucketed aggregation (interval == 0) - sorted parallel vectors.
     // When populated from pushdown, sortedValues carries compact raw doubles
@@ -503,6 +542,17 @@ struct PartialAggregationResult {
 
 class Aggregator {
 public:
+    // The (value, count) a timestamp with exactly one raw contributor
+    // finalizes to: what a fresh AggregationState reports after addValue() of
+    // that one value, without building the state in the common case.
+    static std::pair<double, size_t> loneValueResult(double value, uint64_t timestamp, AggregationMethod method);
+
+    // Reduce many short, aligned raw series before crossing shards. Large or
+    // misaligned series retain the compact raw representation and N-way merge.
+    // Consumes redundant partials; totalPoints still counts every input point.
+    static seastar::future<> compactAlignedPartialGroups(std::vector<PartialAggregationResult>& partials,
+                                                         AggregationMethod method);
+
     // ========================================================================
     // DISTRIBUTED AGGREGATION (15.6x performance improvement)
     // ========================================================================
@@ -533,8 +583,10 @@ public:
     // Merge partial aggregations with metadata preserved (reduce phase).
     // Coroutine: yields between groups and inside the per-point merge loops
     // (same stall rationale as createPartialAggregations).
+    // compactOutput keeps unbucketed results in timestamp/value arrays when
+    // the consumer does not need per-point contributor counts (HTTP responses).
     static seastar::future<std::vector<GroupedAggregationResult>> mergePartialAggregationsGrouped(
-        std::vector<PartialAggregationResult>& partialResults, AggregationMethod method);
+        std::vector<PartialAggregationResult>& partialResults, AggregationMethod method, bool compactOutput = false);
 
     // ========================================================================
     // LEGACY COMPATIBILITY
