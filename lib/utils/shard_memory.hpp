@@ -17,13 +17,10 @@ namespace timestar {
 // shard's memory store. So long-lived structures adopt a buffer only when this
 // returns true, and copy it otherwise.
 //
-// Answers true where there are no per-shard pools to protect: off a reactor
-// thread (plain tests, offline tools) and in builds using the system allocator.
-inline bool isShardLocalMemory(const void* p) noexcept {
-    if (!seastar::engine_is_ready()) {
-        return true;
-    }
-    static const bool hasShardPools = [] {
+// Whether this build has per-shard pools at all. Seastar's debug mode uses the
+// system allocator, which has none.
+inline bool hasShardMemoryPools() noexcept {
+    static const bool hasPools = [] {
         try {
             (void)seastar::memory::get_memory_layout();
             return true;
@@ -31,7 +28,13 @@ inline bool isShardLocalMemory(const void* p) noexcept {
             return false;
         }
     }();
-    if (!hasShardPools) {
+    return hasPools;
+}
+
+// Answers true where there are no per-shard pools to protect: off a reactor
+// thread (plain tests, offline tools) and in builds using the system allocator.
+inline bool isShardLocalMemory(const void* p) noexcept {
+    if (!seastar::engine_is_ready() || !hasShardMemoryPools()) {
         return true;
     }
     // Not cached: the pool's extent grows as the shard maps more of its range.

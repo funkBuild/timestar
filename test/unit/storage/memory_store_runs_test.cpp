@@ -426,6 +426,11 @@ TEST(SeriesRunsCrossShardTest, AStoreKeepsNothingOfAnotherShardsMemory) {
         }
         GTEST_SKIP() << "needs at least two shards";
     }
+    if (!timestar::hasShardMemoryPools()) {
+        // A property of the build, not of how the suite was started: Seastar's
+        // debug mode uses the system allocator, so there is no foreign memory.
+        GTEST_SKIP() << "this Seastar build has no per-shard memory pools (system allocator)";
+    }
     constexpr size_t n = InMemorySeries<double>::kMinAdoptedRunPoints * 3;
 
     ForeignWrite write = seastar::smp::submit_to(1, [] { return buildWrite(n); }).get();

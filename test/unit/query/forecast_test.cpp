@@ -38,11 +38,14 @@ protected:
     std::vector<double> generateLinearData(double slope, double intercept, double noise = 0.0) {
         std::vector<double> values;
         std::mt19937 gen(42);
-        std::normal_distribution<> dist(0.0, noise);
+        // A zero stddev is outside normal_distribution's domain (libstdc++ asserts on it
+        // in unoptimized builds), so noise-free data draws nothing.
+        std::normal_distribution<> dist(0.0, noise > 0.0 ? noise : 1.0);
+        auto jitter = [&] { return noise > 0.0 ? dist(gen) : 0.0; };
 
         for (size_t i = 0; i < timestamps_.size(); ++i) {
             double x = static_cast<double>(i);
-            double y = slope * x + intercept + dist(gen);
+            double y = slope * x + intercept + jitter();
             values.push_back(y);
         }
         return values;
@@ -53,11 +56,14 @@ protected:
                                              double noise = 0.0) {
         std::vector<double> values;
         std::mt19937 gen(42);
-        std::normal_distribution<> dist(0.0, noise);
+        // A zero stddev is outside normal_distribution's domain (libstdc++ asserts on it
+        // in unoptimized builds), so noise-free data draws nothing.
+        std::normal_distribution<> dist(0.0, noise > 0.0 ? noise : 1.0);
+        auto jitter = [&] { return noise > 0.0 ? dist(gen) : 0.0; };
 
         for (size_t i = 0; i < timestamps_.size(); ++i) {
             double x = static_cast<double>(i);
-            double y = baseline + amplitude * std::sin(2.0 * M_PI * x / period) + trend * x + dist(gen);
+            double y = baseline + amplitude * std::sin(2.0 * M_PI * x / period) + trend * x + jitter();
             values.push_back(y);
         }
         return values;
@@ -67,10 +73,13 @@ protected:
     std::vector<double> generateConstantData(double value, double noise = 0.0) {
         std::vector<double> values;
         std::mt19937 gen(42);
-        std::normal_distribution<> dist(0.0, noise);
+        // A zero stddev is outside normal_distribution's domain (libstdc++ asserts on it
+        // in unoptimized builds), so noise-free data draws nothing.
+        std::normal_distribution<> dist(0.0, noise > 0.0 ? noise : 1.0);
+        auto jitter = [&] { return noise > 0.0 ? dist(gen) : 0.0; };
 
         for (size_t i = 0; i < timestamps_.size(); ++i) {
-            values.push_back(value + dist(gen));
+            values.push_back(value + jitter());
         }
         return values;
     }

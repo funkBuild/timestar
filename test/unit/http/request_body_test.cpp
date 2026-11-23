@@ -54,7 +54,7 @@ private:
 };
 
 struct StreamedRequest {
-    seastar::http::request req;
+    seastar::http::request req{};
     seastar::input_stream<char> stream;
     size_t reads = 0;
 
@@ -90,7 +90,7 @@ std::string asString(const seastar::sstring& s) {
 }  // namespace
 
 TEST(RequestBodyTest, InjectedBodyIsReturnedWhenThereIsNoStream) {
-    seastar::http::request req;
+    seastar::http::request req{};
     injectedBody(req) = "{\"query\":\"avg:m()\"}";
     seastar::sstring body;
     EXPECT_EQ(readRequestBody(req, 1024, body).get(), BodyStatus::Ok);
@@ -98,19 +98,21 @@ TEST(RequestBodyTest, InjectedBodyIsReturnedWhenThereIsNoStream) {
 }
 
 TEST(RequestBodyTest, InjectedBodyHonoursTheLimit) {
-    seastar::http::request req;
+    seastar::http::request req{};
     injectedBody(req) = std::string(101, 'x');
     seastar::sstring body;
     EXPECT_EQ(readRequestBody(req, 100, body).get(), BodyStatus::TooLarge);
 
-    seastar::http::request atLimit;
+    seastar::http::request atLimit{};
     injectedBody(atLimit) = std::string(100, 'x');
     EXPECT_EQ(readRequestBody(atLimit, 100, body).get(), BodyStatus::Ok);
     EXPECT_EQ(body.size(), 100u);
 }
 
 TEST(RequestBodyTest, NoBodyAtAllIsAnEmptyOk) {
-    seastar::http::request bare;
+    // Value-initialised on purpose: Seastar's request leaves `content_stream`
+    // indeterminate when default-initialised, and this path reads it.
+    seastar::http::request bare{};
     seastar::sstring body = "stale";
     EXPECT_EQ(readRequestBody(bare, 100, body).get(), BodyStatus::Ok);
     EXPECT_TRUE(body.empty());
