@@ -1,0 +1,18 @@
+shape=dec1     n=3000   ns/value=   1.990  bytes/value= 1.272  fnv=b82ae669f6eaed95
+shape=dec3     n=3000   ns/value=   2.246  bytes/value= 2.147  fnv=33a688fba3d615fa
+shape=dec6     n=3000   ns/value=   2.722  bytes/value= 3.397  fnv=09ea49deb838b6fd
+shape=int      n=3000   ns/value=   2.146  bytes/value= 1.773  fnv=02b1ebb84388028c
+shape=full     n=3000   ns/value=  16.938  bytes/value=10.964  fnv=fa9f9089d7b1fd64
+shape=f32      n=3000   ns/value=  16.347  bytes/value= 9.128  fnv=04fb901b11e602c1
+shape=dec2nan  n=3000   ns/value=   1.817  bytes/value= 1.803  fnv=1d27547c91dfa506
+shape=dec2out  n=3000   ns/value=   2.022  bytes/value= 1.890  fnv=a9c31bf6870bff75
+shape=mixed40  n=3000   ns/value=   7.248  bytes/value= 8.863  fnv=4b30d8c07750099f
+shape=dec1     n=10000  ns/value=   1.807  bytes/value= 1.268  fnv=dd201a6dc4a46522
+shape=dec3     n=10000  ns/value=   2.131  bytes/value= 2.143  fnv=7384258f56bfef5f
+shape=dec6     n=10000  ns/value=   2.687  bytes/value= 3.393  fnv=d22d49c38a8eb0f3
+shape=int      n=10000  ns/value=   1.955  bytes/value= 1.768  fnv=788a3bd07b2fc91e
+shape=full     n=10000  ns/value=  15.146  bytes/value=10.997  fnv=bf26001b6df2f7fe
+shape=f32      n=10000  ns/value=  13.562  bytes/value= 9.018  fnv=0ebee9e02a0fe1c4
+shape=dec2nan  n=10000  ns/value=   1.986  bytes/value= 1.796  fnv=54ece3e88ce36091
+shape=dec2out  n=10000  ns/value=   2.225  bytes/value= 1.954  fnv=7b54f39c16eae193
+shape=mixed40  n=10000  ns/value=   6.854  bytes/value= 8.904  fnv=ee614c2307fc26ba

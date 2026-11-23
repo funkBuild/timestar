@@ -1,0 +1,8 @@
+query                                   points first base  first new steady base  steady new  same
+raw one series                           80000       1.39       0.55        0.28        0.29  bit-identical
+avg across hosts, no interval           600000       2.71       3.29        2.10        2.18  bit-identical
+stddev across hosts, no interval        600000       3.17       3.93        3.09        3.07  bit-identical
+max all fields, 1h buckets              100010       5.38       8.94        4.44        4.70  bit-identical
+avg by host, whole range (stats)            10       0.09       0.09        0.02        0.02  bit-identical
+latest by host, 1m buckets              600000      19.17      19.74       16.54       16.50  bit-identical
+count by rack, 5m buckets               120033       4.19       3.96        3.98        3.73  bit-identical

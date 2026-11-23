@@ -1,0 +1,225 @@
+--- a/lib/storage/memory_store.cpp
++++ b/lib/storage/memory_store.cpp
+@@ -138,6 +138,93 @@
+     }
+ }
+ 
++namespace {
++// Small finite corrections can update central moments without reading untouched
++// points. Keep the batch's mean/M2 in extended precision; retain the full scan
++// for special values, removed extrema and ill-conditioned variance updates.
++class OverwriteStatsUpdater {
++    InMemorySeriesStats& stats;
++    long double mean;
++    long double m2;
++    const double originalM2;
++    bool usable;
++
++    void addToSum(double value) {
++        const double y = value - stats.sumCompensation;
++        const double next = stats.sum + y;
++        stats.sumCompensation = (next - stats.sum) - y;
++        stats.sum = next;
++    }
++
++public:
++    explicit OverwriteStatsUpdater(InMemorySeriesStats& current)
++        : stats(current), mean(current.mean), m2(current.m2), originalM2(current.m2),
++          usable(current.valid && current.count > 0 && std::isfinite(current.sum) &&
++                 std::isfinite(current.sumCompensation) && std::isfinite(current.mean) &&
++                 std::isfinite(current.m2) && current.m2 >= 0 &&
++                 std::abs(current.mean) <= 1e6 * std::sqrt(current.m2 / current.count)) {}
++
++    void replace(double oldValue, double newValue, uint64_t timestamp) {
++        if (!usable)
++            return;
++        if (!std::isfinite(oldValue) || !std::isfinite(newValue) ||
++            (oldValue == stats.min && newValue > oldValue) ||
++            (oldValue == stats.max && newValue < oldValue)) {
++            usable = false;
++            return;
++        }
++        if (oldValue != newValue) {
++            const long double delta = static_cast<long double>(newValue) - oldValue;
++            const long double nextMean = mean + delta / stats.count;
++            m2 += delta * ((static_cast<long double>(oldValue) - mean) +
++                           (static_cast<long double>(newValue) - nextMean));
++            mean = nextMean;
++            // Separate terms retain small new values that would round away in
++            // a double-precision (newValue - oldValue) delta.
++            addToSum(-oldValue);
++            addToSum(newValue);
++            stats.min = std::min(stats.min, newValue);
++            stats.max = std::max(stats.max, newValue);
++        }
++        if (timestamp == stats.firstTimestamp)
++            stats.firstValue = newValue;
++        if (timestamp == stats.latestTimestamp)
++            stats.latestValue = newValue;
++    }
++
++    bool finish() {
++        const double updatedM2 = static_cast<double>(m2);
++        if (!usable || m2 < 0 || !std::isfinite(updatedM2) ||
++            !std::isfinite(static_cast<double>(mean)) || !std::isfinite(stats.sum) ||
++            !std::isfinite(stats.sumCompensation))
++            return false;
++        // Check binary scale boundaries, not just this batch's relative change.
++        // Many small decreases can otherwise amplify the old summary's error
++        // without any single batch removing half its M2. Crossing a lower
++        // exponent forces a fresh scan, bounding that amplification across
++        // successive corrections without storing another per-series counter.
++        if (originalM2 > 0 && (updatedM2 == 0 || std::ilogb(updatedM2) < std::ilogb(originalM2)))
++            return false;
++        stats.mean = static_cast<double>(mean);
++        stats.m2 = updatedM2;
++        return true;
++    }
++};
++// Keep extended-precision temporaries out of the common insert function's
++// register allocation and stack frame, including appends and small-series scans.
++[[gnu::noinline]] void overwriteDoubleValues(InMemorySeries<double>& series, const std::vector<double>& incoming,
++                                           const std::vector<size_t>& targets) {
++    OverwriteStatsUpdater updater(series.stats);
++    for (size_t i = 0; i < targets.size(); ++i) {
++        const size_t target = targets[i];
++        updater.replace(series.values[target], incoming[i], series.timestamps[target]);
++        series.values[target] = incoming[i];
++    }
++    if (!updater.finish())
++        series.recomputeStats();
++}
++}  // namespace
++
+ template <class T>
+ void InMemorySeries<T>::insert(TimeStarInsert<T>&& insertRequest) {
+     const auto& srcTimestamps = insertRequest.getTimestamps();
+@@ -152,7 +239,7 @@
+     // same timestamp in the series. Duplicates within a batch keep the last
+     // occurrence (request order); duplicates against existing data keep the
+     // incoming value. Running stats are updated with the surviving new points
+-    // only, and fully recomputed when an existing point was overwritten.
++    // only. Corrections update finite statistics or rebuild when necessary.
+ 
+     if (oldSize == 0) [[unlikely]] {
+         // Series is empty -- take ownership of the entire vectors via move.
+@@ -173,6 +260,13 @@
+             stats.update(values.data(), timestamps.data(), timestamps.size(), true);
+         }
+         return;
++    }
++
++    if constexpr (std::is_same_v<T, double>) {
++        // A deletion invalidates the whole summary. Extending its stale count,
++        // extrema or moments and marking it valid again would corrupt pushdown.
++        if (!stats.valid)
++            recomputeStats();
+     }
+ 
+     if (newSize > SIZE_MAX - oldSize) {
+@@ -193,10 +287,20 @@
+             targets.push_back(static_cast<size_t>(it - timestamps.begin()));
+         }
+         if (targets.size() == newSize) {
+-            for (size_t i = 0; i < newSize; ++i)
+-                values[targets[i]] = std::move(insertRequest.values[i]);
+-            if constexpr (std::is_same_v<T, double>)
+-                recomputeStats();
++            if constexpr (std::is_same_v<T, double>) {
++                // For short series, the fused SIMD rebuild is cheaper than
++                // updating central moments for each correction individually.
++                if (oldSize / newSize < 128) {
++                    for (size_t i = 0; i < newSize; ++i)
++                        values[targets[i]] = insertRequest.values[i];
++                    recomputeStats();
++                } else {
++                    overwriteDoubleValues(*this, insertRequest.values, targets);
++                }
++            } else {
++                for (size_t i = 0; i < newSize; ++i)
++                    values[targets[i]] = std::move(insertRequest.values[i]);
++            }
+             return;
+         }
+     }
+--- a/lib/encoding/alp/alp_ffor.hpp
++++ b/lib/encoding/alp/alp_ffor.hpp
+@@ -33,7 +33,8 @@
+ // Template parameter BW must be one of {1, 2, 4, 8, 16, 32}.
+ // Values per word = 64 / BW.
+ template <unsigned BW>
+-inline void pack_pow2_u64(const uint64_t* values, size_t count, uint64_t base, uint64_t* out) {
++inline void pack_pow2_u64(const uint64_t* values, size_t count, uint64_t base, void* out) {
++    auto* bytes = static_cast<uint8_t*>(out);
+     constexpr unsigned VPW = 64 / BW;  // values per word
+     constexpr uint64_t mask = (1ULL << BW) - 1;
+     const size_t n_words = ffor_packed_words(count, BW);
+@@ -44,7 +45,7 @@
+         for (unsigned j = 0; j < VPW && i < count; ++j, ++i) {
+             word |= ((values[i] - base) & mask) << (j * BW);
+         }
+-        out[w] = word;
++        std::memcpy(bytes + w * sizeof(word), &word, sizeof(word));
+     }
+ }
+ 
+@@ -166,14 +167,18 @@
+     }
+ }
+ 
+-// Unsigned variant for ALP_RD right-parts
+-inline void ffor_pack_u64(const uint64_t* values, size_t count, uint64_t base, uint8_t bw, uint64_t* out) {
++// Unsigned variant for ALP_RD right-parts and timestamp WAL payloads.
++// Output may start at any byte offset. Fixed-size memcpy stores retain the
++// native word layout without imposing uint64_t alignment on byte buffers.
++inline void ffor_pack_u64(const uint64_t* values, size_t count, uint64_t base, uint8_t bw, void* out) {
++    auto* bytes = static_cast<uint8_t*>(out);
+     if (bw == 0 || count == 0)
+         return;
+ 
+     if (bw >= 64) {
+         for (size_t i = 0; i < count; ++i) {
+-            out[i] = values[i] - base;
++            const uint64_t word = values[i] - base;
++            std::memcpy(bytes + i * sizeof(word), &word, sizeof(word));
+         }
+         return;
+     }
+@@ -215,7 +220,7 @@
+         const uint64_t delta = (values[i] - base) & mask;
+         acc |= delta << acc_bits;
+         if (acc_bits + bw >= 64) {
+-            out[w++] = acc;
++            std::memcpy(bytes + w++ * sizeof(acc), &acc, sizeof(acc));
+             const unsigned consumed = 64 - acc_bits;  // in [1, 63]: bw < 64 forces acc_bits > 0 here
+             acc = (consumed < bw) ? (delta >> consumed) : 0;
+             acc_bits = acc_bits + bw - 64;
+@@ -224,7 +229,7 @@
+         }
+     }
+     if (acc_bits > 0) {
+-        out[w] = acc;
++        std::memcpy(bytes + w * sizeof(acc), &acc, sizeof(acc));
+     }
+ }
+ 
+--- a/lib/encoding/integer/integer_encoder_ffor.cpp
++++ b/lib/encoding/integer/integer_encoder_ffor.cpp
+@@ -270,7 +270,7 @@
+         if (packed_words > 0) {
+             size_t packed_bytes = packed_words * sizeof(uint64_t);
+             uint8_t* dest = buf.grow_uninit(packed_bytes);
+-            timestar::alp::ffor_pack_u64(values, count, min_val, best_bw, reinterpret_cast<uint64_t*>(dest));
++            timestar::alp::ffor_pack_u64(values, count, min_val, best_bw, dest);
+         }
+         return;
+     }
+@@ -312,7 +312,7 @@
+     if (packed_words > 0) {
+         size_t packed_bytes = packed_words * sizeof(uint64_t);
+         uint8_t* dest = buf.grow_uninit(packed_bytes);
+-        timestar::alp::ffor_pack_u64(clean.data(), count, min_val, best_bw, reinterpret_cast<uint64_t*>(dest));
++        timestar::alp::ffor_pack_u64(clean.data(), count, min_val, best_bw, dest);
+     }
+ 
+     // 8b. Write exception positions (4 x uint16_t per uint64_t word)

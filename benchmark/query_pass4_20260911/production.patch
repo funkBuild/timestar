@@ -1,0 +1,210 @@
+--- a/lib/query/aggregator.cpp
++++ b/lib/query/aggregator.cpp
+@@ -69,13 +69,15 @@
+ // Outputs merged (timestamps, values, counts). O(KN) time, zero merge overhead.
+ static seastar::future<> foldAlignedRawValues(const std::vector<PartialAggregationResult*>& partials,
+                                               AggregationMethod method, std::vector<uint64_t>& outTs,
+-                                              std::vector<double>& outVals, std::vector<size_t>& outCounts) {
++                                              std::vector<double>& outVals, std::vector<size_t>& outCounts,
++                                              bool compactOutput = false) {
+     const size_t N = partials[0]->sortedTimestamps.size();
+     const size_t K = partials.size();
+ 
+     outTs = std::move(partials[0]->sortedTimestamps);
+     outVals = std::move(partials[0]->sortedValues);
+-    outCounts.assign(N, K);  // Each output point aggregates K input points
++    if (!compactOutput)
++        outCounts.assign(N, K);  // Each output point aggregates K input points
+ 
+     for (size_t s = 1; s < K; ++s) {
+         assert(partials[s]->sortedValues.size() == N);
+@@ -139,7 +141,8 @@
+ template <class Item, class Output, class Init, class Fold, class Finish>
+ static seastar::future<> nWayHeapMerge(const std::vector<PartialAggregationResult*>& partials,
+                                        std::vector<uint64_t>& outTs, std::vector<Output>& outItems, Init init,
+-                                       Fold fold, Finish finish, size_t yieldChunk = kYieldChunkPoints) {
++                                       Fold fold, Finish finish, size_t yieldChunk = kYieldChunkPoints,
++                                       bool replaceRoot = true) {
+     const size_t K = partials.size();
+ 
+     size_t totalSize = 0;
+@@ -155,7 +158,27 @@
+         bool operator>(const HeapEntry& o) const { return ts > o.ts; }
+     };
+ 
+-    std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
++    struct MergeHeap : std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> {
++        void reserve(size_t size) { this->c.reserve(size); }
++
++        // Each input stream is sorted: advancing the smallest entry can only
++        // move it down the heap. Repair once instead of popping then pushing.
++        void replaceTop(HeapEntry value) {
++            auto& entries = this->c;
++            size_t pos = 0;
++            for (size_t child = 1; child < entries.size(); child = pos * 2 + 1) {
++                if (child + 1 < entries.size() && entries[child].ts >= entries[child + 1].ts)
++                    ++child;
++                if (value.ts <= entries[child].ts)
++                    break;
++                entries[pos] = entries[child];
++                pos = child;
++            }
++            entries[pos] = value;
++        }
++    };
++    MergeHeap heap;
++    heap.reserve(K);
+     for (size_t i = 0; i < K; ++i) {
+         if (!partials[i]->sortedTimestamps.empty()) {
+             heap.push({partials[i]->sortedTimestamps[0], i, 0});
+@@ -168,7 +191,8 @@
+     size_t sinceYield = 0;
+     while (!heap.empty()) {
+         auto [ts, pIdx, pos] = heap.top();
+-        heap.pop();
++        if (!replaceRoot)
++            heap.pop();
+ 
+         if (!outTs.empty() && outTs.back() == ts) {
+             fold(*current, *partials[pIdx], pos);
+@@ -181,8 +205,13 @@
+ 
+         const size_t nextPos = pos + 1;
+         if (nextPos < partials[pIdx]->sortedTimestamps.size()) {
+-            heap.push({partials[pIdx]->sortedTimestamps[nextPos], pIdx, nextPos});
+-        }
++            HeapEntry next{partials[pIdx]->sortedTimestamps[nextPos], pIdx, nextPos};
++            if (replaceRoot)
++                heap.replaceTop(next);
++            else
++                heap.push(next);
++        } else if (replaceRoot)
++            heap.pop();
+ 
+         if (++sinceYield >= yieldChunk) {
+             sinceYield = 0;
+@@ -203,8 +232,8 @@
+ // keeps value NaN with count 0, mirroring getValue() on an empty state.
+ static seastar::future<> nWayMergeRawValues(std::vector<PartialAggregationResult*>& partials, AggregationMethod method,
+                                             std::vector<uint64_t>& outTs, std::vector<double>& outVals,
+-                                            std::vector<size_t>& outCounts) {
+-    {
++                                            std::vector<size_t>& outCounts, bool compactOutput = false) {
++    if (!compactOutput) {
+         size_t totalSize = 0;
+         for (const auto* p : partials)
+             totalSize += p->sortedTimestamps.size();
+@@ -236,6 +265,43 @@
+                 return existing;
+         }
+     };
++    // Preserve the previous heap traversal for order-sensitive tie selection.
++    const bool replaceRoot = method != AggregationMethod::FIRST && method != AggregationMethod::LATEST;
++    if (compactOutput) {
++        // Counts are needed only until this timestamp is finalized. In
++        // particular, keep "no contribution" separate from an arithmetic NaN
++        // (such as +Inf + -Inf), which a later value must not overwrite.
++        struct RawAccumulator {
++            double value;
++            size_t count;
++        };
++        return nWayHeapMerge<RawAccumulator>(
++            partials, outTs, outVals,
++            [](const PartialAggregationResult& p, size_t pos) {
++                const double v = p.sortedValues[pos];
++                return RawAccumulator{v, std::isnan(v) ? size_t{0} : size_t{1}};
++            },
++            [foldDuplicate, method](RawAccumulator& item, const PartialAggregationResult& p, size_t pos) {
++                const double v = p.sortedValues[pos];
++                if (std::isnan(v))
++                    return;
++                if (item.count == 0)
++                    item.value = v;
++                else if (method != AggregationMethod::COUNT)
++                    item.value = foldDuplicate(item.value, v);
++                ++item.count;
++            },
++            [method](uint64_t, const RawAccumulator& item) {
++                if (item.count == 0)
++                    return std::numeric_limits<double>::quiet_NaN();
++                if (method == AggregationMethod::COUNT)
++                    return static_cast<double>(item.count);
++                if (method == AggregationMethod::AVG && item.count > 1)
++                    return item.value / item.count;
++                return item.value;
++            },
++            kYieldChunkPoints, replaceRoot);
++    }
+     return nWayHeapMerge<double>(
+         partials, outTs, outVals,
+         [&outCounts](const PartialAggregationResult& p, size_t pos) {
+@@ -257,7 +323,7 @@
+             }
+             outCounts.back()++;
+         },
+-        [](uint64_t, double value) { return value; });
++        [](uint64_t, double value) { return value; }, kYieldChunkPoints, replaceRoot);
+ }
+ 
+ // N-way heap merge finalizing one AggregationState at a time from MIXED partials: raw
+@@ -299,7 +365,7 @@
+             else
+                 return AggregatedPoint{timestamp, state.getValue(method), state.count};
+         },
+-        kYieldChunkStates);
++        kYieldChunkStates, method != AggregationMethod::FIRST && method != AggregationMethod::LATEST);
+ }
+ 
+ seastar::future<> Aggregator::compactAlignedPartialGroups(std::vector<PartialAggregationResult>& partials,
+@@ -725,31 +791,42 @@
+                         std::vector<double> mergedVals;
+                         std::vector<size_t> mergedCounts;
+ 
+-                        if (allTimestampsIdentical(groupPartials) && !co_await anyRawNaN(groupPartials)) {
+-                            co_await foldAlignedRawValues(groupPartials, method, mergedTs, mergedVals, mergedCounts);
++                        const bool aligned =
++                            allTimestampsIdentical(groupPartials) && !co_await anyRawNaN(groupPartials);
++                        if (aligned) {
++                            co_await foldAlignedRawValues(groupPartials, method, mergedTs, mergedVals, mergedCounts,
++                                                          compactOutput);
+                         } else {
+-                            co_await nWayMergeRawValues(groupPartials, method, mergedTs, mergedVals, mergedCounts);
++                            co_await nWayMergeRawValues(groupPartials, method, mergedTs, mergedVals, mergedCounts,
++                                                        compactOutput);
+                         }
+ 
+                         if (!compactOutput)
+                             groupedResult.points.reserve(mergedTs.size());
+-                        for (size_t i = 0; i < mergedTs.size(); ++i) {
++                        // Compact heap output is already final. An aligned raw
++                        // fold has a constant contributor count, needed only
++                        // for AVG normalization or COUNT values.
++                        const bool needsFinalization =
++                            !compactOutput ||
++                            (aligned && (method == AggregationMethod::AVG || method == AggregationMethod::COUNT));
++                        for (size_t i = 0; needsFinalization && i < mergedTs.size(); ++i) {
++                            const size_t count = compactOutput ? groupPartials.size() : mergedCounts[i];
+                             double finalValue = mergedVals[i];
+-                            if (mergedCounts[i] == 0) [[unlikely]] {
++                            if (count == 0) [[unlikely]] {
+                                 // Every contribution at this timestamp was NaN:
+                                 // the value slot already holds NaN and no method
+                                 // computes over an empty set (getValue() on a
+                                 // count-0 state is NaN) — COUNT included.
+                                 finalValue = std::numeric_limits<double>::quiet_NaN();
+-                            } else if (method == AggregationMethod::AVG && mergedCounts[i] > 1) {
+-                                finalValue /= mergedCounts[i];
++                            } else if (method == AggregationMethod::AVG && count > 1) {
++                                finalValue /= count;
+                             } else if (method == AggregationMethod::COUNT) {
+-                                finalValue = static_cast<double>(mergedCounts[i]);
++                                finalValue = static_cast<double>(count);
+                             }
+                             if (compactOutput)
+                                 mergedVals[i] = finalValue;
+                             else
+-                                groupedResult.points.push_back({mergedTs[i], finalValue, mergedCounts[i]});
++                                groupedResult.points.push_back({mergedTs[i], finalValue, count});
+                             if (++sinceYield >= kYieldChunkPoints) {
+                                 sinceYield = 0;
+                                 co_await seastar::coroutine::maybe_yield();

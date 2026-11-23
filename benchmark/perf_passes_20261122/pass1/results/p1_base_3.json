@@ -1,0 +1,110 @@
+{
+ "blocky: avg all hosts, no interval": {
+  "client_ms": 52.13230522349477,
+  "server_ms": 10.6035015,
+  "points": 1000000,
+  "digest": "5bb3bf52757b6245"
+ },
+ "blocky: max all hosts, no interval": {
+  "client_ms": 52.11884994059801,
+  "server_ms": 10.603506,
+  "points": 1000000,
+  "digest": "5bb3bf52757b6245"
+ },
+ "blocky: latest all hosts, no interval": {
+  "client_ms": 65.43640699237585,
+  "server_ms": 16.1257125,
+  "points": 1000000,
+  "digest": "5bb3bf52757b6245"
+ },
+ "blocky: stddev all hosts, no interval": {
+  "client_ms": 39.03782134875655,
+  "server_ms": 22.3553365,
+  "points": 1000000,
+  "digest": "95819b1c3e2891c3"
+ },
+ "blocky: avg by rack, no interval": {
+  "client_ms": 52.52730008214712,
+  "server_ms": 10.6251675,
+  "points": 1000000,
+  "digest": "e9f3e41d188bdf28"
+ },
+ "blocky: avg all hosts, 1h buckets": {
+  "client_ms": 3.3852853812277317,
+  "server_ms": 2.6607205,
+  "points": 16668,
+  "digest": "b68d22d37252e775"
+ },
+ "interleaved: avg all hosts, no interval": {
+  "client_ms": 51.64621118456125,
+  "server_ms": 10.704538,
+  "points": 1000000,
+  "digest": "12ab0ed918f49311"
+ },
+ "interleaved: max all hosts, no interval": {
+  "client_ms": 52.363693714141846,
+  "server_ms": 10.68975,
+  "points": 1000000,
+  "digest": "12ab0ed918f49311"
+ },
+ "interleaved: latest all hosts, no interval": {
+  "client_ms": 54.90844929590821,
+  "server_ms": 13.1780225,
+  "points": 1000000,
+  "digest": "12ab0ed918f49311"
+ },
+ "interleaved: stddev all hosts, no interval": {
+  "client_ms": 39.0965067781508,
+  "server_ms": 22.430298999999998,
+  "points": 1000000,
+  "digest": "95ac18a8f94483ac"
+ },
+ "interleaved: avg by rack, no interval": {
+  "client_ms": 61.66030466556549,
+  "server_ms": 9.629863,
+  "points": 1000000,
+  "digest": "4b234d222ff03d42"
+ },
+ "interleaved: avg all hosts, 1h buckets": {
+  "client_ms": 2.725322265177965,
+  "server_ms": 2.4878175000000002,
+  "points": 1668,
+  "digest": "d8c3d65ea1158c24"
+ },
+ "aligned: avg all hosts, no interval": {
+  "client_ms": 7.257384248077869,
+  "server_ms": 3.9636430000000002,
+  "points": 100000,
+  "digest": "ed95f39221a4956d"
+ },
+ "aligned: max all hosts, no interval": {
+  "client_ms": 7.078801281750202,
+  "server_ms": 3.8530735,
+  "points": 100000,
+  "digest": "7bf401bce2bede20"
+ },
+ "aligned: latest all hosts, no interval": {
+  "client_ms": 6.945919245481491,
+  "server_ms": 3.5622610000000003,
+  "points": 100000,
+  "digest": "13bd43d46ee3c28e"
+ },
+ "aligned: stddev all hosts, no interval": {
+  "client_ms": 18.580281641334295,
+  "server_ms": 14.662730499999999,
+  "points": 100000,
+  "digest": "6ff6694aafc57ff9"
+ },
+ "aligned: avg by rack, no interval": {
+  "client_ms": 11.299978476017714,
+  "server_ms": 4.372980500000001,
+  "points": 200000,
+  "digest": "9afe827ad6e8b5db"
+ },
+ "aligned: avg all hosts, 1h buckets": {
+  "client_ms": 2.8483960777521133,
+  "server_ms": 2.578449,
+  "points": 1668,
+  "digest": "9d1665a2ff279390"
+ }
+}

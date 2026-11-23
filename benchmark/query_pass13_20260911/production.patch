@@ -1,0 +1,339 @@
+--- a/lib/encoding/integer/integer_encoder_ffor.cpp
++++ b/lib/encoding/integer/integer_encoder_ffor.cpp
+@@ -337,7 +337,7 @@
+ // it here spills loop invariants on the measured GCC build after removing the
+ // aligned scratch copy; an out-of-line call keeps them in registers.
+ [[gnu::noinline]] void unpackTimestampWords(const uint8_t* packed, size_t count, uint64_t base, uint8_t bw,
+-                                           uint64_t* out) {
++                                            uint64_t* out) {
+     timestar::alp::ffor_unpack_u64(packed, count, base, bw, out);
+ }
+ 
+@@ -348,6 +348,7 @@
+     size_t count;
+     bool zeroDelta;
+ };
++template <bool materialize = true>
+ DecodedBlock decodeBlockInto(Slice& s, uint64_t* out) {
+     auto hdr = readBlockHeader(s);
+ 
+@@ -377,7 +378,8 @@
+     // FFOR unpack
+     if (hdr.bw == 0) {
+         // All values are base
+-        std::fill_n(out, hdr.block_count, hdr.base);
++        if constexpr (materialize)
++            std::fill_n(out, hdr.block_count, hdr.base);
+     } else {
+         // Direct pointer access to packed data - skip per-word bounds checks and copy.
+         const size_t packed_words = timestar::alp::ffor_packed_words(hdr.block_count, hdr.bw);
+@@ -393,7 +395,8 @@
+ 
+         // The unpacker reads byte-aligned words directly; no aligned packed
+         // scratch buffer or extra payload pass is needed.
+-        unpackTimestampWords(packed_ptr, hdr.block_count, hdr.base, hdr.bw, out);
++        if constexpr (materialize)
++            unpackTimestampWords(packed_ptr, hdr.block_count, hdr.base, hdr.bw, out);
+     }
+ 
+     // Patch exceptions
+@@ -435,9 +438,11 @@
+                     throw std::runtime_error("Corrupt FFOR block: exception position (" + std::to_string(pos) +
+                                              ") >= block_count (" + std::to_string(hdr.block_count) + ")");
+                 }
+-                uint64_t val;
+-                std::memcpy(&val, val_ptr + (base_idx + j) * sizeof(uint64_t), sizeof(uint64_t));
+-                out[pos] = val;
++                if constexpr (materialize) {
++                    uint64_t val;
++                    std::memcpy(&val, val_ptr + (base_idx + j) * sizeof(uint64_t), sizeof(uint64_t));
++                    out[pos] = val;
++                }
+             }
+         }
+     }
+@@ -464,9 +469,9 @@
+ // headers let us count later survivors without decoding or consuming the slice.
+ // Stop at any nonconstant, invalid or wrapping group; normal decoding retains
+ // responsibility for validation and cursor movement.
+-[[gnu::noinline]] void reserveFilteredAppend(std::vector<uint64_t>& out, size_t count, uint64_t last,
+-                                             uint64_t step, const Slice& following, size_t remaining,
+-                                             uint64_t minTime, uint64_t maxTime) {
++[[gnu::noinline]] void reserveFilteredAppend(std::vector<uint64_t>& out, size_t count, uint64_t last, uint64_t step,
++                                             const Slice& following, size_t remaining, uint64_t minTime,
++                                             uint64_t maxTime) {
+     if (count <= out.capacity() - out.size())
+         return;
+     size_t planned = count;
+@@ -517,9 +522,8 @@
+ // Closed-form filtering is used only when the run cannot wrap. Decreasing or
+ // wrapped runs retain the scalar filter order (below-min is checked first).
+ [[gnu::noinline]] bool appendFilteredProgression(std::vector<uint64_t>& out, uint64_t& last, uint64_t step,
+-                                                size_t count, uint64_t minTime, uint64_t maxTime,
+-                                                size_t& skipped, size_t& added,
+-                                                const Slice& following, size_t remaining) {
++                                                 size_t count, uint64_t minTime, uint64_t maxTime, size_t& skipped,
++                                                 size_t& added, const Slice& following, size_t remaining) {
+     if (count == 0)
+         return false;
+     uint64_t span;
+@@ -650,7 +654,7 @@
+         // val_idx is always >= 2 here (first two values handled above).
+         for (; zz_idx < block_count && val_idx < sz; ++zz_idx, ++val_idx) {
+             const int64_t D = std::bit_cast<int64_t>((values[val_idx] - values[val_idx - 1]) -
+-                                                    (values[val_idx - 1] - values[val_idx - 2]));
++                                                     (values[val_idx - 1] - values[val_idx - 2]));
+             uint64_t zz = ZigZag::zigzagEncode(D);
+             zigzag[zz_idx] = zz;
+             if (zz < block_min)
+@@ -668,6 +672,105 @@
+     }
+ }
+ 
++// Only the final state is needed for skipped deltas. Unsigned weighted sums
++// replace the serial double-prefix recurrence and allow SIMD reduction. Every
++// operation is modulo 2^64, including negative deltas and their products.
++[[gnu::noinline]] void skipIntegerDeltas(const uint64_t* deltas, size_t count, uint64_t& last, uint64_t& delta) {
++    uint64_t sum = 0, weighted = 0;
++    for (size_t i = 0; i < count; ++i) {
++        const uint64_t dd = ZigZag::zigzagDecode(deltas[i]);
++        sum += dd;
++        weighted += dd * (count - i);
++    }
++    last += delta * count + weighted;
++    delta += sum;
++}
++
++// Select integer values by index while reconstructing the delta state. Prefix
++// values never enter a heap buffer; suffix groups need only structural validation.
++// Keep the conversion loop separate so ZigZag and int-to-double conversion can
++// vectorize independently of the delta recurrence.
++template <class T>
++size_t decodeSignedRange(Slice& encoded, unsigned int valueCount, size_t skip, size_t length, std::vector<T>& values) {
++    const size_t first = std::min(skip, static_cast<size_t>(valueCount));
++    const size_t count = std::min(length, static_cast<size_t>(valueCount) - first);
++    const size_t end = first + count;
++    const size_t before = values.size();
++    const size_t payloadMax = encoded.remaining() * (IntegerEncoderFFOR::kBlockSize / 16);
++    const size_t wanted = std::min(count, payloadMax);
++    if (wanted > values.max_size() - before)
++        throw std::length_error("FFOR decoded integers exceed vector max_size");
++    if (wanted > values.capacity() - before) {
++        const size_t capacity = values.capacity();
++        const size_t grown = capacity + std::min(capacity / 2, values.max_size() - capacity);
++        values.reserve(std::max(before + wanted, grown));
++    }
++
++    alignas(64) uint64_t blockBuf[IntegerEncoderFFOR::kBlockSize];
++    uint64_t last = 0, delta = 0;
++    size_t consumed = 0;
++    while (consumed < valueCount && encoded.remaining() >= 16) {
++        // Preserve validation and cursor movement even when no values survive.
++        if (count == 0 || consumed >= end) {
++            consumed += decodeBlockInto<false>(encoded, nullptr).count;
++            continue;
++        }
++        const auto block = decodeBlockInto(encoded, blockBuf);
++        const size_t n = std::min(block.count, end - consumed);
++        const size_t begin = first > consumed ? std::min(n, first - consumed) : 0;
++        if (block.zeroDelta) {
++            // A symbolic first group means both raw value and first delta are
++            // zero. A zero group at logical index one sets the first delta to zero.
++            if (consumed < 2 && n) {
++                if (consumed == 0)
++                    last = 0;
++                delta = 0;
++            }
++            const uint64_t firstValue = last + delta * (begin + 1);
++            const size_t start = values.size();
++            values.resize(start + n - begin);
++            T* dest = values.data() + start;
++            uint64_t value = firstValue;
++            for (size_t i = begin; i < n; ++i) {
++                dest[i - begin] = static_cast<T>(ZigZag::zigzagDecode(value));
++                value += delta;
++            }
++            last += delta * n;
++        } else {
++            size_t i = 0;
++            if (consumed == 0 && i < n) {
++                last = blockBuf[i++];
++            }
++            if (consumed + i == 1 && i < n) {
++                delta = ZigZag::zigzagDecode(blockBuf[i]);
++                last += delta;
++                blockBuf[i++] = last;
++            }
++            if (begin > i && begin - i >= 16) {
++                skipIntegerDeltas(blockBuf + i, begin - i, last, delta);
++                i = begin;
++            } else {
++                for (; i < begin; ++i) {
++                    delta += ZigZag::zigzagDecode(blockBuf[i]);
++                    last += delta;
++                }
++            }
++            for (; i < n; ++i) {
++                delta += ZigZag::zigzagDecode(blockBuf[i]);
++                last += delta;
++                blockBuf[i] = last;
++            }
++            const size_t start = values.size();
++            values.resize(start + n - begin);
++            T* dest = values.data() + start;
++            for (size_t j = begin; j < n; ++j)
++                dest[j - begin] = static_cast<T>(ZigZag::zigzagDecode(blockBuf[j]));
++        }
++        consumed += block.count;
++    }
++    return values.size() - before;
++}
++
+ }  // anonymous namespace
+ 
+ // =============================================================================
+@@ -688,6 +791,16 @@
+     const size_t startPos = target.size();
+     encodeImpl(values, target);
+     return target.size() - startPos;
++}
++
++size_t IntegerEncoderFFOR::decodeSigned(Slice& encoded, unsigned int valueCount, size_t skip, size_t length,
++                                        std::vector<int64_t>& values) {
++    return decodeSignedRange(encoded, valueCount, skip, length, values);
++}
++
++size_t IntegerEncoderFFOR::decodeSigned(Slice& encoded, unsigned int valueCount, size_t skip, size_t length,
++                                        std::vector<double>& values) {
++    return decodeSignedRange(encoded, valueCount, skip, length, values);
+ }
+ 
+ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned int timestampSize,
+@@ -833,9 +946,8 @@
+                 delta = 0;
+             }
+             global_idx = std::min(size_t{2}, global_idx + emit_count);
+-            if (appendFilteredProgression(values, last_decoded, delta, emit_count, minTime, maxTime,
+-                                          nSkipped, nAdded, encoded,
+-                                          total_decoded < timestampSize ? timestampSize - total_decoded : 0))
++            if (appendFilteredProgression(values, last_decoded, delta, emit_count, minTime, maxTime, nSkipped, nAdded,
++                                          encoded, total_decoded < timestampSize ? timestampSize - total_decoded : 0))
+                 return {nSkipped, nAdded};
+             continue;
+         }
+--- a/lib/encoding/integer/integer_encoder_ffor.hpp
++++ b/lib/encoding/integer/integer_encoder_ffor.hpp
+@@ -39,4 +39,14 @@
+     // (endTime inclusive) so results do not depend on data placement.
+     static std::pair<size_t, size_t> decode(Slice& encoded, unsigned int timestampSize, std::vector<uint64_t>& values,
+                                             uint64_t startTime = 0, uint64_t maxTime = UINT64_MAX);
++
++    // Decode signed integer values stored as ZigZag integers inside the FFOR
++    // stream. Append only the index range [skip, skip + length), clamped to
++    // valueCount, and return the number appended. All groups through valueCount
++    // are validated/consumed, including groups after the selected range. The
++    // double overload applies the same int64_t-to-double conversion as queries.
++    static size_t decodeSigned(Slice& encoded, unsigned int valueCount, size_t skip, size_t length,
++                               std::vector<int64_t>& values);
++    static size_t decodeSigned(Slice& encoded, unsigned int valueCount, size_t skip, size_t length,
++                               std::vector<double>& values);
+ };
+--- a/lib/storage/tsm.cpp
++++ b/lib/storage/tsm.cpp
+@@ -187,22 +187,10 @@
+     if (!hdr || hdr->nTimestamps == 0)
+         return 0;
+ 
+-    // Decode zigzag-encoded integers into scratch, then convert to double for the aggregator.
+-    static thread_local std::vector<uint64_t> zigzagScratch;
+-    zigzagScratch.clear();
+-    zigzagScratch.reserve(hdr->nSkipped + hdr->nTimestamps);
++    valScratch.clear();
+     Slice valuesSlice(data + hdr->valueOffset, hdr->valueByteSize);
+-    IntegerEncoder::decode(valuesSlice, hdr->nSkipped + hdr->nTimestamps, zigzagScratch);
+-
+-    valScratch.clear();
+-    valScratch.reserve(hdr->nTimestamps);
+-    // The value decoder decodes whole FFOR groups, so zigzagScratch may hold up
+-    // to a full group beyond nSkipped+nTimestamps; bound the loop so values stay
+-    // in sync with the decoded timestamps.
+-    const size_t valueEnd = std::min(hdr->nSkipped + hdr->nTimestamps, zigzagScratch.size());
+-    for (size_t i = hdr->nSkipped; i < valueEnd; ++i) {
+-        valScratch.push_back(static_cast<double>(ZigZag::zigzagDecode(zigzagScratch[i])));
+-    }
++    IntegerEncoder::decodeSigned(valuesSlice, hdr->nSkipped + hdr->nTimestamps, hdr->nSkipped, hdr->nTimestamps,
++                                 valScratch);
+ 
+     aggregator.addPoints(tsScratch, valScratch);
+     return tsScratch.size();
+@@ -1244,8 +1232,7 @@
+                                      " but reader expects type " + std::to_string(static_cast<uint8_t>(expectedType)));
+         }
+ 
+-        auto blockResults = std::make_unique<TSMBlock<T>>(
+-            startTime == 0 && endTime == UINT64_MAX ? timestampSize : 0);
++        auto blockResults = std::make_unique<TSMBlock<T>>(startTime == 0 && endTime == UINT64_MAX ? timestampSize : 0);
+         auto timestampsSlice = blockSlice.getSlice(timestampBytes);
+         std::tie(ctx.nSkipped, ctx.nTimestamps) =
+             IntegerEncoder::decode(timestampsSlice, timestampSize, blockResults->timestamps, startTime, endTime);
+@@ -1272,15 +1259,7 @@
+             }
+         } else if constexpr (std::is_same_v<T, int64_t>) {
+             auto valuesSlice = blockSlice.getSlice(valueByteSize);
+-            // Coroutine-local buffer — thread_local is unsafe in coroutines because
+-            // another coroutine on the same thread could clear it during a co_await.
+-            std::vector<uint64_t> rawUintScratch;
+-            IntegerEncoder::decode(valuesSlice, timestampSize, rawUintScratch);
+-            blockResults->values.reserve(nTimestamps);
+-            size_t end = std::min(nSkipped + nTimestamps, rawUintScratch.size());
+-            for (size_t i = nSkipped; i < end; ++i) {
+-                blockResults->values.push_back(ZigZag::zigzagDecode(rawUintScratch[i]));
+-            }
++            IntegerEncoder::decodeSigned(valuesSlice, timestampSize, nSkipped, nTimestamps, blockResults->values);
+         }
+ 
+         // Same count contract as decodeBlockFlat(): these per-block decoders build a
+@@ -1464,8 +1443,7 @@
+     }
+ 
+     // Decode timestamps with time-range filtering
+-    auto blockResults = std::make_unique<TSMBlock<T>>(
+-            startTime == 0 && endTime == UINT64_MAX ? timestampSize : 0);
++    auto blockResults = std::make_unique<TSMBlock<T>>(startTime == 0 && endTime == UINT64_MAX ? timestampSize : 0);
+     auto timestampsSlice = blockSlice.getSlice(timestampBytes);
+     auto [nSkipped, nTimestamps] =
+         IntegerEncoder::decode(timestampsSlice, timestampSize, blockResults->timestamps, startTime, endTime);
+@@ -1495,15 +1473,7 @@
+         }
+     } else if constexpr (std::is_same_v<T, int64_t>) {
+         auto valuesSlice = blockSlice.getSlice(valueByteSize);
+-        // Coroutine-local buffer — thread_local is unsafe in coroutines because
+-        // another coroutine on the same thread could clear it during a co_await.
+-        std::vector<uint64_t> rawUintScratch;
+-        IntegerEncoder::decode(valuesSlice, timestampSize, rawUintScratch);
+-        blockResults->values.reserve(nTimestamps);
+-        size_t end = std::min(nSkipped + nTimestamps, rawUintScratch.size());
+-        for (size_t i = nSkipped; i < end; ++i) {
+-            blockResults->values.push_back(ZigZag::zigzagDecode(rawUintScratch[i]));
+-        }
++        IntegerEncoder::decodeSigned(valuesSlice, timestampSize, nSkipped, nTimestamps, blockResults->values);
+     }
+ 
+     // Same count contract as decodeBlockFlat(): these per-block decoders build a
+@@ -1574,15 +1544,7 @@
+         }
+     } else if constexpr (std::is_same_v<T, int64_t>) {
+         auto valuesSlice = blockSlice.getSlice(valueByteSize);
+-        // Coroutine-local buffer — thread_local is unsafe in coroutines because
+-        // another coroutine on the same thread could clear it during a co_await.
+-        std::vector<uint64_t> rawUintScratch;
+-        IntegerEncoder::decode(valuesSlice, timestampSize, rawUintScratch);
+-        size_t end = std::min(nSkipped + nTimestamps, rawUintScratch.size());
+-        for (size_t i = nSkipped; i < end; ++i) {
+-            outValues.push_back(ZigZag::zigzagDecode(rawUintScratch[i]));
+-        }
+-        produced = (end > nSkipped) ? (end - nSkipped) : 0;
++        produced = IntegerEncoder::decodeSigned(valuesSlice, timestampSize, nSkipped, nTimestamps, outValues);
+     }
+ 
+     // ---- THE COUNT CONTRACT, enforced once for every value type ----

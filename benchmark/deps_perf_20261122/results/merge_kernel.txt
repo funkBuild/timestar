@@ -1,0 +1,22 @@
+# median ms over 3 alternating rounds, 10 streams x 100k points; mb_g14 = original source built by GCC 14, mb_g15 = original source built by GCC 15, mb_final = restructured merge built by GCC 15
+layout       method               mb_g14      mb_g15    mb_final   same-result
+blocky       avg                   7.579       7.448       7.405   yes
+blocky       latest                7.657       7.539       7.572   yes
+blocky       stddev(raw)          11.913      10.926      10.890   yes
+blocky       stddev(states)       14.663      14.068      13.761   yes
+short        avg                   3.797       4.146       4.110   yes
+short        latest                3.968       4.003       4.067   yes
+short        stddev(raw)           9.170       8.450       8.548   yes
+short        stddev(states)       22.532      21.796      21.838   yes
+pairs        avg                   6.300       7.235       4.880   yes
+pairs        latest                7.419       9.169       7.722   yes
+pairs        stddev(raw)          19.503      18.721      18.767   yes
+pairs        stddev(states)       25.687      23.953      22.022   yes
+interleaved  avg                   6.790       8.627       5.258   yes
+interleaved  latest                9.017      11.087       9.424   yes
+interleaved  stddev(raw)          19.365      18.670      18.245   yes
+interleaved  stddev(states)       26.278      25.587      22.949   yes
+halfaligned  avg                   5.700       8.097       4.676   yes
+halfaligned  latest                7.755      10.529       8.575   yes
+halfaligned  stddev(raw)          11.115      11.271       9.569   yes
+halfaligned  stddev(states)       20.201      19.394      16.197   yes

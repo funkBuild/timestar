@@ -1,0 +1,68 @@
+[
+  {
+    "format": "json",
+    "rep": 1,
+    "metrics": [
+      "Requests:       100 OK, 0 HTTP errors, 0 connection failures",
+      "Wall time:      2.904 s",
+      "Including setup/teardown: 3.622 s",
+      "Throughput:     3443382 pts/sec",
+      "batch latency           min=  107.58  avg=  227.07  med=  206.89  p95=  364.76  p99=  435.05  max=  443.66  (ms, n=100)"
+    ]
+  },
+  {
+    "format": "protobuf",
+    "rep": 1,
+    "metrics": [
+      "Requests:       100 OK, 0 HTTP errors, 0 connection failures",
+      "Wall time:      2.857 s",
+      "Including setup/teardown: 2.913 s",
+      "Throughput:     3499599 pts/sec",
+      "batch latency           min=   77.37  avg=  223.80  med=  213.22  p95=  348.34  p99=  385.72  max=  418.95  (ms, n=100)"
+    ]
+  },
+  {
+    "format": "protobuf",
+    "rep": 2,
+    "metrics": [
+      "Requests:       100 OK, 0 HTTP errors, 0 connection failures",
+      "Wall time:      2.848 s",
+      "Including setup/teardown: 2.903 s",
+      "Throughput:     3511236 pts/sec",
+      "batch latency           min=   56.39  avg=  225.93  med=  222.66  p95=  354.30  p99=  402.76  max=  441.58  (ms, n=100)"
+    ]
+  },
+  {
+    "format": "json",
+    "rep": 2,
+    "metrics": [
+      "Requests:       100 OK, 0 HTTP errors, 0 connection failures",
+      "Wall time:      2.766 s",
+      "Including setup/teardown: 3.481 s",
+      "Throughput:     3615038 pts/sec",
+      "batch latency           min=  108.75  avg=  217.94  med=  208.03  p95=  350.34  p99=  438.87  max=  439.16  (ms, n=100)"
+    ]
+  },
+  {
+    "format": "json",
+    "rep": 3,
+    "metrics": [
+      "Requests:       100 OK, 0 HTTP errors, 0 connection failures",
+      "Wall time:      2.684 s",
+      "Including setup/teardown: 3.388 s",
+      "Throughput:     3725600 pts/sec",
+      "batch latency           min=   93.41  avg=  209.03  med=  199.87  p95=  325.11  p99=  373.70  max=  384.37  (ms, n=100)"
+    ]
+  },
+  {
+    "format": "protobuf",
+    "rep": 3,
+    "metrics": [
+      "Requests:       100 OK, 0 HTTP errors, 0 connection failures",
+      "Wall time:      3.136 s",
+      "Including setup/teardown: 3.191 s",
+      "Throughput:     3188351 pts/sec",
+      "batch latency           min=  102.06  avg=  247.78  med=  241.25  p95=  369.61  p99=  404.90  max=  419.07  (ms, n=100)"
+    ]
+  }
+]

@@ -1,0 +1,14 @@
+[----------] Global test environment tear-down
+[==========] 3916 tests from 341 test suites ran. (19244 ms total)
+[  PASSED  ] 3906 tests.
+[  SKIPPED ] 10 tests, listed below:
+[  SKIPPED ] IndexWalCrc32cTest.SoftwareFallbackUsesCrc32cPolynomial
+[  SKIPPED ] HttpWriteHandlerAtomicityBehavioralTest.ShardFailureAccountingIsConsistent
+[  SKIPPED ] EngineMetadataTest.NoShardedRefNoCrash
+[  SKIPPED ] EngineMetadataTest.NonZeroShardInsertIndexesMetadataWithRef
+[  SKIPPED ] EngineMetadataTest.NonZeroShardBoolAndStringInsertIndexMetadata
+[  SKIPPED ] EngineMetadataTest.IdempotentMetadataIndexing
+[  SKIPPED ] EngineShardRoutingTest.CanonicalRoutingPlacesDataAndMetadataOnOwningShardOnly
+[  SKIPPED ] EngineShardRoutingTest.ExecuteLocalQueryUsesLocalIndexOnly
+[  SKIPPED ] EngineShardRoutingTest.DeleteByPatternUsesLocalIndexOnly
+[  SKIPPED ] EngineShardRoutingTest.HttpWriteHandlerRoutesByCanonicalSeriesKey

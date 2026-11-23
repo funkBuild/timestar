@@ -1,0 +1,132 @@
+--- a/lib/storage/memory_store.cpp
++++ b/lib/storage/memory_store.cpp
+@@ -138,6 +138,74 @@
+     }
+ }
+ 
++namespace {
++// Small finite corrections can update central moments without reading untouched
++// points. Keep the batch's mean/M2 in extended precision; retain the full scan
++// for special values, removed extrema and ill-conditioned variance updates.
++class OverwriteStatsUpdater {
++    InMemorySeriesStats& stats;
++    long double mean;
++    long double m2;
++    const double originalM2;
++    bool usable;
++
++    void addToSum(double value) {
++        const double y = value - stats.sumCompensation;
++        const double next = stats.sum + y;
++        stats.sumCompensation = (next - stats.sum) - y;
++        stats.sum = next;
++    }
++
++public:
++    explicit OverwriteStatsUpdater(InMemorySeriesStats& current)
++        : stats(current), mean(current.mean), m2(current.m2), originalM2(current.m2),
++          usable(current.valid && current.count > 0 && std::isfinite(current.sum) &&
++                 std::isfinite(current.sumCompensation) && std::isfinite(current.mean) &&
++                 std::isfinite(current.m2) && current.m2 >= 0 &&
++                 std::abs(current.mean) <= 1e6 * std::sqrt(current.m2 / current.count)) {}
++
++    void replace(double oldValue, double newValue, uint64_t timestamp) {
++        if (!usable)
++            return;
++        if (!std::isfinite(oldValue) || !std::isfinite(newValue) ||
++            (oldValue == stats.min && newValue > oldValue) ||
++            (oldValue == stats.max && newValue < oldValue)) {
++            usable = false;
++            return;
++        }
++        if (oldValue != newValue) {
++            const long double delta = static_cast<long double>(newValue) - oldValue;
++            const long double nextMean = mean + delta / stats.count;
++            m2 += delta * ((static_cast<long double>(oldValue) - mean) +
++                           (static_cast<long double>(newValue) - nextMean));
++            mean = nextMean;
++            // Separate terms retain small new values that would round away in
++            // a double-precision (newValue - oldValue) delta.
++            addToSum(-oldValue);
++            addToSum(newValue);
++            stats.min = std::min(stats.min, newValue);
++            stats.max = std::max(stats.max, newValue);
++        }
++        if (timestamp == stats.firstTimestamp)
++            stats.firstValue = newValue;
++        if (timestamp == stats.latestTimestamp)
++            stats.latestValue = newValue;
++    }
++
++    bool finish() {
++        // Removing a large share of the variance magnifies the old summary's
++        // rounding error. Recompute instead of subtracting nearly equal M2s.
++        if (!usable || m2 < originalM2 * 0.5L || !std::isfinite(static_cast<double>(m2)) ||
++            !std::isfinite(static_cast<double>(mean)) || !std::isfinite(stats.sum) ||
++            !std::isfinite(stats.sumCompensation))
++            return false;
++        stats.mean = static_cast<double>(mean);
++        stats.m2 = static_cast<double>(m2);
++        return true;
++    }
++};
++}  // namespace
++
+ template <class T>
+ void InMemorySeries<T>::insert(TimeStarInsert<T>&& insertRequest) {
+     const auto& srcTimestamps = insertRequest.getTimestamps();
+@@ -152,7 +220,7 @@
+     // same timestamp in the series. Duplicates within a batch keep the last
+     // occurrence (request order); duplicates against existing data keep the
+     // incoming value. Running stats are updated with the surviving new points
+-    // only, and fully recomputed when an existing point was overwritten.
++    // only. Corrections update finite statistics or rebuild when necessary.
+ 
+     if (oldSize == 0) [[unlikely]] {
+         // Series is empty -- take ownership of the entire vectors via move.
+@@ -173,6 +241,13 @@
+             stats.update(values.data(), timestamps.data(), timestamps.size(), true);
+         }
+         return;
++    }
++
++    if constexpr (std::is_same_v<T, double>) {
++        // A deletion invalidates the whole summary. Extending its stale count,
++        // extrema or moments and marking it valid again would corrupt pushdown.
++        if (!stats.valid)
++            recomputeStats();
+     }
+ 
+     if (newSize > SIZE_MAX - oldSize) {
+@@ -193,10 +268,27 @@
+             targets.push_back(static_cast<size_t>(it - timestamps.begin()));
+         }
+         if (targets.size() == newSize) {
+-            for (size_t i = 0; i < newSize; ++i)
+-                values[targets[i]] = std::move(insertRequest.values[i]);
+-            if constexpr (std::is_same_v<T, double>)
+-                recomputeStats();
++            if constexpr (std::is_same_v<T, double>) {
++                // For short series, the fused SIMD rebuild is cheaper than
++                // updating central moments for each correction individually.
++                if (oldSize / newSize < 128) {
++                    for (size_t i = 0; i < newSize; ++i)
++                        values[targets[i]] = insertRequest.values[i];
++                    recomputeStats();
++                } else {
++                    OverwriteStatsUpdater updater(stats);
++                    for (size_t i = 0; i < newSize; ++i) {
++                        const size_t target = targets[i];
++                        updater.replace(values[target], insertRequest.values[i], timestamps[target]);
++                        values[target] = insertRequest.values[i];
++                    }
++                    if (!updater.finish())
++                        recomputeStats();
++                }
++            } else {
++                for (size_t i = 0; i < newSize; ++i)
++                    values[targets[i]] = std::move(insertRequest.values[i]);
++            }
+             return;
+         }
+     }

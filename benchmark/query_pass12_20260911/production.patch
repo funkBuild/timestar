@@ -1,0 +1,298 @@
+--- a/lib/encoding/integer/integer_encoder_ffor.cpp
++++ b/lib/encoding/integer/integer_encoder_ffor.cpp
+@@ -460,12 +460,66 @@
+     }
+ }
+ 
++// Reserve only when surviving points need space. Consecutive zero-delta
++// headers let us count later survivors without decoding or consuming the slice.
++// Stop at any nonconstant, invalid or wrapping group; normal decoding retains
++// responsibility for validation and cursor movement.
++[[gnu::noinline]] void reserveFilteredAppend(std::vector<uint64_t>& out, size_t count, uint64_t last,
++                                             uint64_t step, const Slice& following, size_t remaining,
++                                             uint64_t minTime, uint64_t maxTime) {
++    if (count <= out.capacity() - out.size())
++        return;
++    size_t planned = count;
++    size_t offset = following.offset;
++    while (remaining && following.length_ - offset >= 16) {
++        uint64_t word, base;
++        std::memcpy(&word, following.data + offset, 8);
++        std::memcpy(&base, following.data + offset + 8, 8);
++        const size_t stored = word & 0x7FF;
++        constexpr uint64_t nonconstant = (uint64_t{0x7F} << 11) | (uint64_t{0x3FF} << 18);
++        if ((word & nonconstant) || base != 0 || stored > IntegerEncoderFFOR::kBlockSize)
++            break;
++        const size_t n = std::min(stored, remaining);
++        offset += 16;
++        remaining -= n;
++        if (n == 0)
++            continue;
++        uint64_t span;
++        if (__builtin_mul_overflow(step, static_cast<uint64_t>(n), &span) || span > UINT64_MAX - last)
++            break;
++        const uint64_t first = last + step;
++        last += span;
++        if (last < minTime)
++            continue;
++        size_t skip = 0;
++        if (first < minTime) {
++            const uint64_t distance = minTime - first;
++            skip = distance / step + (distance % step != 0);
++        }
++        const uint64_t begin = first + step * skip;
++        if (begin > maxTime)
++            break;
++        size_t take = n - skip;
++        if (last > maxTime)
++            take = (maxTime - begin) / step + 1;
++        planned += take;
++        if (skip + take < n)
++            break;
++    }
++    if (planned > out.max_size() - out.size())
++        throw std::length_error("FFOR decoded timestamps exceed vector max_size");
++    const size_t capacity = out.capacity();
++    const size_t grown = capacity + std::min(capacity / 2, out.max_size() - capacity);
++    out.reserve(std::max(out.size() + planned, grown));
++}
++
+ // Return true at the same first value above maxTime as the scalar decoder.
+ // Closed-form filtering is used only when the run cannot wrap. Decreasing or
+ // wrapped runs retain the scalar filter order (below-min is checked first).
+ [[gnu::noinline]] bool appendFilteredProgression(std::vector<uint64_t>& out, uint64_t& last, uint64_t step,
+                                                 size_t count, uint64_t minTime, uint64_t maxTime,
+-                                                size_t& skipped, size_t& added) {
++                                                size_t& skipped, size_t& added,
++                                                const Slice& following, size_t remaining) {
+     if (count == 0)
+         return false;
+     uint64_t span;
+@@ -503,6 +557,8 @@
+     size_t take = count - skip;
+     if (end > maxTime)
+         take = (maxTime - begin) / step + 1;
++    if (take > out.capacity() - out.size())
++        reserveFilteredAppend(out, take, end, step, following, skip + take == count ? remaining : 0, minTime, maxTime);
+     appendProgression(out, begin, step, take);
+     added += take;
+     last = end;
+@@ -649,35 +705,7 @@
+ 
+     size_t nSkipped = 0, nAdded = 0;
+ 
+-    // Optimized memory allocation.
+-    //
+-    // `timestampSize` is an UPPER BOUND supplied by the caller, not the real
+-    // count. On the protobuf ingest path it is derived from the payload byte
+-    // length (bytes * 64, the encoder's densest possible ratio), so a small
+-    // highly-compressible payload claims a bound far above what it decodes to --
+-    // a 16-byte constant-delta block bounds at 1024 values but yields 20. The
+-    // vector is then retained at that inflated capacity, so the waste is not
+-    // transient: it is per-series resident memory at high cardinality.
+-    //
+-    // Reserve a bounded prefix and let the vector grow into what actually
+-    // decodes. Growth is amortised and the common case (bound == real count)
+-    // still takes a single allocation.
+-    // Bound the reserve by what the PAYLOAD can actually contain, not by the
+-    // claimed count and not by a flat constant. The densest this encoder can be
+-    // is its constant-delta fast path: kBlockSize values per 16-byte header, so
+-    // 64 values per byte. Anything above that is impossible, whatever the caller
+-    // claims.
+-    //
+-    // A flat cap is not enough: a 40-byte payload with a claimed count of 4
+-    // billion still reserved 81,920 slots (655 KB), and with one such reserve per
+-    // point-group in a batched write that is hundreds of MB of pure waste.
+-    static constexpr size_t kMaxValuesPerByte = kBlockSize / 16;  // 64
+-    const size_t payloadMax = encoded.remaining() * kMaxValuesPerByte;
+     const size_t current_size = values.size();
+-    const size_t wanted = std::min(static_cast<size_t>(timestampSize), payloadMax);
+-    if (values.capacity() < current_size + wanted) {
+-        values.reserve(current_size + wanted + (wanted >> 2));
+-    }
+ 
+     // =========================================================================
+     // Fast path: no time filtering (minTime==0 && maxTime==UINT64_MAX).
+@@ -685,6 +713,22 @@
+     // queries. Eliminates 2N branches (minTime/maxTime checks) from the hot loop.
+     // =========================================================================
+     if (minTime == 0 && maxTime == UINT64_MAX) {
++        // The caller's count is only an upper bound. Limit it by the densest
++        // possible payload (1024 points per 16-byte header), and reserve only
++        // for full reads. Filtered reads grow when a point actually survives.
++        constexpr size_t kMaxValuesPerByte = kBlockSize / 16;
++        const size_t payloadMax = encoded.remaining() * kMaxValuesPerByte;
++        const size_t wanted = std::min(static_cast<size_t>(timestampSize), payloadMax);
++        if (wanted > values.max_size() - current_size)
++            throw std::length_error("FFOR decoded timestamps exceed vector max_size");
++        const size_t required = current_size + wanted;
++        if (values.capacity() < required) {
++            // Multiple TSM blocks append to the same vector. Fixed slack per
++            // block reallocates repeatedly; geometric growth amortizes copies.
++            const size_t capacity = values.capacity();
++            const size_t grown = capacity + std::min(capacity / 2, values.max_size() - capacity);
++            values.reserve(std::max(required, grown));
++        }
+         uint64_t last_decoded = 0;
+         uint64_t delta = 0;
+         size_t global_idx = 0;
+@@ -790,7 +834,8 @@
+             }
+             global_idx = std::min(size_t{2}, global_idx + emit_count);
+             if (appendFilteredProgression(values, last_decoded, delta, emit_count, minTime, maxTime,
+-                                          nSkipped, nAdded))
++                                          nSkipped, nAdded, encoded,
++                                          total_decoded < timestampSize ? timestampSize - total_decoded : 0))
+                 return {nSkipped, nAdded};
+             continue;
+         }
+@@ -801,6 +846,17 @@
+         //   global_idx 1: zigzag(delta)
+         //   global_idx 2+: zigzag(delta-of-delta)
+         size_t local_i = 0;
++        size_t buffered = 0;
++        auto appendBuffered = [&](bool canContinue) {
++            if (buffered == 0)
++                return;
++            if (buffered > values.capacity() - values.size())
++                reserveFilteredAppend(values, buffered, last_decoded, delta, encoded,
++                                      canContinue && total_decoded < timestampSize ? timestampSize - total_decoded : 0,
++                                      minTime, maxTime);
++            values.insert(values.end(), blockBuf, blockBuf + buffered);
++            nAdded += buffered;
++        };
+ 
+         // Handle value[0] of the entire sequence (raw timestamp)
+         if (global_idx == 0 && local_i < emit_count) {
+@@ -808,9 +864,9 @@
+             if (last_decoded < minTime) {
+                 nSkipped++;
+             } else if (last_decoded <= maxTime) {
+-                values.push_back(last_decoded);
+-                nAdded++;
++                blockBuf[buffered++] = last_decoded;
+             } else {
++                appendBuffered(false);
+                 return {nSkipped, nAdded};
+             }
+             local_i = 1;
+@@ -824,9 +880,9 @@
+             if (last_decoded < minTime) {
+                 nSkipped++;
+             } else if (last_decoded <= maxTime) {
+-                values.push_back(last_decoded);
+-                nAdded++;
++                blockBuf[buffered++] = last_decoded;
+             } else {
++                appendBuffered(false);
+                 return {nSkipped, nAdded};
+             }
+             local_i++;
+@@ -846,10 +902,10 @@
+             if (last_decoded < minTime) {
+                 nSkipped++;
+             } else if (last_decoded > maxTime) {
++                appendBuffered(false);
+                 return {nSkipped, nAdded};
+             } else {
+-                values.push_back(last_decoded);
+-                nAdded++;
++                blockBuf[buffered++] = last_decoded;
+             }
+ 
+             delta += dd1;
+@@ -857,10 +913,10 @@
+             if (last_decoded < minTime) {
+                 nSkipped++;
+             } else if (last_decoded > maxTime) {
++                appendBuffered(false);
+                 return {nSkipped, nAdded};
+             } else {
+-                values.push_back(last_decoded);
+-                nAdded++;
++                blockBuf[buffered++] = last_decoded;
+             }
+ 
+             delta += dd2;
+@@ -868,10 +924,10 @@
+             if (last_decoded < minTime) {
+                 nSkipped++;
+             } else if (last_decoded > maxTime) {
++                appendBuffered(false);
+                 return {nSkipped, nAdded};
+             } else {
+-                values.push_back(last_decoded);
+-                nAdded++;
++                blockBuf[buffered++] = last_decoded;
+             }
+ 
+             delta += dd3;
+@@ -879,10 +935,10 @@
+             if (last_decoded < minTime) {
+                 nSkipped++;
+             } else if (last_decoded > maxTime) {
++                appendBuffered(false);
+                 return {nSkipped, nAdded};
+             } else {
+-                values.push_back(last_decoded);
+-                nAdded++;
++                blockBuf[buffered++] = last_decoded;
+             }
+         }
+ 
+@@ -897,11 +953,12 @@
+                 continue;
+             }
+             if (last_decoded > maxTime) {
++                appendBuffered(false);
+                 return {nSkipped, nAdded};
+             }
+-            values.push_back(last_decoded);
+-            nAdded++;
+-        }
++            blockBuf[buffered++] = last_decoded;
++        }
++        appendBuffered(true);
+     }
+ 
+     return {nSkipped, nAdded};
+--- a/lib/storage/tsm.cpp
++++ b/lib/storage/tsm.cpp
+@@ -150,7 +150,6 @@
+         return std::nullopt;
+ 
+     tsScratchOut.clear();
+-    tsScratchOut.reserve(timestampSize);
+ 
+     auto timestampsSlice = blockSlice.getSlice(timestampBytes);
+     auto [nSkipped, nTimestamps] =
+@@ -1245,12 +1244,14 @@
+                                      " but reader expects type " + std::to_string(static_cast<uint8_t>(expectedType)));
+         }
+ 
+-        auto blockResults = std::make_unique<TSMBlock<T>>(timestampSize);
++        auto blockResults = std::make_unique<TSMBlock<T>>(
++            startTime == 0 && endTime == UINT64_MAX ? timestampSize : 0);
+         auto timestampsSlice = blockSlice.getSlice(timestampBytes);
+         std::tie(ctx.nSkipped, ctx.nTimestamps) =
+             IntegerEncoder::decode(timestampsSlice, timestampSize, blockResults->timestamps, startTime, endTime);
+         const size_t nSkipped = ctx.nSkipped;
+         const size_t nTimestamps = ctx.nTimestamps;
++        blockResults->values.reserve(nTimestamps);
+         ctx.valueByteSize = indexBlock.size - timestampBytes - BLOCK_HEADER_SIZE;
+         const size_t valueByteSize = ctx.valueByteSize;
+ 
+@@ -1463,10 +1464,12 @@
+     }
+ 
+     // Decode timestamps with time-range filtering
+-    auto blockResults = std::make_unique<TSMBlock<T>>(timestampSize);
++    auto blockResults = std::make_unique<TSMBlock<T>>(
++            startTime == 0 && endTime == UINT64_MAX ? timestampSize : 0);
+     auto timestampsSlice = blockSlice.getSlice(timestampBytes);
+     auto [nSkipped, nTimestamps] =
+         IntegerEncoder::decode(timestampsSlice, timestampSize, blockResults->timestamps, startTime, endTime);
++    blockResults->values.reserve(nTimestamps);
+ 
+     // Decode values based on type — guard against unsigned underflow before subtraction
+     if (timestampBytes + BLOCK_HEADER_SIZE > blockSize) {

@@ -1,0 +1,6 @@
+base 112466850 4.6 2315228 332474899 | 1500 OK, 0 HTTP errors, 0 connection failures
+new 122443538 4.33 2315588 332474607 | 1500 OK, 0 HTTP errors, 0 connection failures
+new 121063085 4.27 2274652 332474242 | 1500 OK, 0 HTTP errors, 0 connection failures
+base 120312541 4.32 2278636 332474073 | 1500 OK, 0 HTTP errors, 0 connection failures
+base 120363280 4.28 2336552 332475025 | 1500 OK, 0 HTTP errors, 0 connection failures
+new 120414763 4.36 2338232 332474613 | 1500 OK, 0 HTTP errors, 0 connection failures

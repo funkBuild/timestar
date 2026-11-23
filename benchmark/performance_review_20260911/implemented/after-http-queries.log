@@ -1,0 +1,84 @@
+INFO  2026-09-11 15:43:45,609 seastar - Reactor backend: linux-aio
+INFO  2026-09-11 15:43:45,609 seastar - Perf-based stall detector creation failed (EACCESS), try setting /proc/sys/kernel/perf_event_paranoid to 1 or less to enable kernel backtraces: falling back to posix timer.
+================================================================================
+ TimeStar Query Benchmark
+================================================================================
+  Server:   127.0.0.1:18086
+  Format:   json
+  Warmup:   3 iterations per query
+================================================================================
+
+Server health check: OK
+
+Running 34 queries
+
+[1/34] latest: single field (20x) ... avg=370.75ms  min=363.86  p50=368.25  p95=382.39  max=382.63ms  pts=1000000  series=1  resp=38182824B
+[2/34] latest: all fields (20x) ... FAILED: {"status":"error","error_code":"TOO_MANY_POINTS","message":"Total points 10500000 exceeds limit of 10000000","error":"To
+[3/34] latest: single field, tag filter (20x) ... avg=9.15ms  min=8.67  p50=9.12  p95=9.94  max=10.04ms  pts=130000  series=1  resp=4964026B
+[4/34] latest: all fields, two tag filters (20x) ... avg=279.34ms  min=271.52  p50=278.94  p95=284.08  max=299.33ms  pts=900000  series=1  resp=34364307B
+[5/34] avg: narrow range, single field (20x) ... avg=0.08ms  min=0.07  p50=0.07  p95=0.12  max=0.23ms  pts=101  series=1  resp=4074B
+[6/34] min: narrow range, single field (20x) ... avg=0.07ms  min=0.07  p50=0.07  p95=0.09  max=0.14ms  pts=101  series=1  resp=4078B
+[7/34] max: narrow range, single field (20x) ... avg=0.07ms  min=0.06  p50=0.07  p95=0.07  max=0.10ms  pts=101  series=1  resp=4055B
+[8/34] sum: narrow range, single field (20x) ... avg=0.07ms  min=0.06  p50=0.07  p95=0.10  max=0.11ms  pts=101  series=1  resp=4089B
+[9/34] count: narrow range, single field (20x) ... avg=0.07ms  min=0.06  p50=0.07  p95=0.07  max=0.11ms  pts=101  series=1  resp=2431B
+[10/34] median: narrow range, single field (10x) ... avg=0.08ms  min=0.07  p50=0.07  p95=0.08  max=0.12ms  pts=101  series=1  resp=4074B
+[11/34] stddev: narrow range, single field (10x) ... avg=0.07ms  min=0.07  p50=0.07  p95=0.07  max=0.11ms  pts=101  series=1  resp=4100B
+[12/34] avg: narrow, all 10 fields (10x) ... avg=0.13ms  min=0.11  p50=0.12  p95=0.13  max=0.17ms  pts=1010  series=1  resp=39163B
+[13/34] avg: narrow, 3 fields (10x) ... avg=0.09ms  min=0.08  p50=0.08  p95=0.09  max=0.12ms  pts=303  series=1  resp=11866B
+[14/34] avg: medium range (~7d), single field (10x) ... avg=0.64ms  min=0.60  p50=0.63  p95=0.66  max=0.70ms  pts=10001  series=1  resp=382164B
+[15/34] avg: full range, single field (5x) ... avg=371.51ms  min=368.72  p50=371.23  p95=372.31  max=374.87ms  pts=1000000  series=1  resp=38183143B
+[16/34] avg: full range, all fields (5x) ... FAILED: {"status":"error","error_code":"TOO_MANY_POINTS","message":"Total points 10500000 exceeds limit of 10000000","error":"To
+[17/34] avg: single host filter (20x) ... avg=0.06ms  min=0.05  p50=0.05  p95=0.06  max=0.11ms  pts=0  series=0  resp=109B
+[18/34] avg: host + rack filter (20x) ... avg=0.05ms  min=0.05  p50=0.05  p95=0.05  max=0.09ms  pts=0  series=0  resp=109B
+[19/34] avg: rack filter, all fields (10x) ... avg=0.13ms  min=0.12  p50=0.13  p95=0.14  max=0.18ms  pts=1010  series=1  resp=39163B
+[20/34] avg: group by host (10x) ... avg=0.08ms  min=0.07  p50=0.08  p95=0.09  max=0.11ms  pts=202  series=2  resp=8051B
+[21/34] avg: group by rack (10x) ... avg=0.08ms  min=0.07  p50=0.07  p95=0.09  max=0.11ms  pts=101  series=1  resp=4087B
+[22/34] avg: group by host+rack (10x) ... avg=0.08ms  min=0.07  p50=0.08  p95=0.08  max=0.12ms  pts=202  series=2  resp=8079B
+[23/34] avg: group by host, full range (5x) ... avg=402.51ms  min=393.05  p50=401.86  p95=402.67  max=418.10ms  pts=1040000  series=10  resp=39711100B
+[24/34] avg: 1h buckets, medium range (10x) ... avg=0.11ms  min=0.09  p50=0.10  p95=0.11  max=0.18ms  pts=168  series=1  resp=6636B
+[25/34] avg: 5m buckets, narrow range (20x) ... avg=0.07ms  min=0.06  p50=0.06  p95=0.07  max=0.11ms  pts=21  series=1  resp=1013B
+[26/34] avg: 1d buckets, full range (5x) ... avg=0.35ms  min=0.30  p50=0.38  p95=0.38  max=0.39ms  pts=695  series=1  resp=26793B
+[27/34] max: 1h buckets, tag filter (10x) ... avg=0.05ms  min=0.05  p50=0.05  p95=0.05  max=0.08ms  pts=0  series=0  resp=109B
+[28/34] avg: 1h buckets, group by host (5x) ... avg=0.12ms  min=0.11  p50=0.12  p95=0.12  max=0.16ms  pts=338  series=4  resp=13476B
+[29/34] avg: 5m buckets, all fields, tag filter (5x) ... avg=0.09ms  min=0.08  p50=0.08  p95=0.08  max=0.12ms  pts=10  series=1  resp=972B
+[30/34] GET /measurements (20x) ... avg=0.03ms  min=0.02  p50=0.02  p95=0.03  max=0.05ms  resp=45B
+[31/34] GET /tags?measurement=server.metrics (20x) ... avg=0.03ms  min=0.02  p50=0.02  p95=0.03  max=0.05ms  resp=177B
+[32/34] GET /fields?measurement=server.metrics (20x) ... avg=0.03ms  min=0.03  p50=0.03  p95=0.03  max=0.09ms  resp=567B
+[33/34] avg: narrow, single field (repeated) (50x) ... avg=0.13ms  min=0.06  p50=0.07  p95=0.10  max=2.84ms  pts=101  series=1  resp=4074B
+[34/34] latest: tag filter (repeated) (50x) ... avg=4.06ms  min=3.72  p50=4.00  p95=4.28  max=4.91ms  pts=70000  series=1  resp=2672777B
+
+================================================================================
+ SUMMARY
+================================================================================
+
+  Category      Queries   Iters   Fails   Total(ms)     Avg(ms)
+  ------------  ------  ------  ------  ----------  ----------
+  latest             5     130      20     13388.2      121.71
+  avg               19     240       5      3897.8       16.59
+  min                1      20       0         1.5        0.07
+  max                2      30       0         1.9        0.06
+  sum                1      20       0         1.4        0.07
+  count              1      20       0         1.3        0.07
+  median             1      10       0         0.8        0.08
+  stddev             1      10       0         0.7        0.07
+  metadata           3      60       0         1.6        0.03
+
+  Total: 34 queries, 540 iterations, 515 OK, 25 failed, 17295.3ms total
+
+  Top 5 slowest (by average latency):
+      402.51ms  avg: group by host, full range
+      371.51ms  avg: full range, single field
+      370.75ms  latest: single field
+      279.34ms  latest: all fields, two tag filters
+        9.15ms  latest: single field, tag filter
+
+  Top 5 fastest (by average latency):
+        0.00ms  latest: all fields
+        0.00ms  avg: full range, all fields
+        0.03ms  GET /measurements
+        0.03ms  GET /tags?measurement=server.metrics
+        0.03ms  GET /fields?measurement=server.metrics
+
+================================================================================
+ Benchmark complete.
+================================================================================

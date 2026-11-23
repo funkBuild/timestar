@@ -1,0 +1,6 @@
+base 42196345 2.47 1084760 62493652 | 260 OK, 1240 HTTP errors, 0 connection failures
+new 33857458 3.56 1072324 96749376 | 388 OK, 1112 HTTP errors, 0 connection failures
+new 64688622 2.45 1037872 93294635 | 385 OK, 1115 HTTP errors, 0 connection failures
+base 46236959 2.39 1092908 62097126 | 260 OK, 1240 HTTP errors, 0 connection failures
+base 45975661 2.4 1091088 62669597 | 261 OK, 1239 HTTP errors, 0 connection failures
+new 63961420 2.37 1052128 92149563 | 357 OK, 1143 HTTP errors, 0 connection failures

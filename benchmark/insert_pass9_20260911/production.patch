@@ -1,0 +1,85 @@
+--- a/lib/storage/memory_store.cpp
++++ b/lib/storage/memory_store.cpp
+@@ -7,6 +7,7 @@
+ #include "value_type_dispatch.hpp"  // TIMESTAR_INSTANTIATE_FOR_VALUE_TYPES
+ 
+ #include <algorithm>
++#include <array>
+ #include <chrono>
+ #include <cmath>
+ #include <numeric>
+@@ -139,6 +140,44 @@
+ }
+ 
+ namespace {
++// Validate correction targets before modifying values. Search independent keys
++// together so cache misses can overlap; select each half without a data-dependent
++// branch. The final comparison also permits returning the one-past-end position.
++[[gnu::noinline]] bool findCorrectionTargets(const uint64_t* data, size_t size, const uint64_t* keys,
++                                            size_t count, std::vector<size_t>& targets) {
++    constexpr size_t width = 8;
++    size_t i = 0;
++    for (; count - i >= width; i += width) {
++        std::array<size_t, width> base{};
++        size_t len = size;
++        while (len > 1) {
++            const size_t half = len / 2;
++            for (size_t k = 0; k < width; ++k)
++                base[k] = data[base[k] + half] < keys[i + k] ? base[k] + half : base[k];
++            len -= half;
++        }
++        for (size_t k = 0; k < width; ++k) {
++            base[k] += data[base[k]] < keys[i + k];
++            if (base[k] == size || data[base[k]] != keys[i + k])
++                return false;
++        }
++        targets.insert(targets.end(), base.begin(), base.end());
++    }
++    for (; i < count; ++i) {
++        size_t base = 0, len = size;
++        while (len > 1) {
++            const size_t half = len / 2;
++            base = data[base + half] < keys[i] ? base + half : base;
++            len -= half;
++        }
++        base += data[base] < keys[i];
++        if (base == size || data[base] != keys[i])
++            return false;
++        targets.push_back(base);
++    }
++    return true;
++}
++
+ // Small finite corrections can update central moments without reading untouched
+ // points. Keep the batch's mean/M2 in extended precision; retain the full scan
+ // for special values, removed extrema and ill-conditioned variance updates.
+@@ -280,13 +319,23 @@
+     if (newSize <= oldSize / 8 && srcTimestamps.front() <= timestamps.back()) {
+         std::vector<size_t> targets;
+         targets.reserve(newSize);
+-        for (uint64_t ts : srcTimestamps) {
+-            auto it = std::lower_bound(timestamps.begin(), timestamps.end(), ts);
+-            if (it == timestamps.end() || *it != ts)
+-                break;
+-            targets.push_back(static_cast<size_t>(it - timestamps.begin()));
++        // Tiny requests cannot overlap a group of searches. Keep the scalar
++        // standard search here: warm single-key requests benefit from branch
++        // prediction and avoid an out-of-line helper call.
++        bool allFound = true;
++        if (newSize < 8) {
++            for (uint64_t ts : srcTimestamps) {
++                const auto it = std::lower_bound(timestamps.begin(), timestamps.end(), ts);
++                if (it == timestamps.end() || *it != ts) {
++                    allFound = false;
++                    break;
++                }
++                targets.push_back(static_cast<size_t>(it - timestamps.begin()));
++            }
++        } else {
++            allFound = findCorrectionTargets(timestamps.data(), oldSize, srcTimestamps.data(), newSize, targets);
+         }
+-        if (targets.size() == newSize) {
++        if (allFound) {
+             if constexpr (std::is_same_v<T, double>) {
+                 // For short series, the fused SIMD rebuild is cheaper than
+                 // updating central moments for each correction individually.

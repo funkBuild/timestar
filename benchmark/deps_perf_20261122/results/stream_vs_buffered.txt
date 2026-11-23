@@ -1,0 +1,12 @@
+== avg:blocky(v)
+buffered  server CPU 48.00 ms/query | ttfb 32.34 ms | total 39.80 ms | peak RSS 250 MB
+streamed  server CPU 43.75 ms/query | ttfb 5.62 ms | total 35.48 ms | peak RSS 204 MB
+== avg:interleaved(v)
+buffered  server CPU 50.88 ms/query | ttfb 36.05 ms | total 43.90 ms | peak RSS 250 MB
+streamed  server CPU 46.62 ms/query | ttfb 9.12 ms | total 38.97 ms | peak RSS 204 MB
+== stddev:blocky(v)
+buffered  server CPU 31.25 ms/query | ttfb 17.29 ms | total 23.14 ms | peak RSS 233 MB
+streamed  server CPU 31.12 ms/query | ttfb 9.08 ms | total 23.03 ms | peak RSS 204 MB
+== avg:aligned(v)
+buffered  server CPU 13.25 ms/query | ttfb 5.94 ms | total 6.81 ms | peak RSS 196 MB
+streamed  server CPU 13.25 ms/query | ttfb 3.92 ms | total 6.83 ms | peak RSS 190 MB

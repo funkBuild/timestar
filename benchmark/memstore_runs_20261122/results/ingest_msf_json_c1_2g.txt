@@ -1,0 +1,6 @@
+base 13748007 3.26 1076796 62273184 | 260 OK, 1240 HTTP errors, 0 connection failures
+new 26577692 3.34 1086696 119425870 | 502 OK, 998 HTTP errors, 0 connection failures
+new 26462447 3.35 1087020 119425870 | 502 OK, 998 HTTP errors, 0 connection failures
+base 13969619 3.28 1080500 62273184 | 260 OK, 1240 HTTP errors, 0 connection failures
+base 13838070 3.29 1080832 62273184 | 260 OK, 1240 HTTP errors, 0 connection failures
+new 25130169 3.42 1086724 119425870 | 502 OK, 998 HTTP errors, 0 connection failures

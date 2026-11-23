@@ -1,0 +1,66 @@
+# bucketed queries: build before this round vs final BucketMap build; server execution_time_ms, median of 3 alternating rounds x 5 iterations
+queries 114 | results varying run to run (float fold order across shards, in either build): 2 | new build never matching any baseline run: 0 []
+query                                      buckets  before ms   after ms       x
+stdvar:blocky(v) @1m                       1000000     135.85      42.57   3.19x
+stddev:blocky(v) @1m                       1000000     135.11      42.81   3.16x
+spread:blocky(v) @1m                       1000000     133.76      41.69   3.21x
+min:blocky(v) @1m                          1000000     133.52      41.79   3.20x
+first:blocky(v) @1m                        1000000     133.30      41.76   3.19x
+count:blocky(v) @1m                        1000000     132.88      41.89   3.17x
+max:blocky(v) @1m                          1000000     132.72      41.61   3.19x
+sum:blocky(v) @1m                          1000000     132.36      41.56   3.18x
+latest:blocky(v) @1m                       1000000     132.20      41.72   3.17x
+avg:blocky(v) @1m                          1000000     132.19      42.87   3.08x
+max:blocky(v) by rack @1m                  1000000     111.80      34.47   3.24x
+median:blocky(v) @1m                       1000000     108.96      55.08   1.98x
+avg:aligned(v) by host @1m                 1000000      75.65      24.61   3.07x
+avg:blocky(v) by host @1m                  1000000      75.64      23.57   3.21x
+avg:interleaved(v) by host @1m             1000000      74.90      25.21   2.97x
+max:interleaved(v) by rack @1m              200000      66.15      22.42   2.95x
+max:aligned(v) by rack @1m                  200000      64.76      21.97   2.95x
+count:interleaved(v) @1m                    100000      54.29      18.03   3.01x
+sum:interleaved(v) @1m                      100000      53.93      18.30   2.95x
+count:aligned(v) @1m                        100000      53.89      18.48   2.92x
+spread:interleaved(v) @1m                   100000      53.86      18.65   2.89x
+first:interleaved(v) @1m                    100000      53.60      18.79   2.85x
+spread:aligned(v) @1m                       100000      53.31      18.35   2.91x
+min:interleaved(v) @1m                      100000      53.27      18.02   2.96x
+max:interleaved(v) @1m                      100000      53.09      18.51   2.87x
+avg:interleaved(v) @1m                      100000      53.02      17.92   2.96x
+latest:interleaved(v) @1m                   100000      52.94      18.09   2.93x
+first:aligned(v) @1m                        100000      52.89      18.15   2.91x
+min:aligned(v) @1m                          100000      52.45      18.31   2.86x
+stdvar:aligned(v) @1m                       100000      52.31      18.11   2.89x
+latest:aligned(v) @1m                       100000      52.30      18.00   2.91x
+sum:aligned(v) @1m                          100000      52.12      18.75   2.78x
+stddev:aligned(v) @1m                       100000      52.04      18.33   2.84x
+avg:aligned(v) @1m                          100000      52.04      17.92   2.90x
+stddev:interleaved(v) @1m                   100000      51.95      18.60   2.79x
+max:aligned(v) @1m                          100000      51.91      18.34   2.83x
+stdvar:interleaved(v) @1m                   100000      51.89      18.51   2.80x
+median:interleaved(v) @1m                   100000      43.33      28.02   1.55x
+median:aligned(v) @1m                       100000      43.04      26.79   1.61x
+median:blocky(v) @5m                        200001      29.39      19.34   1.52x
+median:interleaved(v) @5m                    20001      26.31      20.89   1.26x
+median:aligned(v) @5m                        20001      25.02      20.09   1.25x
+stddev:blocky(v) @5m                        200001      22.85       7.59   3.01x
+max:blocky(v) @5m                           200001      22.27       7.38   3.02x
+stdvar:blocky(v) @5m                        200001      22.12       7.65   2.89x
+min:blocky(v) @5m                           200001      21.76       7.30   2.98x
+avg:blocky(v) @5m                           200001      21.66       7.73   2.80x
+sum:blocky(v) @5m                           200001      21.60       7.40   2.92x
+spread:blocky(v) @5m                        200001      21.35       7.58   2.82x
+count:blocky(v) @5m                         200001      21.24       6.93   3.06x
+first:blocky(v) @5m                         200001      21.18       7.17   2.95x
+latest:blocky(v) @5m                        200001      20.78       7.27   2.86x
+median:aligned(v) @1h                         1668      17.17      16.16   1.06x
+median:interleaved(v) @1h                     1668      16.98      15.45   1.10x
+median:blocky(v) @1h                         16668      16.16      14.87   1.09x
+avg:blocky(v) start-aligned @7m             142857      15.37       9.43   1.63x
+stddev:aligned(v) @5m                        20001      15.06       4.83   3.12x
+stdvar:aligned(v) @5m                        20001      14.96       4.78   3.13x
+spread:interleaved(v) @5m                    20001      14.95       4.62   3.24x
+stddev:interleaved(v) @5m                    20001      14.88       4.82   3.09x
+speedup over all 114 queries: min 1.06x median 2.86x max 4.17x
+slower by >5%: []
+numeric comparison of full results (one run each): 113 of 114 bit-identical, no structural differences, largest relative value difference 3.24e-16

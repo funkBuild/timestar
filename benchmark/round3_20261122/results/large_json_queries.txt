@@ -1,0 +1,18 @@
+== stddev:blocky(v)
+base  server CPU 31.16 ms/query | ttfb 8.96 ms | total 23.01 ms | bytes 22000197
+new   server CPU 29.50 ms/query | ttfb 7.11 ms | total 21.61 ms | bytes 22000197
+== stddev:interleaved(v)
+base  server CPU 42.84 ms/query | ttfb 21.35 ms | total 35.28 ms | bytes 22000203
+new   server CPU 32.34 ms/query | ttfb 10.74 ms | total 25.26 ms | bytes 22000202
+== avg:blocky(v)
+base  server CPU 43.67 ms/query | ttfb 5.55 ms | total 35.25 ms | bytes 30865607
+new   server CPU 38.67 ms/query | ttfb 5.48 ms | total 30.50 ms | bytes 30865607
+== avg:interleaved(v)
+base  server CPU 66.16 ms/query | ttfb 16.00 ms | total 57.50 ms | bytes 30859980
+new   server CPU 49.83 ms/query | ttfb 12.64 ms | total 43.87 ms | bytes 30859980
+== latest:interleaved(v)
+base  server CPU 50.34 ms/query | ttfb 12.48 ms | total 42.71 ms | bytes 30859980
+new   server CPU 45.00 ms/query | ttfb 12.03 ms | total 37.45 ms | bytes 30859980
+== spread:aligned(v)
+base  server CPU 21.33 ms/query | ttfb 11.81 ms | total 14.65 ms | bytes 3027049
+new   server CPU 21.00 ms/query | ttfb 11.88 ms | total 14.39 ms | bytes 3027049

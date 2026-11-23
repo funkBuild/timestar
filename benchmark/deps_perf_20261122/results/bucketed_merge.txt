@@ -1,0 +1,23 @@
+# bucketed queries, pre-upgrade build vs final build; server execution_time_ms, median of 3 alternating rounds
+queries 114 | results varying run to run (float fold order across shards, in either build): 1 | final build never matching any baseline run: 0 []
+query                                      buckets  before ms   after ms       x
+avg:blocky(v) @1m                          1000000     234.71     133.09   1.76x
+first:blocky(v) @1m                        1000000     231.43     132.60   1.75x
+max:blocky(v) @1m                          1000000     230.02     133.25   1.73x
+latest:blocky(v) @1m                       1000000     227.34     131.93   1.72x
+min:blocky(v) @1m                          1000000     226.61     134.00   1.69x
+stddev:blocky(v) @1m                       1000000     223.70     135.97   1.65x
+spread:blocky(v) @1m                       1000000     223.14     133.77   1.67x
+stdvar:blocky(v) @1m                       1000000     222.93     134.60   1.66x
+sum:blocky(v) @1m                          1000000     221.39     131.57   1.68x
+count:blocky(v) @1m                        1000000     219.09     133.85   1.64x
+median:blocky(v) @1m                       1000000     196.34     109.01   1.80x
+max:blocky(v) by rack @1m                  1000000     183.25     110.73   1.65x
+avg:blocky(v) by host @1m                  1000000      75.54      74.84   1.01x
+avg:interleaved(v) by host @1m             1000000      74.84      75.21   1.00x
+avg:aligned(v) by host @1m                 1000000      74.31      75.87   0.98x
+max:interleaved(v) by rack @1m              200000      68.91      67.05   1.03x
+max:aligned(v) by rack @1m                  200000      67.41      65.33   1.03x
+first:interleaved(v) @1m                    100000      55.70      52.82   1.05x
+speedup over all 114 queries: min 0.94x median 1.06x max 1.80x
+slower by >5%: [('median:interleaved(v) @5m', 0.94, 25.18, 26.88)]
