@@ -16,6 +16,16 @@ static_assert(std::endian::native == std::endian::little, "CRC32 slicing-by-8 re
 // tables (8 KB total), achieving 4-8x throughput vs single-table lookup.
 // Output is bit-identical to the original single-table implementation.
 
+namespace timestar::crc32simd {
+
+// Carry-less-multiply fold for long inputs (crc32_simd.cpp). Consumes a prefix
+// of `data` — a multiple of 16 bytes — updating `*crc`, and returns how many
+// bytes it consumed: 0 when the input is too short or the CPU has no native
+// carry-less multiply, in which case the tables below handle everything.
+size_t foldPrefix(uint32_t* crc, const uint8_t* data, size_t length);
+
+}  // namespace timestar::crc32simd
+
 namespace detail {
 
 // Generate 8 slicing tables at compile time.
@@ -57,6 +67,9 @@ public:
     // Initial CRC state for incremental computation.
     static constexpr uint32_t INIT = 0xFFFFFFFF;
 
+    // Inputs shorter than this stay on the tables.
+    static constexpr size_t SIMD_MIN_BYTES = 128;
+
     // Compile-time slicing-by-8 CRC32 lookup tables (8 KB).
     static constexpr auto TABLES = detail::generateCrc32SlicingTables();
 
@@ -67,6 +80,20 @@ public:
     // Slicing-by-8: processes 8 bytes per iteration via 8 interleaved
     // table lookups XOR'd together, ~4-8x faster than byte-at-a-time.
     static uint32_t update(uint32_t crc, const uint8_t* data, size_t length) {
+        // Long inputs (WAL entries, manifests) go through the carry-less
+        // multiply fold where the CPU has one: same checksum, several times
+        // the throughput. Short ones are not worth the dispatch.
+        if (length >= SIMD_MIN_BYTES) {
+            const size_t consumed = timestar::crc32simd::foldPrefix(&crc, data, length);
+            data += consumed;
+            length -= consumed;
+        }
+        return updateTables(crc, data, length);
+    }
+
+    // The table-driven implementation on its own. update() falls back to it;
+    // tests use it as the reference for the SIMD path.
+    static uint32_t updateTables(uint32_t crc, const uint8_t* data, size_t length) {
         const uint8_t* end = data + length;
 
         // Slicing-by-8 main loop: 8 bytes per iteration.

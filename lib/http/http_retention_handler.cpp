@@ -7,6 +7,7 @@
 #include "http_routes.hpp"
 #include "logger.hpp"
 #include "proto_converters.hpp"
+#include "request_body.hpp"
 #include "value_type_dispatch.hpp"  // valueTypeFromName -> isNonNumericValueType
 
 #include <map>
@@ -88,7 +89,14 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
     }
 
     // Body size limit to prevent DoS via large payloads
-    if (req->content.size() > timestar::config().http.max_query_body_size) {
+    seastar::sstring body;
+    const auto bodyStatus =
+        co_await timestar::http::readRequestBody(*req, timestar::config().http.max_query_body_size, body);
+    if (bodyStatus == timestar::http::BodyStatus::Incomplete) {
+        timestar::http::replyIncompleteBody(*reply, resFmt);
+        co_return reply;
+    }
+    if (bodyStatus == timestar::http::BodyStatus::TooLarge) {
         reply->set_status(seastar::http::reply::status_type::payload_too_large);
         if (timestar::http::isProtobuf(resFmt)) {
             reply->_content = timestar::proto::formatErrorResponse("Request body too large");
@@ -109,7 +117,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
 
         if (timestar::http::isProtobuf(reqFmt)) {
             // Parse protobuf request
-            auto parsed = timestar::proto::parseRetentionPutRequest(req->content.data(), req->content.size());
+            auto parsed = timestar::proto::parseRetentionPutRequest(body.data(), body.size());
             policyReq.measurement = std::move(parsed.measurement);
             policyReq.ttl = std::move(parsed.ttl);
 
@@ -137,7 +145,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
                 downsampleFieldPresent = true;
             }
         } else {
-            auto err = glz::read_json(policyReq, req->content);
+            auto err = glz::read_json(policyReq, body);
             if (err) {
                 reply->set_status(seastar::http::reply::status_type::bad_request);
                 if (timestar::http::isProtobuf(resFmt)) {

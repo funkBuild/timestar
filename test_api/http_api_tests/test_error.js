@@ -1,5 +1,5 @@
 const axios = require('axios');
-const BASE_URL = 'http://localhost:8086';
+const BASE_URL = `http://${process.env.TIMESTAR_HOST || 'localhost'}:${process.env.TIMESTAR_PORT || 8086}`;
 
 async function test() {
   try {

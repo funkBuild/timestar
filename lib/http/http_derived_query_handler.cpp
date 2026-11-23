@@ -8,6 +8,7 @@
 #include "json_escape.hpp"
 #include "logger.hpp"
 #include "proto_converters.hpp"
+#include "request_body.hpp"
 #include "timestar_config.hpp"
 
 #include <seastar/core/future.hh>
@@ -41,7 +42,13 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::
 
     try {
         // Validate request body size
-        if (req->content.size() > MAX_DERIVED_QUERY_BODY_SIZE) {
+        seastar::sstring rawBody;
+        const auto bodyStatus = co_await timestar::http::readRequestBody(*req, MAX_DERIVED_QUERY_BODY_SIZE, rawBody);
+        if (bodyStatus == timestar::http::BodyStatus::Incomplete) {
+            timestar::http::replyIncompleteBody(*rep, resFmt);
+            co_return std::move(rep);
+        }
+        if (bodyStatus == timestar::http::BodyStatus::TooLarge) {
             rep->set_status(seastar::http::reply::status_type::payload_too_large);
             if (timestar::http::isProtobuf(resFmt)) {
                 rep->_content =
@@ -51,11 +58,11 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::
                     DerivedQueryExecutor::createErrorResponse("BODY_TOO_LARGE", "Request body too large (max 1MB)");
             }
             timestar::http::setContentType(*rep, resFmt);
-            rep->done();
             co_return std::move(rep);
         }
 
-        std::string body = std::move(req->content);
+        // The executor takes a std::string; requests here are capped at 1MB.
+        std::string body(rawBody.data(), rawBody.size());
 
         if (body.empty()) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
@@ -65,7 +72,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::
                 rep->_content = DerivedQueryExecutor::createErrorResponse("EMPTY_REQUEST", "Request body is required");
             }
             timestar::http::setContentType(*rep, resFmt);
-            rep->done();
             co_return std::move(rep);
         }
 
@@ -192,7 +198,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::
             }
 
             timestar::http::setContentType(*rep, resFmt);
-            rep->done();
 
             // Log execution stats + slow query detection
             const auto slowMs = timestar::config().http.slow_query_threshold_ms;
@@ -233,7 +238,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::
                 rep->_content = executor.createErrorResponse("QUERY_ERROR", e.what());
             }
             timestar::http::setContentType(*rep, resFmt);
-            rep->done();
 
             http_log.warn("Derived query error: {}", e.what());
         }
@@ -248,7 +252,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::
             rep->_content = DerivedQueryExecutor::createErrorResponse("INTERNAL_ERROR", "Internal server error");
         }
         timestar::http::setContentType(*rep, resFmt);
-        rep->done();
 
         http_log.error("Derived query internal error: {}", e.what());
 

@@ -38,9 +38,9 @@ TEST(LwwMemoryStoreTest, OverwriteAcrossBatchesReplacesValueAndStats) {
     b.addValue(2000, 200.0);
     series.insert(std::move(b));
 
-    ASSERT_EQ(series.timestamps.size(), 3u);
-    EXPECT_EQ(series.timestamps[1], 2000u);
-    EXPECT_DOUBLE_EQ(series.values[1], 200.0);
+    ASSERT_EQ(series.timestamps().size(), 3u);
+    EXPECT_EQ(series.timestamps()[1], 2000u);
+    EXPECT_DOUBLE_EQ(series.values()[1], 200.0);
 
     // Running stats were recomputed over the surviving points only —
     // the overwritten value must not linger in sum/max/count.
@@ -69,10 +69,10 @@ TEST(LwwMemoryStoreTest, OverwriteTailPointBoundaryEqual) {
     b.addValue(3000, 3.0);
     series.insert(std::move(b));
 
-    ASSERT_EQ(series.timestamps.size(), 3u);
-    EXPECT_DOUBLE_EQ(series.values[0], 1.0);
-    EXPECT_DOUBLE_EQ(series.values[1], 5.0);
-    EXPECT_DOUBLE_EQ(series.values[2], 3.0);
+    ASSERT_EQ(series.timestamps().size(), 3u);
+    EXPECT_DOUBLE_EQ(series.values()[0], 1.0);
+    EXPECT_DOUBLE_EQ(series.values()[1], 5.0);
+    EXPECT_DOUBLE_EQ(series.values()[2], 3.0);
 
     EXPECT_EQ(series.stats.count, 3u);
     EXPECT_DOUBLE_EQ(series.stats.compensatedSum(), 9.0);
@@ -88,8 +88,8 @@ TEST(LwwMemoryStoreTest, RepeatedOverwriteOfSamePoint) {
         w.addValue(1000, static_cast<double>(i));
         series.insert(std::move(w));
     }
-    ASSERT_EQ(series.timestamps.size(), 1u);
-    EXPECT_DOUBLE_EQ(series.values[0], 5.0);
+    ASSERT_EQ(series.timestamps().size(), 1u);
+    EXPECT_DOUBLE_EQ(series.values()[0], 5.0);
     EXPECT_EQ(series.stats.count, 1u);
     EXPECT_DOUBLE_EQ(series.stats.compensatedSum(), 5.0);
     EXPECT_DOUBLE_EQ(series.stats.min, 5.0);
@@ -109,9 +109,9 @@ TEST(LwwMemoryStoreTest, WithinBatchLastOccurrenceWinsEvenWhenUnsorted) {
     w.addValue(2000, 3.0);
     series.insert(std::move(w));
 
-    ASSERT_EQ(series.timestamps.size(), 3u);
-    EXPECT_EQ(series.timestamps[1], 2000u);
-    EXPECT_DOUBLE_EQ(series.values[1], 3.0);
+    ASSERT_EQ(series.timestamps().size(), 3u);
+    EXPECT_EQ(series.timestamps()[1], 2000u);
+    EXPECT_DOUBLE_EQ(series.values()[1], 3.0);
 }
 
 TEST(LwwMemoryStoreTest, StringOverwrite) {
@@ -126,9 +126,9 @@ TEST(LwwMemoryStoreTest, StringOverwrite) {
     b.addValue(1000, std::string("new"));
     series.insert(std::move(b));
 
-    ASSERT_EQ(series.timestamps.size(), 2u);
-    EXPECT_EQ(series.values[0], "new");
-    EXPECT_EQ(series.values[1], "keep");
+    ASSERT_EQ(series.timestamps().size(), 2u);
+    EXPECT_EQ(series.values()[0], "new");
+    EXPECT_EQ(series.values()[1], "keep");
 }
 
 TEST(LwwMemoryStoreTest, BoolOverwrite) {
@@ -142,8 +142,8 @@ TEST(LwwMemoryStoreTest, BoolOverwrite) {
     b.addValue(1000, false);
     series.insert(std::move(b));
 
-    ASSERT_EQ(series.timestamps.size(), 1u);
-    EXPECT_FALSE(static_cast<bool>(series.values[0]));
+    ASSERT_EQ(series.timestamps().size(), 1u);
+    EXPECT_FALSE(static_cast<bool>(series.values()[0]));
 }
 
 TEST(LwwMemoryStoreTest, Int64Overwrite) {
@@ -157,8 +157,8 @@ TEST(LwwMemoryStoreTest, Int64Overwrite) {
     b.addValue(1000, int64_t{42});
     series.insert(std::move(b));
 
-    ASSERT_EQ(series.timestamps.size(), 1u);
-    EXPECT_EQ(series.values[0], 42);
+    ASSERT_EQ(series.timestamps().size(), 1u);
+    EXPECT_EQ(series.values()[0], 42);
 }
 
 // ---------------------------------------------------------------------------

@@ -57,6 +57,12 @@ HTTP POST /query
 - In-memory buffer for recent writes
 - Provides fast reads for the latest data
 - Rolled over to TSM files when size threshold is reached
+- A series is a consolidated, sorted run of points plus the in-order batches
+  that arrived since it was last read. Those batches are kept as they arrived
+  (no copy when they were parsed on the owning shard, one exact-size copy
+  otherwise) and are written to the TSM file in place at rollover; the first
+  query that needs a series' points merges them. Out-of-order writes,
+  duplicates and small batches merge immediately, as last-write-wins requires
 
 ### TSM Files
 
@@ -180,6 +186,20 @@ TOML-based configuration with environment variable overrides (`TIMESTAR_*`):
 | `[engine]` | Metadata retry, retention sweep, tombstone cleanup, I/O priority shares |
 | `[streaming]` | Subscription limits, queue size, heartbeat interval |
 | `[seastar]` | SMP count, memory, reactor backend, poll mode |
+
+**Reactor backend.** Seastar picks `io_uring` when the kernel permits it and
+falls back to `linux-aio` otherwise; `[seastar] reactor_backend` (or
+`TIMESTAR_REACTOR_BACKEND`) pins it. The difference is visible in CPU
+accounting, not in results: with `linux-aio` a shard busy-polls for as long as
+any disk I/O is in flight, so an I/O-bound server shows every shard at 100% CPU,
+while `io_uring` sleeps in the kernel until completions arrive (measured on
+NVMe: the same ingest run used 7.8 CPU-seconds under `io_uring` and 27 under
+`linux-aio`; `linux-aio` finished the run roughly 10-15% sooner, on a shared
+disk, so treat that side as approximate). Docker's default
+seccomp profile blocks `io_uring`, so a container runs `linux-aio` unless
+started with a profile that allows it (for example
+`--security-opt seccomp=unconfined`); the startup log line
+`Reactor backend: ...` says which is in use.
 
 Generate a default config: `./timestar_http_server --dump-config`
 

@@ -117,6 +117,22 @@ public:
     void writeSeries(TSMValueType seriesType, const SeriesId128& seriesId, const std::vector<uint64_t>& timestamps,
                      const std::vector<T>& values);
 
+    // One contiguous piece of a series that is held as several.
+    template <class T>
+    struct SeriesRun {
+        const std::vector<uint64_t>* timestamps;
+        const std::vector<T>* values;
+    };
+
+    // Same bytes as writeSeries() over the concatenation of `runs`, without
+    // building the concatenation: a block that lies inside one run is encoded
+    // from the run's storage, and only a block that straddles runs is gathered
+    // (one block's worth of scratch). This is how a memory store's adopted
+    // batches reach disk without ever being copied into one vector. Not for
+    // strings, whose dictionary is built over the whole series.
+    template <class T>
+    void writeSeriesRuns(TSMValueType seriesType, const SeriesId128& seriesId, std::span<const SeriesRun<T>> runs);
+
     // Same output as writeSeries(), but drains the buffer between blocks so a
     // single large series cannot pin its whole encoded size in memory. Use this
     // wherever series size is unbounded (compaction's merge path).

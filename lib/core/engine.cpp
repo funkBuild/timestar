@@ -7,6 +7,7 @@
 #include "placement_table.hpp"
 #include "query_runner.hpp"
 #include "series_key.hpp"
+#include "shard_count.hpp"
 #include "tsm_compactor.hpp"
 #include "tsm_writer.hpp"
 #include "util.hpp"
@@ -316,7 +317,10 @@ seastar::future<std::vector<TimeStarInsert<T>>> Engine::enforceSeriesTypes(std::
         auto convert = [&]<class U>() -> bool {
             TimeStarInsert<U> out(req.measurement, req.field);
             out.setSharedTags(std::make_shared<const std::map<std::string, std::string>>(req.getTags()));
-            out.setSharedTimestamps(std::make_shared<const std::vector<uint64_t>>(req.getTimestamps()));
+            if (req.sharedTimestampBatch())
+                out.setSharedTimestamps(req.sharedTimestampBatch());
+            else
+                out.setSharedTimestamps(std::make_shared<const std::vector<uint64_t>>(req.getTimestamps()));
             out.setCachedSeriesId128(seriesId);
             out.values.reserve(req.values.size());
             for (size_t i = 0; i < req.values.size(); ++i) {
@@ -514,7 +518,7 @@ seastar::future<> Engine::indexMetadataSync(std::vector<MetadataOp> metaOps) {
     }
 
     // Group MetadataOps by target shard based on series hash
-    unsigned shardCount = seastar::smp::count;
+    unsigned shardCount = timestar::shardCount();
     std::vector<std::vector<MetadataOp>> opsByShard(shardCount);
 
     for (auto& op : metaOps) {
@@ -744,31 +748,33 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries, ui
     // oldest→newest (pinnedStores is newest-first) so that among stores the
     // newest store's copy overrides on ties as well.
     auto checkMemSeries = [&](const auto* series, auto& entry) {
-        if (!series || series->timestamps.empty())
+        if (!series || series->empty())
             return;
+        const auto& timestamps = series->timestamps();
+        const auto& values = series->values();
         if (!wantFirst) {
             // LATEST: check last element (timestamps are sorted ascending)
-            auto it = std::upper_bound(series->timestamps.begin(), series->timestamps.end(), endTime);
-            if (it == series->timestamps.begin())
+            auto it = std::upper_bound(timestamps.begin(), timestamps.end(), endTime);
+            if (it == timestamps.begin())
                 return;
             --it;
             if (*it < startTime)
                 return;
-            size_t idx = static_cast<size_t>(it - series->timestamps.begin());
-            if (!entry.resolved || series->timestamps[idx] >= entry.timestamp) {
-                entry.timestamp = series->timestamps[idx];
-                entry.value = static_cast<double>(series->values[idx]);
+            size_t idx = static_cast<size_t>(it - timestamps.begin());
+            if (!entry.resolved || timestamps[idx] >= entry.timestamp) {
+                entry.timestamp = timestamps[idx];
+                entry.value = static_cast<double>(values[idx]);
                 entry.resolved = true;
             }
         } else {
             // FIRST: check first element in range
-            auto it = std::lower_bound(series->timestamps.begin(), series->timestamps.end(), startTime);
-            if (it == series->timestamps.end() || *it > endTime)
+            auto it = std::lower_bound(timestamps.begin(), timestamps.end(), startTime);
+            if (it == timestamps.end() || *it > endTime)
                 return;
-            size_t idx = static_cast<size_t>(it - series->timestamps.begin());
-            if (!entry.resolved || series->timestamps[idx] <= entry.timestamp) {
-                entry.timestamp = series->timestamps[idx];
-                entry.value = static_cast<double>(series->values[idx]);
+            size_t idx = static_cast<size_t>(it - timestamps.begin());
+            if (!entry.resolved || timestamps[idx] <= entry.timestamp) {
+                entry.timestamp = timestamps[idx];
+                entry.value = static_cast<double>(values[idx]);
                 entry.resolved = true;
             }
         }
@@ -786,17 +792,19 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries, ui
     }
 }
 
-seastar::future<> Engine::prefetchSeriesIndices(const std::vector<SeriesId128>& seriesIds) {
+seastar::future<> Engine::prefetchSeriesIndices(const std::vector<SeriesId128>& seriesIds, uint64_t startTime,
+                                                uint64_t endTime) {
     // Snapshot TSM file pointers so compaction cannot invalidate iterators
     // across co_await suspension points.
     std::vector<seastar::shared_ptr<TSM>> tsmSnapshot;
     for (const auto& [rank, tsmFile] : tsmFileManager.getSequencedTsmFiles()) {
         tsmSnapshot.push_back(tsmFile);
     }
-    // Prefetch all TSM files in parallel (was sequential: one co_await per file).
-    co_await seastar::parallel_for_each(tsmSnapshot, [&seriesIds](seastar::shared_ptr<TSM>& tsmFile) {
-        return tsmFile->prefetchFullIndexEntries(seriesIds);
-    });
+    // Bound cold-cache prefetch fan-out; each file prunes its sparse entries by time.
+    co_await seastar::max_concurrent_for_each(
+        tsmSnapshot, 8, [&seriesIds, startTime, endTime](seastar::shared_ptr<TSM>& tsmFile) {
+            return tsmFile->prefetchFullIndexEntries(seriesIds, startTime, endTime);
+        });
 }
 
 // Rebuild day-bitmap membership lost to an unclean shutdown.

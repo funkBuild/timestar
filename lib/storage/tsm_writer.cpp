@@ -201,6 +201,67 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128& seriesId
     indexEntries[seriesId] = std::move(indexEntry);
 }
 
+template <class T>
+void TSMWriter::writeSeriesRuns(TSMValueType seriesType, const SeriesId128& seriesId,
+                                std::span<const SeriesRun<T>> runs) {
+    static_assert(!std::is_same_v<T, std::string>, "string series need one vector for their dictionary");
+    size_t remaining = 0;
+    for (const auto& run : runs) {
+        if (run.timestamps->size() != run.values->size()) {
+            throw std::invalid_argument("TSMWriter::writeSeriesRuns: timestamps (" +
+                                        std::to_string(run.timestamps->size()) + ") and values (" +
+                                        std::to_string(run.values->size()) + ") size mismatch");
+        }
+        remaining += run.timestamps->size();
+    }
+
+    TSMIndexEntry indexEntry;
+    indexEntry.seriesId = seriesId;
+    indexEntry.seriesType = seriesType;
+
+    // Block k is points [k*B, (k+1)*B) of the concatenation — the same
+    // boundaries writeSeries() uses, so the file does not depend on how the
+    // series happened to be split into runs.
+    std::vector<uint64_t> gatheredTimestamps;
+    std::vector<T> gatheredValues;
+    size_t run = 0;
+    size_t pos = 0;  // next unread point of runs[run]
+    while (remaining > 0) {
+        const size_t blockSize = std::min(remaining, static_cast<size_t>(maxPointsPerBlock_));
+        while (pos == runs[run].timestamps->size()) {
+            ++run;
+            pos = 0;
+        }
+        if (runs[run].timestamps->size() - pos >= blockSize) {
+            writeSeriesBlockAt<T>(seriesType, seriesId, *runs[run].timestamps, *runs[run].values, pos, blockSize,
+                                  indexEntry);
+            pos += blockSize;
+        } else {
+            gatheredTimestamps.clear();
+            gatheredValues.clear();
+            gatheredTimestamps.reserve(blockSize);
+            gatheredValues.reserve(blockSize);
+            for (size_t need = blockSize; need > 0;) {
+                while (pos == runs[run].timestamps->size()) {
+                    ++run;
+                    pos = 0;
+                }
+                const auto& ts = *runs[run].timestamps;
+                const auto& vals = *runs[run].values;
+                const size_t take = std::min(need, ts.size() - pos);
+                gatheredTimestamps.insert(gatheredTimestamps.end(), ts.begin() + pos, ts.begin() + pos + take);
+                gatheredValues.insert(gatheredValues.end(), vals.begin() + pos, vals.begin() + pos + take);
+                pos += take;
+                need -= take;
+            }
+            writeSeriesBlockAt<T>(seriesType, seriesId, gatheredTimestamps, gatheredValues, 0, blockSize, indexEntry);
+        }
+        remaining -= blockSize;
+    }
+
+    indexEntries[seriesId] = std::move(indexEntry);
+}
+
 // Streaming variant: identical output, but drains the buffer between blocks.
 //
 // writeSeries() emits every block of the series before returning, so a caller
@@ -900,7 +961,7 @@ void TSMWriter::writeAllSeries(TSMWriter& writer, seastar::shared_ptr<MemoryStor
     {
         size_t totalPoints = 0;
         for (auto it = store.get()->series.begin(); it != store.get()->series.end(); ++it) {
-            totalPoints += std::visit([](const auto& s) { return s.timestamps.size(); }, it.value());
+            totalPoints += std::visit([](const auto& s) { return s.size(); }, it.value());
         }
         writer.buffer.reserve(4096 + totalPoints * 9 + store.get()->series.size() * 160);
     }
@@ -910,7 +971,7 @@ void TSMWriter::writeAllSeries(TSMWriter& writer, seastar::shared_ptr<MemoryStor
         auto& memStore = it.value();
         TSMValueType seriesType = (TSMValueType)memStore.index();
 
-        size_t seriesPoints = std::visit([](const auto& s) { return s.timestamps.size(); }, memStore);
+        size_t seriesPoints = std::visit([](const auto& s) { return s.size(); }, memStore);
         LOG_INSERT_PATH(timestar::tsm_log, debug, "Processing series '{}' with {} points, type={}", seriesKey.toHex(),
                         seriesPoints, static_cast<int>(seriesType));
 
@@ -921,8 +982,22 @@ void TSMWriter::writeAllSeries(TSMWriter& writer, seastar::shared_ptr<MemoryStor
                 auto& series = std::get<InMemorySeries<T>>(memStore);
                 series.sort();
                 LOG_INSERT_PATH(timestar::tsm_log, trace, "Writing series '{}' (type {}) with {} points",
-                                seriesKey.toHex(), static_cast<int>(seriesType), series.timestamps.size());
-                writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
+                                seriesKey.toHex(), static_cast<int>(seriesType), series.size());
+                // Batches the series adopted are written from where they
+                // are; consolidating them here would copy the whole store
+                // once more on its way out.
+                if constexpr (!std::is_same_v<T, std::string>) {
+                    if (series.runCount() > 1) {
+                        std::vector<TSMWriter::SeriesRun<T>> runs;
+                        runs.reserve(series.runCount());
+                        series.forEachRun([&](const std::vector<uint64_t>& ts, const std::vector<T>& vals) {
+                            runs.push_back({&ts, &vals});
+                        });
+                        writer.writeSeriesRuns<T>(seriesType, seriesId, runs);
+                        return;
+                    }
+                }
+                writer.writeSeries(seriesType, seriesId, series.timestamps(), series.values());
             });
         } catch (const std::bad_alloc& e) {
             timestar::tsm_log.error("BAD_ALLOC when processing series '{}' with {} points", seriesKey.toHex(),
@@ -974,6 +1049,12 @@ seastar::future<> TSMWriter::runAsync(seastar::shared_ptr<MemoryStore> store, st
 }
 
 // Template instantiations
+template void TSMWriter::writeSeriesRuns<double>(TSMValueType, const SeriesId128&,
+                                                 std::span<const TSMWriter::SeriesRun<double>>);
+template void TSMWriter::writeSeriesRuns<bool>(TSMValueType, const SeriesId128&,
+                                               std::span<const TSMWriter::SeriesRun<bool>>);
+template void TSMWriter::writeSeriesRuns<int64_t>(TSMValueType, const SeriesId128&,
+                                                  std::span<const TSMWriter::SeriesRun<int64_t>>);
 template void TSMWriter::writeSeries<double>(TSMValueType seriesType, const SeriesId128& seriesId,
                                              const std::vector<uint64_t>& timestamps,
                                              const std::vector<double>& values);

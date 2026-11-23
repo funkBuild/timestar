@@ -38,8 +38,8 @@ protected:
             SeriesId128 seriesId = SeriesId128::fromSeriesKey(key);
             InMemorySeries<double> series;
             for (int i = 0; i < numPoints; ++i) {
-                series.timestamps.push_back(baseTime + i * 1000);
-                series.values.push_back(100.0 + std::sin(i * 0.1) * 10.0);
+                series.timestamps().push_back(baseTime + i * 1000);
+                series.values().push_back(100.0 + std::sin(i * 0.1) * 10.0);
             }
             store->series[seriesId] = std::move(series);
         }

@@ -73,30 +73,30 @@ TEST_F(ContentNegotiationParseTest, LeadingTrailingWhitespaceHandled) {
 class ContentNegotiationRequestTest : public ::testing::Test {};
 
 TEST_F(ContentNegotiationRequestTest, NoContentTypeDefaultsToJson) {
-    seastar::http::request req;
+    seastar::http::request req{};
     EXPECT_EQ(requestFormat(req), WireFormat::Json);
 }
 
 TEST_F(ContentNegotiationRequestTest, JsonContentTypeReturnsJson) {
-    seastar::http::request req;
+    seastar::http::request req{};
     req._headers["Content-Type"] = "application/json";
     EXPECT_EQ(requestFormat(req), WireFormat::Json);
 }
 
 TEST_F(ContentNegotiationRequestTest, ProtobufContentTypeReturnsProtobuf) {
-    seastar::http::request req;
+    seastar::http::request req{};
     req._headers["Content-Type"] = "application/x-protobuf";
     EXPECT_EQ(requestFormat(req), WireFormat::Protobuf);
 }
 
 TEST_F(ContentNegotiationRequestTest, ProtobufAltContentTypeReturnsProtobuf) {
-    seastar::http::request req;
+    seastar::http::request req{};
     req._headers["Content-Type"] = "application/protobuf";
     EXPECT_EQ(requestFormat(req), WireFormat::Protobuf);
 }
 
 TEST_F(ContentNegotiationRequestTest, JsonWithCharsetReturnsJson) {
-    seastar::http::request req;
+    seastar::http::request req{};
     req._headers["Content-Type"] = "application/json; charset=utf-8";
     EXPECT_EQ(requestFormat(req), WireFormat::Json);
 }
@@ -108,63 +108,63 @@ TEST_F(ContentNegotiationRequestTest, JsonWithCharsetReturnsJson) {
 class ContentNegotiationResponseTest : public ::testing::Test {};
 
 TEST_F(ContentNegotiationResponseTest, AcceptProtobufReturnsProtobuf) {
-    seastar::http::request req;
+    seastar::http::request req{};
     req._headers["Accept"] = "application/x-protobuf";
     EXPECT_EQ(responseFormat(req), WireFormat::Protobuf);
 }
 
 TEST_F(ContentNegotiationResponseTest, AcceptProtobufAltReturnsProtobuf) {
-    seastar::http::request req;
+    seastar::http::request req{};
     req._headers["Accept"] = "application/protobuf";
     EXPECT_EQ(responseFormat(req), WireFormat::Protobuf);
 }
 
 TEST_F(ContentNegotiationResponseTest, AcceptJsonReturnsJson) {
-    seastar::http::request req;
+    seastar::http::request req{};
     req._headers["Accept"] = "application/json";
     EXPECT_EQ(responseFormat(req), WireFormat::Json);
 }
 
 TEST_F(ContentNegotiationResponseTest, AcceptEmptyContentTypeProtobufEchoes) {
-    seastar::http::request req;
+    seastar::http::request req{};
     // No Accept header, but Content-Type is protobuf -> echo
     req._headers["Content-Type"] = "application/x-protobuf";
     EXPECT_EQ(responseFormat(req), WireFormat::Protobuf);
 }
 
 TEST_F(ContentNegotiationResponseTest, AcceptEmptyContentTypeJsonEchoes) {
-    seastar::http::request req;
+    seastar::http::request req{};
     // No Accept header, no Content-Type -> default Json
     EXPECT_EQ(responseFormat(req), WireFormat::Json);
 }
 
 TEST_F(ContentNegotiationResponseTest, AcceptEmptyContentTypeEmptyDefaultsToJson) {
-    seastar::http::request req;
+    seastar::http::request req{};
     req._headers["Content-Type"] = "application/json";
     // No Accept -> echo Content-Type (Json)
     EXPECT_EQ(responseFormat(req), WireFormat::Json);
 }
 
 TEST_F(ContentNegotiationResponseTest, AcceptMultipleWithProtobuf) {
-    seastar::http::request req;
+    seastar::http::request req{};
     req._headers["Accept"] = "application/json, application/x-protobuf";
     EXPECT_EQ(responseFormat(req), WireFormat::Protobuf);
 }
 
 TEST_F(ContentNegotiationResponseTest, AcceptMultipleWithoutProtobuf) {
-    seastar::http::request req;
+    seastar::http::request req{};
     req._headers["Accept"] = "application/json, text/html";
     EXPECT_EQ(responseFormat(req), WireFormat::Json);
 }
 
 TEST_F(ContentNegotiationResponseTest, AcceptWithQualityParameter) {
-    seastar::http::request req;
+    seastar::http::request req{};
     req._headers["Accept"] = "application/x-protobuf;q=0.9";
     EXPECT_EQ(responseFormat(req), WireFormat::Protobuf);
 }
 
 TEST_F(ContentNegotiationResponseTest, AcceptWildcardFallsBackToJson) {
-    seastar::http::request req;
+    seastar::http::request req{};
     req._headers["Accept"] = "*/*";
     EXPECT_EQ(responseFormat(req), WireFormat::Json);
 }

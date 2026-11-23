@@ -1,0 +1,7 @@
+cases=240008 mismatches=0  crc32("123456789")=cbf43926 (expect cbf43926)
+len=64      tables   4.57 GB/s   update()   4.49 GB/s   0.98x   (sink 00000000)
+len=128     tables   3.85 GB/s   update()   8.20 GB/s   2.13x   (sink 00000000)
+len=256     tables   3.49 GB/s   update()  13.90 GB/s   3.99x   (sink 00000000)
+len=1024    tables   3.27 GB/s   update()  19.66 GB/s   6.01x   (sink 00000000)
+len=16384   tables   3.21 GB/s   update()  20.85 GB/s   6.51x   (sink 00000000)
+len=262144  tables   3.19 GB/s   update()  20.97 GB/s   6.58x   (sink 00000000)

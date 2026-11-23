@@ -17,6 +17,8 @@
 // keep the explicit invoke_on loop — this template covers the "same work on
 // every shard" case, which is the bulk of the duplication.
 
+#include "shard_count.hpp"
+
 #include <iterator>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
@@ -40,7 +42,7 @@ template <class Service, class PerShard>
 auto scatterAll(seastar::sharded<Service>& sharded, PerShard perShard)
     -> seastar::future<std::vector<detail::future_value_t<std::invoke_result_t<PerShard, Service&>>>> {
     using R = detail::future_value_t<std::invoke_result_t<PerShard, Service&>>;
-    const unsigned shardCount = seastar::smp::count;
+    const unsigned shardCount = timestar::shardCount();
     std::vector<seastar::future<R>> futures;
     futures.reserve(shardCount);
     for (unsigned s = 0; s < shardCount; ++s) {

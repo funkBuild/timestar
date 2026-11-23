@@ -114,7 +114,7 @@ TEST_F(HttpAuthWrapTest, AllHandlersPassAuthTokenInSetRoutes) {
 #else
     std::string src = readFile("../bin/timestar_http_server.cpp");
 #endif
-    if (src.empty()) { GTEST_SKIP() << "Could not read server source"; }
+    ASSERT_FALSE(src.empty()) << "Could not read server source";
 
     // Every registerRoutes call should pass g_authToken
     // Count registerRoutes calls vs registerRoutes with g_authToken

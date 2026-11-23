@@ -152,7 +152,10 @@ def main():
     print(report)
 
     # Write report to file for CI artifact
-    report_path = Path(current_path).parent / "benchmark_report.md"
+    # Written next to the results file. Deliberately NOT "benchmark_report.md":
+    # that is a hand-written, tracked document in benchmark/, and a local run
+    # with results in benchmark/ used to overwrite it.
+    report_path = Path(current_path).parent / "ci_benchmark_report.md"
     report_path.write_text(report)
     print(f"\nReport written to {report_path}")
 

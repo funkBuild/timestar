@@ -1,6 +1,7 @@
+#include "../../../lib/core/placement_table.hpp"
 #include "../../../lib/encoding/float_encoder.hpp"
 #include "../../../lib/encoding/integer_encoder.hpp"
-#include "../../../lib/core/placement_table.hpp"
+#include "shard_count.hpp"
 
 #include <gtest/gtest.h>
 
@@ -68,7 +69,7 @@ int main(int argc, char** argv) {
     seastar::app_template app;
     return app.run(argc, argv, [&] {
         return seastar::async([&] {
-            timestar::setGlobalPlacement(timestar::PlacementTable::buildLocal(seastar::smp::count));
+            timestar::setGlobalPlacement(timestar::PlacementTable::buildLocal(timestar::shardCount()));
             return ::RUN_ALL_TESTS();
         });
     });

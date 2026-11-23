@@ -47,3 +47,27 @@ TEST(IntegerEncoderOverflow, AlternatingPattern) {
     verifyRoundTrip(values);
 }
 
+
+TEST(IntegerEncoderOverflow, FullUnsignedDomainAcrossBlocksAndScalarTails) {
+    constexpr uint64_t high = uint64_t{1} << 63;
+    for (size_t n : {2, 3, 7, 17, 1023, 1024, 1025, 2051}) {
+        std::vector<uint64_t> values;
+        for (size_t i = 0; i < n; ++i) {
+            const uint64_t extremes[] = {UINT64_MAX, 0, high - 1, high, 1, UINT64_MAX - 1, 7};
+            values.push_back(extremes[i % 7]);
+        }
+        verifyRoundTrip(values);
+    }
+}
+
+TEST(IntegerEncoderOverflow, FilteredDecodeCrossesSignedBoundary) {
+    constexpr uint64_t high = uint64_t{1} << 63;
+    std::vector<uint64_t> input{0, 1, high - 2, high - 1, high, high + 1, UINT64_MAX - 1, UINT64_MAX};
+    auto encoded = IntegerEncoder::encode(input);
+    Slice slice(encoded.data.data(), encoded.size());
+    std::vector<uint64_t> output;
+    const auto [skipped, added] = IntegerEncoder::decode(slice, input.size(), output, high - 1, UINT64_MAX - 1);
+    EXPECT_EQ(skipped, 3);
+    EXPECT_EQ(added, 4);
+    EXPECT_EQ(output, (std::vector<uint64_t>{high - 1, high, high + 1, UINT64_MAX - 1}));
+}

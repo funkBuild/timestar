@@ -2,7 +2,7 @@ include(FetchContent)
 FetchContent_Declare(
   googletest
   GIT_REPOSITORY https://github.com/google/googletest.git
-  GIT_TAG v1.15.2
+  GIT_TAG v1.18.0
   GIT_SHALLOW TRUE
 )
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
@@ -109,6 +109,7 @@ set(SOURCE_INSPECTION_DEFS
     LINE_PARSER_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/utils/line_parser.hpp"
     WAL_FILE_MANAGER_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/wal_file_manager.hpp"
     NATIVE_INDEX_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/native_index.cpp"
+    INDEX_WAL_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/index_wal.cpp"
     NATIVE_INDEX_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/native_index.hpp"
 )
 

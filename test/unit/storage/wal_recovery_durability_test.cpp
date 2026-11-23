@@ -50,9 +50,9 @@ TEST_F(WALRecoveryDurabilityTest, InsertMemoryWorksWithoutWAL) {
     SeriesId128 seriesId = insert.seriesId128();
     auto result = store->querySeries<double>(seriesId);
     ASSERT_NE(result, nullptr);
-    EXPECT_EQ(result->values.size(), 3);
-    EXPECT_DOUBLE_EQ(result->values[0], 50.0);
-    EXPECT_DOUBLE_EQ(result->values[2], 70.0);
+    EXPECT_EQ(result->values().size(), 3);
+    EXPECT_DOUBLE_EQ(result->values()[0], 50.0);
+    EXPECT_DOUBLE_EQ(result->values()[2], 70.0);
 }
 
 // After insertMemory without WAL, the store correctly reports non-empty state
@@ -110,8 +110,8 @@ TEST_F(WALRecoveryDurabilityTest, MultipleInsertsAccumulateWithoutWAL) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("sensor reading");
     auto result = store->querySeries<double>(seriesId);
     ASSERT_NE(result, nullptr);
-    EXPECT_EQ(result->values.size(), 100);
-    EXPECT_EQ(result->timestamps.size(), 100);
+    EXPECT_EQ(result->values().size(), 100);
+    EXPECT_EQ(result->timestamps().size(), 100);
 
     // WAL should still be null
     EXPECT_EQ(store->getWAL(), nullptr);

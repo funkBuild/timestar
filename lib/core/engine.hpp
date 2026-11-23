@@ -338,7 +338,8 @@ public:
     seastar::future<std::vector<timestar::SeriesResult>> executeLocalQuery(const timestar::ShardQuery& shardQuery);
 
     // Prefetch TSM index entries for a batch of series (warms cache before per-series queries)
-    seastar::future<> prefetchSeriesIndices(const std::vector<SeriesId128>& seriesIds);
+    seastar::future<> prefetchSeriesIndices(const std::vector<SeriesId128>& seriesIds, uint64_t startTime = 0,
+                                            uint64_t endTime = UINT64_MAX);
 
     // Pushdown aggregation: returns aggregated state directly from TSM blocks,
     // bypassing full point materialisation. Returns nullopt when pushdown is

@@ -2,6 +2,7 @@
 #include "engine.hpp"
 #include "logger.hpp"
 #include "query_result.hpp"
+#include "shard_count.hpp"
 #include "timestar_value.hpp"
 
 #include <chrono>
@@ -183,7 +184,7 @@ seastar::future<> run_benchmark(seastar::sharded<Engine>& engine) {
     std::cout << "TimeStar Performance Benchmark" << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << "Configuration:" << std::endl;
-    std::cout << "  CPU cores/shards:  " << seastar::smp::count << std::endl;
+    std::cout << "  CPU cores/shards:  " << timestar::shardCount() << std::endl;
     std::cout << "  Insert operations: " << NUM_INSERTS << std::endl;
     std::cout << "  Points per insert: " << BATCH_SIZE << std::endl;
     std::cout << "  Total data points: " << NUM_INSERTS * BATCH_SIZE << std::endl;
@@ -210,7 +211,7 @@ seastar::future<> run_benchmark(seastar::sharded<Engine>& engine) {
         // scenarios. For accurate benchmarks, use timestar_insert_bench / timestar_query_bench.
         std::hash<std::string> hasher;
         size_t hash = hasher(seriesKey);
-        unsigned targetShard = hash % seastar::smp::count;
+        unsigned targetShard = hash % timestar::shardCount();
 
         auto opStart = std::chrono::high_resolution_clock::now();
         co_await engine.invoke_on(targetShard, [insert](Engine& e) { return e.insert(insert); });
@@ -268,7 +269,7 @@ seastar::future<> run_benchmark(seastar::sharded<Engine>& engine) {
         // Determine shard
         std::hash<std::string> hasher;
         size_t hash = hasher(seriesKey);
-        unsigned targetShard = hash % seastar::smp::count;
+        unsigned targetShard = hash % timestar::shardCount();
 
         auto opStart = std::chrono::high_resolution_clock::now();
         auto result = co_await engine.invoke_on(
@@ -323,15 +324,15 @@ seastar::future<> run_benchmark(seastar::sharded<Engine>& engine) {
 
     // Memory and disk usage
     std::cout << "\n### RESOURCE USAGE ###" << std::endl;
-    std::cout << "Shards used:     " << seastar::smp::count << std::endl;
+    std::cout << "Shards used:     " << timestar::shardCount() << std::endl;
 
     // Check disk usage
     size_t totalDiskUsage = 0;
     size_t tsmFiles = 0;
     size_t walFiles = 0;
 
-    // `seastar::smp::count` is unsigned; matching it avoids -Wsign-compare.
-    for (unsigned i = 0; i < seastar::smp::count; ++i) {
+    // `timestar::shardCount()` is unsigned; matching it avoids -Wsign-compare.
+    for (unsigned i = 0; i < timestar::shardCount(); ++i) {
         std::string shardPath = "shard_" + std::to_string(i);
         if (fs::exists(shardPath)) {
             for (const auto& entry : fs::recursive_directory_iterator(shardPath)) {
@@ -374,7 +375,7 @@ int main(int argc, char** argv) {
 
     return app.run(argc, argv, []() -> seastar::future<> {
         // Initialize virtual shard placement table before engine start
-        auto pt = timestar::PlacementTable::buildLocal(seastar::smp::count);
+        auto pt = timestar::PlacementTable::buildLocal(timestar::shardCount());
         timestar::setGlobalPlacement(std::move(pt));
 
         seastar::sharded<Engine> engine;

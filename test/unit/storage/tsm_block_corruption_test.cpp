@@ -28,6 +28,12 @@
 #include "../../../lib/storage/tsm.hpp"
 #include "../../../lib/storage/tsm_writer.hpp"
 
+#include "../../../lib/encoding/integer_encoder.hpp"
+#include "../../../lib/encoding/float_encoder.hpp"
+#include "../../../lib/encoding/bool_encoder_rle.hpp"
+#include "../../../lib/encoding/string_encoder.hpp"
+#include "../../../lib/encoding/zigzag.hpp"
+
 #include <gtest/gtest.h>
 
 #include <cstring>
@@ -932,3 +938,49 @@ seastar::future<> testDescriptorMutatedDuringRead(std::string filename) {
 TEST_F(TSMBlockCorruptionTest, ReadSingleBlock_SurvivesDescriptorMutatedDuringRead) {
     testDescriptorMutatedDuringRead(getTestFilePath("0_211.tsm")).get();
 }
+
+namespace {
+template<class T>
+void checkFilteredBlockCapacity(TSM& tsm) {
+    constexpr size_t n = 8192;
+    std::vector<uint64_t> timestamps(n);
+    std::vector<T> values(n);
+    for (size_t i = 0; i < n; ++i) {
+        timestamps[i] = 1700000000000000000ULL + i * 1000;
+        if constexpr (std::is_same_v<T, std::string>) values[i] = std::to_string(i);
+        else values[i] = static_cast<T>(i % 127);
+    }
+    auto times = IntegerEncoder::encode(timestamps);
+    AlignedBuffer block;
+    block.write(static_cast<uint8_t>(TSM::getValueType<T>()));
+    block.write(static_cast<uint32_t>(n));
+    block.write(static_cast<uint32_t>(times.size()));
+    block.write(times);
+    if constexpr (std::is_same_v<T, double>) FloatEncoder::encodeInto(values, block);
+    else if constexpr (std::is_same_v<T, bool>) BoolEncoderRLE::encodeInto(values, block);
+    else if constexpr (std::is_same_v<T, std::string>) StringEncoder::encodeInto(values, block);
+    else {
+        std::vector<uint64_t> zigzag(n);
+        for (size_t i = 0; i < n; ++i) zigzag[i] = ZigZag::zigzagEncode(values[i]);
+        IntegerEncoder::encodeInto(zigzag, block);
+    }
+    for (bool empty : {false, true}) {
+        Slice slice(block.data.data(), block.size());
+        auto result = tsm.decodeBlock<T>(slice, block.size(), empty ? timestamps.back() + 1 : timestamps[4096],
+                                        empty ? UINT64_MAX : timestamps[4223]);
+        ASSERT_NE(result, nullptr);
+        EXPECT_EQ(result->size(), empty ? 0 : 128);
+        EXPECT_LE(result->timestamps.capacity(), empty ? 0 : 256);
+        EXPECT_LE(result->values.capacity(), empty ? 0 : 256);
+        for (size_t i = 0; i < result->size(); ++i) {
+            EXPECT_EQ(result->timestamps[i], timestamps[4096 + i]);
+            EXPECT_EQ(result->values[i], values[4096 + i]);
+        }
+    }
+}
+}
+
+TEST_F(TSMDecodeBlockTest, FilteredFloatBuffersFollowSurvivorCount) { checkFilteredBlockCapacity<double>(dummyTsm); }
+TEST_F(TSMDecodeBlockTest, FilteredIntegerBuffersFollowSurvivorCount) { checkFilteredBlockCapacity<int64_t>(dummyTsm); }
+TEST_F(TSMDecodeBlockTest, FilteredBooleanBuffersFollowSurvivorCount) { checkFilteredBlockCapacity<bool>(dummyTsm); }
+TEST_F(TSMDecodeBlockTest, FilteredStringBuffersFollowSurvivorCount) { checkFilteredBlockCapacity<std::string>(dummyTsm); }

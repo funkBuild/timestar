@@ -301,10 +301,10 @@ struct ShardResult {
 static future<ShardResult> runBenchmark(socket_address addr, unsigned maxConn, size_t batchSize, size_t batchCount,
                                         int numHosts, int numRacks, uint64_t globalSeed,
                                         WireFormat format = WireFormat::Json) {
-    using http_client = http::experimental::client;
+    using http_client = http::client;
 
     // Build HTTP client with connection pool.
-    auto factory = std::make_unique<http::experimental::basic_connection_factory>(addr);
+    auto factory = std::make_unique<http::basic_connection_factory>(addr);
     auto client = std::make_unique<http_client>(std::move(factory), maxConn);
 
     // Pre-generate payloads for the array formats so timing measures only
@@ -347,7 +347,7 @@ static future<ShardResult> runBenchmark(socket_address addr, unsigned maxConn, s
     // MIME type for HTTP requests.  Seastar's write_body() maps file-extension
     // strings to MIME types ("json" → "application/json").  For protobuf there
     // is no built-in mapping, so we call write_body("bin", ...) and then
-    // override the Content-Type header directly via set_mime_type().
+    // override the Content-Type header directly via set_content_type().
     const bool useProto = (format == WireFormat::Protobuf || format == WireFormat::ProtobufBatch);
 
     auto res = make_lw_shared<ShardResult>();
@@ -368,14 +368,14 @@ static future<ShardResult> runBenchmark(socket_address addr, unsigned maxConn, s
             if (format == WireFormat::ProtobufBatch) {
                 req.write_body("bin",
                                sstring(buildPayloadProtoBatch(globalSeed, numHosts, numRacks, startTs, batchSize, i)));
-                req.set_mime_type("application/x-protobuf");
+                req.set_content_type("application/x-protobuf");
             } else {
                 req.write_body("json",
                                sstring(buildPayloadJsonBatch(globalSeed, numHosts, numRacks, startTs, batchSize, i)));
             }
         } else if (useProto) {
             req.write_body("bin", sstring(payloads[i]));
-            req.set_mime_type("application/x-protobuf");
+            req.set_content_type("application/x-protobuf");
         } else {
             req.write_body("json", sstring(payloads[i]));
         }
@@ -510,8 +510,8 @@ int main(int argc, char** argv) {
 
         // ── Health check ────────────────────────────────────────────
         {
-            auto factory = std::make_unique<http::experimental::basic_connection_factory>(addr);
-            auto client = std::make_unique<http::experimental::client>(std::move(factory));
+            auto factory = std::make_unique<http::basic_connection_factory>(addr);
+            auto client = std::make_unique<http::client>(std::move(factory));
             auto req = http::request::make("GET", sstring("localhost"), sstring("/health"));
             bool healthy = false;
             try {
@@ -549,7 +549,11 @@ int main(int argc, char** argv) {
         auto result = co_await runBenchmark(addr, maxConn, batchSize, batches, numHosts, numRacks, seed, format);
 
         auto globalEnd = clk::now();
-        double wallSec = std::chrono::duration<double>(globalEnd - globalStart).count();
+        const double totalWallSec = std::chrono::duration<double>(globalEnd - globalStart).count();
+        // The worker starts this timer after pre-generating array payloads.
+        // Including generation here hides server improvements behind client CPU
+        // cost. Scalar batch formats still generate lazily inside this interval.
+        const double wallSec = std::chrono::duration<double>(result.wall_time).count();
 
         // ── Aggregate ───────────────────────────────────────────────
         LatencyStats combined = std::move(result.latency);
@@ -571,6 +575,10 @@ int main(int argc, char** argv) {
         }
         fmt::print("  Points written: {}\n", totalPts);
         fmt::print("  Wall time:      {:.3f} s\n", wallSec);
+        fmt::print("  Including setup/teardown: {:.3f} s\n", totalWallSec);
+        if (format == WireFormat::JsonBatch || format == WireFormat::ProtobufBatch) {
+            fmt::print("  Timing includes lazy scalar payload generation.\n");
+        }
         fmt::print("  Throughput:     {:.0f} pts/sec\n", totalPts / wallSec);
         fmt::print("  Batch rate:     {:.1f} batches/sec\n", totalOk / wallSec);
 
@@ -582,8 +590,8 @@ int main(int argc, char** argv) {
             fmt::print("\n  Verifying data persistence...\n");
 
             // Query the measurement to see how many points the server reports.
-            auto factory = std::make_unique<http::experimental::basic_connection_factory>(addr);
-            auto vclient = std::make_unique<http::experimental::client>(std::move(factory));
+            auto factory = std::make_unique<http::basic_connection_factory>(addr);
+            auto vclient = std::make_unique<http::client>(std::move(factory));
 
             // Build a query that covers the full time range we inserted.
             constexpr uint64_t BASE_TS = 1'000'000'000'000'000'000ULL;

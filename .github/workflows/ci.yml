@@ -81,8 +81,8 @@ jobs:
                 -GNinja \
                 -DCMAKE_BUILD_TYPE=Release \
                 "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG" \
-                -DCMAKE_C_COMPILER=gcc-14 \
-                -DCMAKE_CXX_COMPILER=g++-14 \
+                -DCMAKE_C_COMPILER=gcc-15 \
+                -DCMAKE_CXX_COMPILER=g++-15 \
                 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
                 -DCMAKE_C_COMPILER_LAUNCHER=ccache \
                 -DTIMESTAR_NATIVE_ARCH=OFF \
@@ -160,7 +160,7 @@ jobs:
             -e CCACHE_MAXSIZE=2G \
             -e CCACHE_COMPRESS=1 \
             -e COVERAGE_FAIL_UNDER_LINE=40 \
-            -e COVERAGE_CMAKE_ARGS='-G Ninja -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DTIMESTAR_NATIVE_ARCH=OFF' \
+            -e COVERAGE_CMAKE_ARGS='-G Ninja -DCMAKE_C_COMPILER=gcc-15 -DCMAKE_CXX_COMPILER=g++-15 -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DTIMESTAR_NATIVE_ARCH=OFF' \
             timestar-deps \
             bash -c 'apt-get update -qq && apt-get install -y -qq gcovr && \
               ccache -z && cd /src && ./scripts/run_coverage.sh && ccache -s'
@@ -230,12 +230,12 @@ jobs:
                 -GNinja \
                 -DCMAKE_BUILD_TYPE=Release \
                 "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG" \
-                -DCMAKE_C_COMPILER=gcc-14 \
-                -DCMAKE_CXX_COMPILER=g++-14 \
+                -DCMAKE_C_COMPILER=gcc-15 \
+                -DCMAKE_CXX_COMPILER=g++-15 \
                 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
                 -DCMAKE_C_COMPILER_LAUNCHER=ccache \
                 -DTIMESTAR_NATIVE_ARCH=OFF && \
-              ninja -j$(nproc) encoder_benchmark bool_encoder_benchmark && \
+              ninja -j$(nproc) encoder_benchmark && \
               ccache -s'
 
       - name: Run benchmarks
@@ -265,4 +265,4 @@ jobs:
           name: benchmark-results
           path: |
             benchmark-results/ci_results.json
-            benchmark/benchmark_report.md
+            benchmark-results/ci_benchmark_report.md

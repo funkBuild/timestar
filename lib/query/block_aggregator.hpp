@@ -209,11 +209,7 @@ public:
             size_t i = 0;
             while (i < n) {
                 uint64_t bucket = (timestamps[i] / interval_) * interval_;
-                uint64_t nextBucket = bucket + interval_;
-                size_t j = i + 1;
-                while (j < n && timestamps[j] < nextBucket) {
-                    ++j;
-                }
+                const size_t j = bucketRunEnd(timestamps, i, n, bucket);
                 bucketStates_[bucket].count += j - i;
                 i = j;
             }
@@ -314,7 +310,7 @@ public:
     size_t pointCount() const { return pointCount_; }
 
     // Move out bucket states (interval > 0).
-    std::unordered_map<uint64_t, AggregationState> takeBucketStates() {
+    BucketStateMap takeBucketStates() {
         // The single-bucket optimisation pre-inserts its bucket at
         // construction; if no point actually landed in it (e.g. all data fell
         // into other epoch buckets or there was no data at all), drop the
@@ -361,6 +357,33 @@ public:
     }
 
 private:
+    // Locate the end of a sorted same-bucket run. Keep sparse runs linear,
+    // then probe exponentially and binary-search the final bracket so dense
+    // buckets do not require reading every timestamp before folding values.
+    size_t bucketRunEnd(const std::vector<uint64_t>& timestamps, size_t begin, size_t end, uint64_t bucket) const {
+        const uint64_t nextBucket = bucket + interval_;
+        if (nextBucket < bucket)
+            return end;  // Final uint64_t bucket: every remaining timestamp fits.
+        size_t pos = begin + 1;
+        if (end - pos <= 8 || timestamps[pos + 7] >= nextBucket) {
+            while (pos < end && timestamps[pos] < nextBucket)
+                ++pos;
+            return pos;
+        }
+        pos += 8;
+        size_t step = 8;
+        while (pos < end) {
+            const size_t probe = pos + std::min(step, end - pos) - 1;
+            if (timestamps[probe] >= nextBucket) {
+                return std::lower_bound(timestamps.begin() + pos, timestamps.begin() + probe, nextBucket) -
+                       timestamps.begin();
+            }
+            pos = probe + 1;
+            step = std::min(step * 2, end - pos);
+        }
+        return end;
+    }
+
     // Multi-bucket fold over sorted timestamps: batch consecutive timestamps in
     // the same bucket, so each run costs one division + one hash lookup + one
     // SIMD fold instead of per-point division/hash/switch. Timestamps are
@@ -371,11 +394,7 @@ private:
         size_t i = startIdx;
         while (i < endIdx) {
             uint64_t bucket = (timestamps[i] / interval_) * interval_;
-            uint64_t nextBucket = bucket + interval_;
-            size_t j = i + 1;
-            while (j < endIdx && timestamps[j] < nextBucket) {
-                ++j;
-            }
+            const size_t j = bucketRunEnd(timestamps, i, endIdx, bucket);
             auto& state = bucketStates_[bucket];
             if (methodAware_ && (j - i) >= 4) {
                 addPointsSIMDFoldRange(timestamps, values, i, j, state);
@@ -641,17 +660,16 @@ private:
     AggregationMethod method_;
     bool methodAware_;
     // Bucketed mode
-    std::unordered_map<uint64_t, AggregationState> bucketStates_;
+    BucketStateMap bucketStates_;
     // Non-bucketed mode: compact raw storage (16 bytes/point)
     std::vector<uint64_t> timestamps_;
     std::vector<double> rawValues_;
     // Single-bucket optimisation: cached pointer to the only bucket entry,
     // avoiding per-point integer division and hash map lookup.
-    // INVARIANT: singleBucketState_ points into bucketStates_. std::unordered_map
-    // is node-based, so inserting additional buckets through the multi-bucket
+    // INVARIANT: singleBucketState_ points into bucketStates_. BucketMap never
+    // moves an entry on insertion, so adding buckets through the multi-bucket
     // path (points outside [singleBucketKey_, singleBucketKey_ + interval_),
-    // see inSingleBucket()) never invalidates this pointer — rehashing moves
-    // buckets, not nodes.
+    // see inSingleBucket()) never invalidates this pointer.
     AggregationState* singleBucketState_ = nullptr;
     uint64_t singleBucketKey_ = 0;
     // Non-bucketed fold mode: single accumulated state (streaming aggregation)
@@ -664,7 +682,7 @@ private:
 // a PartialAggregationResult by the caller.
 struct PushdownResult {
     // For bucketed (interval > 0):
-    std::unordered_map<uint64_t, AggregationState> bucketStates;
+    BucketStateMap bucketStates;
     // For non-bucketed (interval == 0) — raw values (16 bytes/point):
     std::vector<uint64_t> sortedTimestamps;
     std::vector<double> sortedValues;

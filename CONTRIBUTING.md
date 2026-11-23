@@ -10,7 +10,7 @@
 
 2. Install dependencies (Ubuntu/Debian):
    ```bash
-   sudo apt install cmake g++-14 libssl-dev \
+   sudo apt install cmake g++-15 libssl-dev \
      libboost-all-dev liblz4-dev libgnutls28-dev libsctp-dev libhwloc-dev \
      libnuma-dev libpciaccess-dev libcrypto++-dev libxml2-dev xfslibs-dev \
      systemtap-sdt-dev libyaml-cpp-dev libxxhash-dev ragel

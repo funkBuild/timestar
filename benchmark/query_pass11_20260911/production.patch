@@ -1,0 +1,162 @@
+--- a/lib/encoding/integer/integer_encoder_ffor.cpp
++++ b/lib/encoding/integer/integer_encoder_ffor.cpp
+@@ -342,9 +342,13 @@
+ }
+ 
+ // Decode one block of zigzag values from the Slice into a caller-provided buffer.
+-// Writes exactly `hdr.block_count` values to `out`. Returns the block count.
+-// The caller must ensure `out` has room for at least kBlockSize (1024) elements.
+-size_t decodeBlockInto(Slice& s, uint64_t* out) {
++// Zero-delta blocks are returned symbolically without filling `out`.
++// Other blocks write exactly `count` values; `out` has room for kBlockSize.
++struct DecodedBlock {
++    size_t count;
++    bool zeroDelta;
++};
++DecodedBlock decodeBlockInto(Slice& s, uint64_t* out) {
+     auto hdr = readBlockHeader(s);
+ 
+     // Validate bit-width: legal values are 0..64.  A corrupt block with bw > 64
+@@ -366,6 +370,10 @@
+         throw std::runtime_error("Corrupt FFOR block: exception_count exceeds block_count");
+     }
+ 
++    // No payload or exceptions: every decoded delta-of-delta is zero.
++    if (hdr.bw == 0 && hdr.base == 0 && hdr.exc_count == 0)
++        return {hdr.block_count, true};
++
+     // FFOR unpack
+     if (hdr.bw == 0) {
+         // All values are base
+@@ -434,7 +442,71 @@
+         }
+     }
+ 
+-    return hdr.block_count;
++    return {hdr.block_count, false};
++}
++
++// Write the surviving arithmetic progression directly into the output. The
++// unsigned induction variable also handles modular wraparound for full reads.
++[[gnu::noinline]] void appendProgression(std::vector<uint64_t>& out, uint64_t first, uint64_t step, size_t count) {
++    if (count == 0)
++        return;
++    const size_t start = out.size();
++    out.resize(start + count);
++    auto* dest = out.data() + start;
++    uint64_t value = first;
++    for (size_t i = 0; i < count; ++i) {
++        dest[i] = value;
++        value += step;
++    }
++}
++
++// Return true at the same first value above maxTime as the scalar decoder.
++// Closed-form filtering is used only when the run cannot wrap. Decreasing or
++// wrapped runs retain the scalar filter order (below-min is checked first).
++[[gnu::noinline]] bool appendFilteredProgression(std::vector<uint64_t>& out, uint64_t& last, uint64_t step,
++                                                size_t count, uint64_t minTime, uint64_t maxTime,
++                                                size_t& skipped, size_t& added) {
++    if (count == 0)
++        return false;
++    uint64_t span;
++    if (__builtin_mul_overflow(step, static_cast<uint64_t>(count), &span) || span > UINT64_MAX - last) {
++        for (size_t i = 0; i < count; ++i) {
++            last += step;
++            if (last < minTime) {
++                ++skipped;
++            } else if (last > maxTime) {
++                return true;
++            } else {
++                out.push_back(last);
++                ++added;
++            }
++        }
++        return false;
++    }
++    const uint64_t first = last + step;
++    const uint64_t end = last + span;
++    if (end < minTime) {
++        skipped += count;
++        last = end;
++        return false;
++    }
++    size_t skip = 0;
++    if (first < minTime) {
++        // end >= minTime implies a positive step here. Avoid overflow in ceil.
++        const uint64_t distance = minTime - first;
++        skip = distance / step + (distance % step != 0);
++    }
++    skipped += skip;
++    const uint64_t begin = first + step * skip;
++    if (begin > maxTime)
++        return true;
++    size_t take = count - skip;
++    if (end > maxTime)
++        take = (maxTime - begin) / step + 1;
++    appendProgression(out, begin, step, take);
++    added += take;
++    last = end;
++    return skip + take < count;
+ }
+ 
+ // Shared encode implementation: fuses delta-of-delta + zigzag encoding with
+@@ -619,7 +691,8 @@
+         size_t total_decoded = 0;
+ 
+         while (total_decoded < timestampSize && encoded.remaining() >= 16) {
+-            const size_t block_count = decodeBlockInto(encoded, blockBuf);
++            const auto block = decodeBlockInto(encoded, blockBuf);
++            const size_t block_count = block.count;
+ 
+             // The stream decodes in whole FFOR groups, so the final group may
+             // contain more entries than requested (callers may request fewer
+@@ -627,6 +700,19 @@
+             // so the output never exceeds timestampSize.
+             const size_t emit_count = std::min(block_count, timestampSize - total_decoded);
+             total_decoded += block_count;
++            if (block.zeroDelta) {
++                // At stream start, zero raw timestamp / first delta also form
++                // a constant run. A one-value first block keeps global_idx=1.
++                if (global_idx < 2 && emit_count) {
++                    if (global_idx == 0)
++                        last_decoded = 0;
++                    delta = 0;
++                }
++                appendProgression(values, last_decoded + delta, delta, emit_count);
++                last_decoded += delta * emit_count;
++                global_idx = std::min(size_t{2}, global_idx + emit_count);
++                continue;
++            }
+ 
+             size_t local_i = 0;
+ 
+@@ -676,7 +762,8 @@
+ 
+     while (total_decoded < timestampSize && encoded.remaining() >= 16) {
+         // Unpack one block into the stack-local buffer (L1-hot)
+-        const size_t block_count = decodeBlockInto(encoded, blockBuf);
++        const auto block = decodeBlockInto(encoded, blockBuf);
++        const size_t block_count = block.count;
+ 
+         // Clamp emission to the requested count, exactly as the unfiltered fast
+         // path above does.  The stream decodes in whole FFOR groups, so the final
+@@ -695,6 +782,18 @@
+         // different route.
+         const size_t emit_count = std::min(static_cast<size_t>(block_count), timestampSize - total_decoded);
+         total_decoded += block_count;
++        if (block.zeroDelta) {
++            if (global_idx < 2 && emit_count) {
++                if (global_idx == 0)
++                    last_decoded = 0;
++                delta = 0;
++            }
++            global_idx = std::min(size_t{2}, global_idx + emit_count);
++            if (appendFilteredProgression(values, last_decoded, delta, emit_count, minTime, maxTime,
++                                          nSkipped, nAdded))
++                return {nSkipped, nAdded};
++            continue;
++        }
+ 
+         // Determine where to start consuming values within this block.
+         // The first two values of the ENTIRE sequence need special handling:

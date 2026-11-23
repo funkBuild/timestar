@@ -20,6 +20,7 @@
 #include "../../../lib/http/http_query_handler.hpp"
 #include "../../../lib/http/http_write_handler.hpp"
 #include "../../test_helpers.hpp"
+#include "request_body.hpp"
 
 #include <glaze/json.hpp>
 
@@ -45,7 +46,7 @@ protected:
 
     static std::unique_ptr<seastar::http::request> makeJsonRequest(const std::string& body) {
         auto req = std::make_unique<seastar::http::request>();
-        req->content = body;
+        timestar::http::injectedBody(*req) = body;
         req->_headers["Content-Type"] = "application/json";
         return req;
     }
@@ -153,7 +154,7 @@ TEST_F(ApiEdgeRegressionsTest, OversizedBatchReturns413) {
         auto testCfg = savedCfg;
         testCfg.storage.wal_size_threshold = 16 * 1024 * 1024;
         timestar::setGlobalConfig(testCfg);
-        auto restoreCfg = seastar::defer([&] { timestar::setGlobalConfig(savedCfg); });
+        auto restoreCfg = seastar::defer([&] noexcept { timestar::setGlobalConfig(savedCfg); });
 
         ScopedShardedEngine eng;
         eng.start();

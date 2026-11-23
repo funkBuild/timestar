@@ -1,6 +1,7 @@
 #include "http_write_handler.hpp"
 
 #include "content_negotiation.hpp"
+#include "floating_json_array.hpp"
 #include "http_auth.hpp"
 #include "http_error.hpp"
 #include "http_routes.hpp"
@@ -9,7 +10,9 @@
 #include "placement_table.hpp"
 #include "proto_converters.hpp"
 #include "proto_write_fast_path.hpp"
+#include "request_body.hpp"
 #include "series_key.hpp"
+#include "shard_count.hpp"
 
 #include <boost/iterator/counting_iterator.hpp>
 
@@ -49,7 +52,7 @@ struct FastDoubleWritePoint {
     std::map<std::string, std::string> tags;
     std::optional<std::vector<uint64_t>> timestamps;
     std::optional<uint64_t> timestamp;
-    std::map<std::string, std::vector<double>> fields;
+    std::map<std::string, FloatingJsonArray> fields;
 };
 
 }  // namespace timestar::http
@@ -636,11 +639,11 @@ bool HttpWriteHandler::buildMWPFromFastPath(FastDoubleWritePoint& fwp, uint64_t 
     for (auto& [fieldName, values] : fwp.fields) {
         if (!isValidName(fieldName))
             return false;
-        if (values.empty())
+        if (values.values.empty())
             continue;
         FieldArrays fa;
         fa.type = FieldArrays::DOUBLE;
-        fa.doubles = std::move(values);
+        fa.doubles = std::move(values.values);
         mwp.fields[fieldName] = std::move(fa);
     }
     if (mwp.fields.empty())
@@ -777,82 +780,15 @@ tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandle
         return true;
     };
 
-    // Helper lambda: initialize a new CoalesceCandidate with metadata.
-    // Takes a shared_ptr to the tag map so that all candidates from the
-    // same write point share a single allocation (O(1) pointer copy).
-    auto initCandidate = [](CoalesceCandidate& candidate, const std::string& seriesKey, const std::string& measurement,
-                            std::shared_ptr<const std::map<std::string, std::string>> tags,
-                            const std::string& fieldName, TSMValueType valueType, const std::string& groupKey) {
-        candidate.seriesKey = seriesKey;
-        candidate.groupKey = groupKey;
-        candidate.measurement = measurement;
-        candidate.sharedTags = std::move(tags);
-        candidate.fieldName = fieldName;
-        candidate.valueType = valueType;
-    };
-
-    // Helper lambda: find or create a candidate, handling type mismatch and overflow
-    // by creating disambiguated keys. Returns a reference to the target candidate.
-    // Takes shared_ptr<const map> by value so the shared tag map is propagated
-    // without copying the underlying map data.
+    // Find or create the candidate a value belongs to. The lookup, the
+    // Integer/Float promotion and the disambiguation of conflicting types
+    // are shared with the plain-batch front-end.
     auto findOrCreateCandidate = [&](const std::string& seriesKey, const std::string& measurement,
                                      std::shared_ptr<const std::map<std::string, std::string>> tags,
                                      const std::string& fieldName, TSMValueType valueType, size_t numValuesToAdd,
                                      const std::string& groupKey) -> CoalesceCandidate& {
-        // Single hash/probe: try_emplace default-constructs the candidate only when the
-        // key is new, replacing the previous find() + operator[] double lookup.
-        auto [it, inserted] = candidates.try_emplace(seriesKey);
-        if (inserted) {
-            CoalesceCandidate& c = it.value();
-            initCandidate(c, seriesKey, measurement, std::move(tags), fieldName, valueType, groupKey);
-            return c;
-        }
-        CoalesceCandidate& existing = it.value();
-        if (existing.valueType == valueType && existing.timestamps.size() + numValuesToAdd <= MAX_COALESCE_SIZE) {
-            return existing;
-        }
-        // Integer/Float promotion: JSON serializers (e.g. JavaScript) encode
-        // exact-integer doubles like 1.0 as "1" (no decimal point), which
-        // generic_u64 parses as int64_t. Promote the candidate to Float so
-        // all numeric values for the same field are stored in one series.
-        if (existing.timestamps.size() + numValuesToAdd <= MAX_COALESCE_SIZE) {
-            if (existing.valueType == TSMValueType::Integer && valueType == TSMValueType::Float) {
-                // Promote existing integer candidate to float
-                timestar::http_log.debug("Promoting integer field to float");
-                existing.doubleValues.reserve(existing.integerValues.size() + numValuesToAdd);
-                for (int64_t v : existing.integerValues) {
-                    existing.doubleValues.push_back(static_cast<double>(v));
-                }
-                existing.integerValues.clear();
-                existing.integerValues.shrink_to_fit();
-                existing.valueType = TSMValueType::Float;
-                return existing;
-            }
-            if (existing.valueType == TSMValueType::Float && valueType == TSMValueType::Integer) {
-                // Existing is already float; caller will add value as double via addScalarToCandidate
-                // after we return with the promoted type. We just need to signal
-                // the caller to treat the incoming integer as a float.
-                // Since we return the existing Float candidate, the caller's
-                // valueType variable won't match, but the caller uses the
-                // candidate's valueType for storage. Let's handle this by
-                // returning the existing candidate directly — the caller
-                // must cast the integer to double before adding.
-                return existing;
-            }
-        }
-        // Non-numeric type mismatch or size overflow: create a disambiguated candidate
-        size_t suffix = 1;
-        static constexpr size_t MAX_DISAMBIGUATE = 10000;
-        std::string altKey;
-        do {
-            altKey = seriesKey + "#" + std::to_string(suffix++);
-            if (suffix > MAX_DISAMBIGUATE) {
-                throw std::invalid_argument("Too many type-conflicting writes for series: " + seriesKey);
-            }
-        } while (candidates.count(altKey) > 0);
-        CoalesceCandidate& c = candidates[altKey];
-        initCandidate(c, altKey, measurement, std::move(tags), fieldName, valueType, groupKey);
-        return c;
+        return findOrCreateCoalesceCandidate(candidates, seriesKey, measurement, std::move(tags), fieldName, valueType,
+                                             numValuesToAdd, groupKey);
     };
 
     // One-entry series memo (N4): batches are typically grouped by series, so
@@ -1174,6 +1110,230 @@ tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandle
     return candidates;
 }
 
+// Find or create the CoalesceCandidate for `seriesKey`, handling a type
+// mismatch or a full candidate by creating a disambiguated key. Shared by the
+// DOM and plain-batch front-ends so both resolve conflicts identically.
+HttpWriteHandler::CoalesceCandidate& HttpWriteHandler::findOrCreateCoalesceCandidate(
+    tsl::robin_map<std::string, CoalesceCandidate>& candidates, const std::string& seriesKey,
+    std::string_view measurement, std::shared_ptr<const std::map<std::string, std::string>> tags,
+    std::string_view fieldName, TSMValueType valueType, size_t numValuesToAdd, const std::string& groupKey) {
+    // All candidates from the same write point share one tag-map allocation
+    // (O(1) pointer copy).
+    auto initCandidate = [&](CoalesceCandidate& candidate, const std::string& key) {
+        candidate.seriesKey = key;
+        candidate.groupKey = groupKey;
+        candidate.measurement = measurement;
+        candidate.sharedTags = std::move(tags);
+        candidate.fieldName = fieldName;
+        candidate.valueType = valueType;
+    };
+
+    // Single hash/probe: try_emplace default-constructs the candidate only when the
+    // key is new, replacing the previous find() + operator[] double lookup.
+    auto [it, inserted] = candidates.try_emplace(seriesKey);
+    if (inserted) {
+        CoalesceCandidate& c = it.value();
+        initCandidate(c, seriesKey);
+        return c;
+    }
+    CoalesceCandidate& existing = it.value();
+    if (existing.valueType == valueType && existing.timestamps.size() + numValuesToAdd <= MAX_COALESCE_SIZE) {
+        return existing;
+    }
+    // Integer/Float promotion: JSON serializers (e.g. JavaScript) encode
+    // exact-integer doubles like 1.0 as "1" (no decimal point), which is read
+    // as an integer. Promote the candidate to Float so all numeric values for
+    // the same field are stored in one series.
+    if (existing.timestamps.size() + numValuesToAdd <= MAX_COALESCE_SIZE) {
+        if (existing.valueType == TSMValueType::Integer && valueType == TSMValueType::Float) {
+            // Promote existing integer candidate to float
+            timestar::http_log.debug("Promoting integer field to float");
+            existing.doubleValues.reserve(existing.integerValues.size() + numValuesToAdd);
+            for (int64_t v : existing.integerValues) {
+                existing.doubleValues.push_back(static_cast<double>(v));
+            }
+            existing.integerValues.clear();
+            existing.integerValues.shrink_to_fit();
+            existing.valueType = TSMValueType::Float;
+            return existing;
+        }
+        if (existing.valueType == TSMValueType::Float && valueType == TSMValueType::Integer) {
+            // Existing is already float: return it, and the caller stores the
+            // incoming integer as a double (it stores by the candidate's
+            // valueType, not the incoming one).
+            return existing;
+        }
+    }
+    // Non-numeric type mismatch or size overflow: create a disambiguated candidate
+    size_t suffix = 1;
+    static constexpr size_t MAX_DISAMBIGUATE = 10000;
+    std::string altKey;
+    do {
+        altKey = seriesKey + "#" + std::to_string(suffix++);
+        if (suffix > MAX_DISAMBIGUATE) {
+            throw std::invalid_argument("Too many type-conflicting writes for series: " + seriesKey);
+        }
+    } while (candidates.count(altKey) > 0);
+    CoalesceCandidate& c = candidates[altKey];
+    initCandidate(c, altKey);
+    return c;
+}
+
+// Candidate grouping for a plain batch (see plain_write_batch.hpp): the same
+// result buildCoalesceCandidates produces from the DOM of the same body, read
+// from the scanner's flat arrays instead. Every step that can reject a write —
+// and the order they run in — mirrors the DOM loop, because a write rejected
+// part-way keeps the fields it had already contributed.
+tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandler::buildPlainCoalesceCandidates(
+    const timestar::http::PlainWriteBatch& batch, uint64_t defaultTimestampNs, size_t& entriesSkipped,
+    size_t& totalWritesProcessed) {
+    using timestar::http::PlainField;
+    using timestar::http::PlainTag;
+
+    tsl::robin_map<std::string, CoalesceCandidate> candidates;
+    // Same adaptive pre-sizing as the DOM front-end, with its own memory of
+    // the previous batch.
+    static thread_local size_t lastUniqueSeries = 0;
+    candidates.reserve(
+        std::min(batch.writes.size() * 2, std::max<size_t>(1024, lastUniqueSeries + lastUniqueSeries / 4)));
+
+    // One-entry series memo: consecutive writes usually share measurement and
+    // tags, in which case the key prefix and the shared tag map are reused.
+    bool memoValid = false;
+    std::string_view memoMeasurement;
+    const PlainTag* memoTags = nullptr;
+    size_t memoTagCount = 0;
+    std::string measurement;  // hoisted: reused capacity across writes
+    std::string seriesKeyPrefix;
+    std::shared_ptr<const std::map<std::string, std::string>> sharedTags;
+    std::string seriesKey;
+    std::string scratchKey;  // names/values as std::string for the validators
+    std::string scratchValue;
+
+    auto sameTags = [](const PlainTag* a, size_t na, const PlainTag* b, size_t nb) {
+        if (na != nb)
+            return false;
+        for (size_t i = 0; i < na; ++i) {
+            if (a[i].key != b[i].key || a[i].value != b[i].value)
+                return false;
+        }
+        return true;
+    };
+
+    for (const auto& write : batch.writes) {
+        totalWritesProcessed++;
+
+        try {
+            measurement.assign(write.measurement);
+            {
+                auto err = validateName(measurement, "Measurement name");
+                if (!err.empty())
+                    throw std::invalid_argument(err);
+            }
+
+            const uint64_t timestamp = write.hasTimestamp ? write.timestamp : defaultTimestampNs;
+
+            const PlainTag* tags = batch.tags.data() + write.tagsBegin;
+            const size_t tagCount = write.tagsEnd - write.tagsBegin;
+
+            const bool memoHit =
+                memoValid && memoMeasurement == write.measurement && sameTags(tags, tagCount, memoTags, memoTagCount);
+            if (!memoHit) {
+                memoValid = false;  // invalidate while rebuilding
+
+                std::map<std::string, std::string> localTags;
+                for (size_t i = 0; i < tagCount; ++i) {
+                    scratchKey.assign(tags[i].key);
+                    if (!isValidName(scratchKey)) [[unlikely]]
+                        throw std::invalid_argument(validateName(scratchKey, "Tag key '" + scratchKey + "'"));
+                    scratchValue.assign(tags[i].value);
+                    if (!isValidTagValue(scratchValue)) [[unlikely]]
+                        throw std::invalid_argument(
+                            validateTagValue(scratchValue, "Tag value for '" + scratchKey + "'"));
+                    localTags[scratchKey] = scratchValue;
+                }
+
+                seriesKeyPrefix = measurement;
+                for (const auto& [tagKey, tagValue] : localTags) {
+                    seriesKeyPrefix += ",";
+                    seriesKeyPrefix += tagKey;
+                    seriesKeyPrefix += "=";
+                    seriesKeyPrefix += tagValue;
+                }
+
+                sharedTags = std::make_shared<const std::map<std::string, std::string>>(std::move(localTags));
+
+                memoMeasurement = write.measurement;
+                memoTags = tags;
+                memoTagCount = tagCount;
+                memoValid = true;
+            }
+
+            for (uint32_t f = write.fieldsBegin; f < write.fieldsEnd; ++f) {
+                const PlainField& field = batch.fields[f];
+
+                scratchKey.assign(field.name);
+                if (!isValidName(scratchKey)) [[unlikely]]
+                    throw std::invalid_argument(validateName(scratchKey, "Field name '" + scratchKey + "'"));
+
+                seriesKey = seriesKeyPrefix;
+                seriesKey += " ";
+                seriesKey += field.name;
+
+                TSMValueType valueType;
+                switch (field.kind) {
+                    case PlainField::Kind::Integer:
+                        valueType = TSMValueType::Integer;
+                        break;
+                    case PlainField::Kind::Float:
+                        valueType = TSMValueType::Float;
+                        break;
+                    case PlainField::Kind::Boolean:
+                        valueType = TSMValueType::Boolean;
+                        break;
+                    default:
+                        valueType = TSMValueType::String;
+                        break;
+                }
+
+                CoalesceCandidate& candidate = findOrCreateCoalesceCandidate(
+                    candidates, seriesKey, write.measurement, sharedTags, field.name, valueType, 1, seriesKeyPrefix);
+
+                candidate.timestamps.push_back(timestamp);
+                candidate.timestampHashSum += timestamp;
+                candidate.timestampHashXor ^= timestamp;
+                candidate.timestampHashMul = candidate.timestampHashMul * 0x9e3779b97f4a7c15ULL + timestamp;
+                // Stored by the candidate's type: an integer arriving at a
+                // candidate already promoted to Float is stored as a double.
+                switch (candidate.valueType) {
+                    case TSMValueType::Float:
+                        candidate.doubleValues.push_back(
+                            field.kind == PlainField::Kind::Integer ? static_cast<double>(field.integer) : field.real);
+                        break;
+                    case TSMValueType::Boolean:
+                        candidate.boolValues.push_back(field.boolean ? 1 : 0);
+                        break;
+                    case TSMValueType::String:
+                        candidate.stringValues.emplace_back(field.text);
+                        break;
+                    case TSMValueType::Integer:
+                        candidate.integerValues.push_back(field.integer);
+                        break;
+                    default:
+                        break;
+                }
+            }
+        } catch (const std::exception& e) {
+            ++entriesSkipped;
+            LOG_INSERT_PATH(timestar::http_log, debug, "[COALESCE] Failed to parse write: {}", e.what());
+            continue;
+        }
+    }
+
+    lastUniqueSeries = candidates.size();
+    return candidates;
+}
+
 // Second pass of coalesceWrites (field-array assembly phase): convert the
 // CoalesceCandidates into MultiWritePoint objects, merging candidates that
 // share a group key and compatible timestamps into multi-field points.
@@ -1318,6 +1478,126 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     return result;
 }
 
+// The plain-batch counterpart of coalesceWrites: same two phases, with the
+// candidates read from the scanner's flat arrays instead of a DOM.
+std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalescePlainBatch(
+    const timestar::http::PlainWriteBatch& batch, uint64_t defaultTimestampNs, size_t& entriesSkippedOut) {
+    size_t totalWritesProcessed = 0;
+    size_t entriesSkipped = 0;
+    auto candidates = buildPlainCoalesceCandidates(batch, defaultTimestampNs, entriesSkipped, totalWritesProcessed);
+
+    entriesSkippedOut = entriesSkipped;
+    if (entriesSkipped > 0) {
+        timestar::http_log.warn("[COALESCE] Skipped {} of {} entries due to parse errors", entriesSkipped,
+                                batch.writes.size());
+    }
+
+    size_t individualCount = 0;
+    return assembleCoalescedPoints(candidates, individualCount);
+}
+
+std::string HttpWriteHandler::describeCoalescedBatch(std::string_view body, uint64_t defaultTimestampNs, bool plainPath,
+                                                     bool* accepted) {
+    tsl::robin_map<std::string, CoalesceCandidate> candidates;
+    size_t entriesSkipped = 0;
+    size_t totalWritesProcessed = 0;
+    bool ok = false;
+    if (plainPath) {
+        timestar::http::PlainWriteBatch batch;
+        ok = timestar::http::scanPlainWriteBatch(body, batch, MAX_BATCH_WRITES);
+        if (ok) {
+            candidates = buildPlainCoalesceCandidates(batch, defaultTimestampNs, entriesSkipped, totalWritesProcessed);
+        }
+    } else {
+        json_value_t doc{};
+        const std::string owned(body);  // the JSON reader wants a terminator
+        if (!glz::read_json(doc, owned) && doc.is_object()) {
+            auto& obj = doc.get<json_value_t::object_t>();
+            if (obj.contains("writes") && obj["writes"].is_array()) {
+                const auto& writes = obj["writes"].get<json_value_t::array_t>();
+                if (writes.size() <= MAX_BATCH_WRITES) {
+                    ok = true;
+                    candidates =
+                        buildCoalesceCandidates(writes, defaultTimestampNs, entriesSkipped, totalWritesProcessed);
+                }
+            }
+        }
+    }
+    if (accepted) {
+        *accepted = ok;
+    }
+    if (!ok) {
+        return {};
+    }
+
+    size_t individualCount = 0;
+    const auto points = assembleCoalescedPoints(candidates, individualCount);
+
+    // One text block per point, sorted: the order points are emitted in is the
+    // candidate map's iteration order, which depends on how the previous batch
+    // sized it and is not part of the result.
+    std::vector<std::string> blocks;
+    auto hexDouble = [](double v) {
+        char buf[40];
+        std::snprintf(buf, sizeof buf, "%a", v);
+        return std::string(buf);
+    };
+    for (const auto& point : points) {
+        std::string out;
+        out += "point ";
+        out += point.measurement;
+        out += " tags{";
+        if (point.tags) {
+            for (const auto& [k, v] : *point.tags) {
+                out += k + "=" + v + ";";
+            }
+        }
+        out += "} ts[";
+        for (uint64_t t : point.timestamps) {
+            out += std::to_string(t) + ",";
+        }
+        out += "]\n";
+        for (const auto& [name, arrays] : point.fields) {
+            out += "  field " + name + " ";
+            switch (arrays.type) {
+                case FieldArrays::DOUBLE:
+                    out += "double[";
+                    for (double v : arrays.doubles) {
+                        out += hexDouble(v) + ",";
+                    }
+                    break;
+                case FieldArrays::BOOL:
+                    out += "bool[";
+                    for (auto v : arrays.bools) {
+                        out += v ? "1," : "0,";
+                    }
+                    break;
+                case FieldArrays::STRING:
+                    out += "string[";
+                    for (const auto& v : arrays.strings) {
+                        out += std::to_string(v.size()) + ":" + v + ",";
+                    }
+                    break;
+                case FieldArrays::INTEGER:
+                    out += "int[";
+                    for (int64_t v : arrays.integers) {
+                        out += std::to_string(v) + ",";
+                    }
+                    break;
+            }
+            out += "]\n";
+        }
+        blocks.push_back(std::move(out));
+    }
+    std::sort(blocks.begin(), blocks.end());
+    std::string out;
+    for (const auto& block : blocks) {
+        out += block;
+    }
+    out += "skipped " + std::to_string(entriesSkipped) + " of " + std::to_string(totalWritesProcessed) + "\n";
+    return out;
+}
+
 bool HttpWriteHandler::validateArraySizes(const MultiWritePoint& point, std::string& error) {
     // Identifier limits first (measurement/tag lengths, tag count) — these
     // mirror the index encoder's hard limits so oversized identifiers are
@@ -1385,21 +1665,9 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
     // copy + re-wrap per point).
     auto sharedTags = point.tags ? std::move(point.tags) : std::make_shared<const std::map<std::string, std::string>>();
     auto sharedTimestamps = std::make_shared<const std::vector<uint64_t>>(std::move(point.timestamps));
+    auto timestampBatch = std::make_shared<const SharedTimestampBatch>(sharedTimestamps);
 
-    // Timestamp range for MetadataOp day-bitmap coverage (first batch of a
-    // new series). Computed lazily — metaOps are only emitted for unknown
-    // series, so the common all-known path never pays the minmax scan.
-    uint64_t mwpMinTs = 0, mwpMaxTs = 0;
-    bool mwpTsRangeComputed = false;
-    auto tsRange = [&]() -> std::pair<uint64_t, uint64_t> {
-        if (!mwpTsRangeComputed && !sharedTimestamps->empty()) {
-            auto [mn, mx] = std::minmax_element(sharedTimestamps->begin(), sharedTimestamps->end());
-            mwpMinTs = *mn;
-            mwpMaxTs = *mx;
-            mwpTsRangeComputed = true;
-        }
-        return {mwpMinTs, mwpMaxTs};
-    };
+    auto tsRange = [&]() -> std::pair<uint64_t, uint64_t> { return {timestampBatch->min, timestampBatch->max}; };
 
     // Pre-build the measurement+tags prefix once for series key construction
     std::string seriesKeyPrefix;
@@ -1456,7 +1724,7 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
 
                 TimeStarInsert<double> insert(point.measurement, fieldName);
                 insert.setSharedTags(sharedTags);
-                insert.setSharedTimestamps(sharedTimestamps);
+                insert.setSharedTimestamps(timestampBatch);
                 insert.setCachedSeriesKey(std::move(seriesKey));
                 insert.setCachedSeriesId128(seriesId);
                 insert.values = std::move(fieldArray.doubles);
@@ -1483,7 +1751,7 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
 
                 TimeStarInsert<bool> insert(point.measurement, fieldName);
                 insert.setSharedTags(sharedTags);
-                insert.setSharedTimestamps(sharedTimestamps);
+                insert.setSharedTimestamps(timestampBatch);
                 insert.setCachedSeriesKey(std::move(seriesKey));
                 insert.setCachedSeriesId128(seriesId);
                 // Convert uint8_t to bool
@@ -1514,7 +1782,7 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
 
                 TimeStarInsert<std::string> insert(point.measurement, fieldName);
                 insert.setSharedTags(sharedTags);
-                insert.setSharedTimestamps(sharedTimestamps);
+                insert.setSharedTimestamps(timestampBatch);
                 insert.setCachedSeriesKey(std::move(seriesKey));
                 insert.setCachedSeriesId128(seriesId);
                 insert.values = std::move(fieldArray.strings);
@@ -1541,7 +1809,7 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
 
                 TimeStarInsert<int64_t> insert(point.measurement, fieldName);
                 insert.setSharedTags(sharedTags);
-                insert.setSharedTimestamps(sharedTimestamps);
+                insert.setSharedTimestamps(timestampBatch);
                 insert.setCachedSeriesKey(std::move(seriesKey));
                 insert.setCachedSeriesId128(seriesId);
                 insert.values = std::move(fieldArray.integers);
@@ -1566,7 +1834,7 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
     auto start_total = std::chrono::high_resolution_clock::now();
 #endif
 
-    const size_t shardCount = seastar::smp::count;
+    const size_t shardCount = timestar::shardCount();
     BatchAccumulator acc(shardCount);
     accumulateMultiWritePoint(point, acc);
 
@@ -1637,37 +1905,23 @@ std::string HttpWriteHandler::createPartialFailureResponse(int64_t pointsWritten
 }
 
 // handleWrite phase 1: read the request body and enforce size limits.
-// Parses directly from the request's body buffer. `req.content` is a
-// seastar::sstring; assigning it into a std::string is a cross-type
-// COPY of the entire body (the std::move is inert), ~2MB per bench
-// request. A view is zero-copy: `req` outlives this coroutine and
-// sstring data is null-terminated (required by Glaze's default opts).
-// On success returns true with `body` viewing the bytes (owned by
-// req.content or bodyStorage — caller locals that outlive this
-// parent-awaited coroutine). On failure (payload too large / empty body)
-// returns false with the error response fully assembled in `rep`.
-seastar::future<bool> HttpWriteHandler::readWriteBody(seastar::http::request& req, std::string& bodyStorage,
+// The body is read once into `bodyStorage` (see request_body.hpp) and parsed
+// in place: `body` views it, which is zero-copy, and sstring data is
+// NUL-terminated as Glaze's default options require. Both are caller locals
+// that outlive this parent-awaited coroutine.
+// On success returns true. On failure (payload too large / incomplete /
+// empty body) returns false with the error response fully assembled in `rep`.
+seastar::future<bool> HttpWriteHandler::readWriteBody(seastar::http::request& req, seastar::sstring& bodyStorage,
                                                       std::string_view& body, timestar::http::WireFormat resFmt,
                                                       seastar::http::reply& rep) {
-    if (!req.content.empty()) {
-        body = std::string_view(req.content.data(), req.content.size());
-    } else if (req.content_stream) {
-        // Pre-reserve from Content-Length to avoid repeated reallocations
-        // during streaming reads. Cap at maxWriteBodySize to prevent abuse.
-        if (req.content_length > 0 && req.content_length <= maxWriteBodySize()) {
-            bodyStorage.reserve(req.content_length);
-        }
-        while (!req.content_stream->eof()) {
-            auto data = co_await req.content_stream->read();
-            bodyStorage.append(data.get(), data.size());
-            if (bodyStorage.size() > maxWriteBodySize()) {
-                break;
-            }
-        }
-        body = bodyStorage;
+    const auto status = co_await timestar::http::readRequestBody(req, maxWriteBodySize(), bodyStorage);
+    if (status == timestar::http::BodyStatus::Incomplete) {
+        timestar::http::replyIncompleteBody(rep, resFmt);
+        co_return false;
     }
+    body = std::string_view(bodyStorage.data(), bodyStorage.size());
 
-    if (body.size() > maxWriteBodySize()) {
+    if (status == timestar::http::BodyStatus::TooLarge) {
         rep.set_status(seastar::http::reply::status_type::payload_too_large);
         if (timestar::http::isProtobuf(resFmt)) {
             rep._content = timestar::proto::formatWriteResponse(
@@ -1700,7 +1954,7 @@ seastar::future<bool> HttpWriteHandler::readWriteBody(seastar::http::request& re
 // directly to per-shard TimeStarInsert batches. Skips the intermediate
 // MultiWritePoint conversion and type detection heuristics.
 // Fully assembles the response (success/partial/error) into `rep`. `body`
-// views memory owned by the caller (req->content or bodyStorage), which
+// views memory owned by the caller (handleWrite's bodyStorage), which
 // outlives this parent-awaited coroutine.
 seastar::future<> HttpWriteHandler::handleProtobufWrite(std::string_view body, uint64_t defaultTimestampNs,
                                                         timestar::http::WireFormat resFmt, seastar::http::reply& rep) {
@@ -1714,7 +1968,7 @@ seastar::future<> HttpWriteHandler::handleProtobufWrite(std::string_view body, u
     int64_t pointsWritten = fastResult.totalPoints;
 
     // Group FastFieldInserts into per-shard TimeStarInsert batches
-    const size_t shardCount = seastar::smp::count;
+    const size_t shardCount = timestar::shardCount();
     std::vector<std::vector<TimeStarInsert<double>>> shardDoubleInserts(shardCount);
     std::vector<std::vector<TimeStarInsert<bool>>> shardBoolInserts(shardCount);
     std::vector<std::vector<TimeStarInsert<std::string>>> shardStringInserts(shardCount);
@@ -1736,12 +1990,16 @@ seastar::future<> HttpWriteHandler::handleProtobufWrite(std::string_view body, u
         }
     }
 
+    std::shared_ptr<const SharedTimestampBatch> timestampBatch;
     for (auto& ffi : fastResult.inserts) {
         // Compute series ID once for shard routing and metadata dedup.
         // TODO: pre-compute in parseWriteRequestFast() once libtimestar_proto_conv
         // links series_id (requires adding xxhash dependency to that target).
         SeriesId128 seriesId = SeriesId128::fromSeriesKey(ffi.seriesKey);
         size_t shard = timestar::routeToCore(seriesId);
+
+        if (!timestampBatch || timestampBatch->timestamps != ffi.timestamps)
+            timestampBatch = std::make_shared<const SharedTimestampBatch>(ffi.timestamps);
 
         // Track metadata (deduplicate by SeriesId128)
         if (seenMF.insert(seriesId).second) {
@@ -1762,12 +2020,7 @@ seastar::future<> HttpWriteHandler::handleProtobufWrite(std::string_view body, u
                         vtype = TSMValueType::Integer;
                         break;
                 }
-                uint64_t mnTs = 0, mxTs = 0;
-                if (ffi.timestamps && !ffi.timestamps->empty()) {
-                    auto [mnIt, mxIt] = std::minmax_element(ffi.timestamps->begin(), ffi.timestamps->end());
-                    mnTs = *mnIt;
-                    mxTs = *mxIt;
-                }
+                const uint64_t mnTs = timestampBatch->min, mxTs = timestampBatch->max;
                 allMetaOps.push_back(MetaOp{vtype, ffi.measurement, ffi.fieldName, *ffi.tags, mnTs, mxTs, seriesId});
             }
         }
@@ -1779,7 +2032,7 @@ seastar::future<> HttpWriteHandler::handleProtobufWrite(std::string_view body, u
             case timestar::proto::FastFieldInsert::Type::DOUBLE: {
                 TimeStarInsert<double> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
                 insert.setSharedTags(std::move(ffi.tags));
-                insert.setSharedTimestamps(std::move(ffi.timestamps));
+                insert.setSharedTimestamps(timestampBatch);
                 insert.values = std::move(ffi.doubleValues);
                 insert.setCachedSeriesKey(std::move(ffi.seriesKey));
                 insert.setCachedSeriesId128(seriesId);
@@ -1789,7 +2042,7 @@ seastar::future<> HttpWriteHandler::handleProtobufWrite(std::string_view body, u
             case timestar::proto::FastFieldInsert::Type::BOOL: {
                 TimeStarInsert<bool> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
                 insert.setSharedTags(std::move(ffi.tags));
-                insert.setSharedTimestamps(std::move(ffi.timestamps));
+                insert.setSharedTimestamps(timestampBatch);
                 insert.values.reserve(ffi.boolValues.size());
                 for (uint8_t v : ffi.boolValues) {
                     insert.values.push_back(v != 0);
@@ -1802,7 +2055,7 @@ seastar::future<> HttpWriteHandler::handleProtobufWrite(std::string_view body, u
             case timestar::proto::FastFieldInsert::Type::STRING: {
                 TimeStarInsert<std::string> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
                 insert.setSharedTags(std::move(ffi.tags));
-                insert.setSharedTimestamps(std::move(ffi.timestamps));
+                insert.setSharedTimestamps(timestampBatch);
                 insert.values = std::move(ffi.stringValues);
                 insert.setCachedSeriesKey(std::move(ffi.seriesKey));
                 insert.setCachedSeriesId128(seriesId);
@@ -1812,7 +2065,7 @@ seastar::future<> HttpWriteHandler::handleProtobufWrite(std::string_view body, u
             case timestar::proto::FastFieldInsert::Type::INTEGER: {
                 TimeStarInsert<int64_t> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
                 insert.setSharedTags(std::move(ffi.tags));
-                insert.setSharedTimestamps(std::move(ffi.timestamps));
+                insert.setSharedTimestamps(timestampBatch);
                 insert.values = std::move(ffi.integerValues);
                 insert.setCachedSeriesKey(std::move(ffi.seriesKey));
                 insert.setCachedSeriesId128(seriesId);
@@ -1890,31 +2143,6 @@ seastar::future<bool> HttpWriteHandler::tryFastDoubleWrite(std::string_view body
         FastDoubleWritePoint fwp;
         auto fast_err = glz::read_json(fwp, body);
         if (!fast_err && !fwp.measurement.empty() && !fwp.fields.empty()) {
-            // The fast struct parses every numeric as double, erasing the
-            // int/float token distinction the DOM path uses for type detection
-            // ("10" -> Integer, "10.0" -> Float). The DOM path types a field
-            // from its FIRST value's token, so when that value is integral the
-            // two paths can disagree — and which path ran depended on nothing
-            // but body size (>256 bytes). A field written twice then flapped
-            // Float/Integer across writes, producing divergent-type TSM files
-            // for one series, which is unreadable (block type mismatch) and
-            // wedges compaction. Fall back to the DOM path for exact
-            // token-level detection; real float telemetry (fractional first
-            // value) keeps the fast path.
-            bool firstValueMaybeInt = false;
-            for (const auto& [fieldName, values] : fwp.fields) {
-                if (!values.empty()) {
-                    const double v0 = values.front();
-                    if (std::isfinite(v0) && v0 == std::trunc(v0)) {
-                        firstValueMaybeInt = true;
-                        break;
-                    }
-                }
-            }
-            if (firstValueMaybeInt) {
-                co_return false;
-            }
-
             // Fast path succeeded - yield after CPU-heavy parse
             co_await seastar::coroutine::maybe_yield();
 
@@ -1951,7 +2179,6 @@ seastar::future<bool> HttpWriteHandler::processBatchWrites(const json_value_t::a
                                                            uint64_t defaultTimestampNs, int64_t& pointsWritten,
                                                            timestar::http::WireFormat resFmt,
                                                            seastar::http::reply& rep) {
-    constexpr size_t MAX_BATCH_WRITES = 100000;
     if (writes_array.size() > MAX_BATCH_WRITES) {
         rep.set_status(seastar::http::reply::status_type::bad_request);
         rep._content = createErrorResponse("Batch too large: " + std::to_string(writes_array.size()) +
@@ -1974,12 +2201,23 @@ seastar::future<bool> HttpWriteHandler::processBatchWrites(const json_value_t::a
                     writes_array.size(), coalescedWrites.size(), coalesceDuration.count());
 #endif
 
+    co_return co_await processCoalescedWrites(std::move(coalescedWrites), coalesceSkipped, pointsWritten, resFmt, rep);
+}
+
+// Batch path after coalescing, shared by the DOM and plain-batch front-ends:
+// validate, accumulate per shard, dispatch, and report. Returns true when the
+// response is already assembled in `rep`. `rep` is a caller local that
+// outlives this parent-awaited coroutine; the coalesced points are owned here.
+seastar::future<bool> HttpWriteHandler::processCoalescedWrites(std::vector<MultiWritePoint> coalescedWrites,
+                                                               size_t coalesceSkipped, int64_t& pointsWritten,
+                                                               timestar::http::WireFormat resFmt,
+                                                               seastar::http::reply& rep) {
     // Validate all MWPs up-front (before any dispatch), then accumulate
     // the ENTIRE request into one set of per-shard typed insert vectors.
     // This replaces the previous one-coroutine-per-MultiWritePoint fan-out
     // (M × shards cross-shard round trips and M WAL cycles per request)
     // with a single dispatch per active shard.
-    const size_t shardCount = seastar::smp::count;
+    const size_t shardCount = timestar::shardCount();
     BatchAccumulator acc(shardCount);
     {
         size_t accumulated = 0;
@@ -2093,7 +2331,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
     try {
         // Phase 1: read the body (buffered or streamed) and enforce size
         // limits. On failure the error response is already assembled in rep.
-        std::string bodyStorage;  // owns data only on the streaming branch
+        seastar::sstring bodyStorage;  // owns the body for the whole request
         std::string_view body;
         if (!co_await readWriteBody(*req, bodyStorage, body, resFmt, *rep)) {
             co_return rep;
@@ -2126,6 +2364,30 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
         bool fastPathHandled = false;
         if (body.size() > 256) {
             fastPathHandled = co_await tryFastDoubleWrite(body, defaultTimestampNs, pointsWritten);
+        }
+
+        // ─── Fast path: plain scalar batch ───
+        // {"writes":[...]} where every element is one plain scalar point is
+        // read in a single pass into flat arrays of views over the body (see
+        // plain_write_batch.hpp) — no DOM, so none of its per-value allocation
+        // and none of its 10-15x-the-body memory. All or nothing: anything the
+        // scanner does not recognise sends the whole request down the DOM path
+        // below, which stays the definition of what such input means.
+        if (!fastPathHandled) {
+            timestar::http::PlainWriteBatch plainBatch;
+            if (timestar::http::scanPlainWriteBatch(body, plainBatch, MAX_BATCH_WRITES)) {
+                co_await seastar::coroutine::maybe_yield();
+                size_t coalesceSkipped = 0;
+                auto coalescedWrites = coalescePlainBatch(plainBatch, defaultTimestampNs, coalesceSkipped);
+                // The coalesced points own their data; release the views
+                // before the dispatch below suspends.
+                plainBatch = {};
+                if (co_await processCoalescedWrites(std::move(coalescedWrites), coalesceSkipped, pointsWritten, resFmt,
+                                                    *rep)) {
+                    co_return rep;
+                }
+                fastPathHandled = true;
+            }
         }
 
         // ─── Standard DOM path (batch writes + mixed-type single writes) ───

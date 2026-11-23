@@ -7,6 +7,7 @@
 #include "value_type_dispatch.hpp"  // TIMESTAR_INSTANTIATE_FOR_VALUE_TYPES
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <numeric>
@@ -20,7 +21,7 @@
 // Phase 2: Welford mean/m2 via scalar (sequential dependency)
 // Phase 3: first/latest timestamp tracking (branch-heavy, not vectorizable)
 // ---------------------------------------------------------------------------
-void InMemorySeriesStats::update(const double* values, const uint64_t* timestamps, size_t n) {
+void InMemorySeriesStats::update(const double* values, const uint64_t* timestamps, size_t n, bool sorted) {
     if (n == 0)
         return;
     valid = true;
@@ -112,7 +113,7 @@ void InMemorySeriesStats::update(const double* values, const uint64_t* timestamp
     // When the batch contains NaN (validN < n), first/latest must be the
     // first/last non-NaN VALUES (canonical FIRST/LATEST semantics) — take
     // the NaN-skipping loop instead.
-    if (validN == n && std::is_sorted(timestamps, timestamps + n)) [[likely]] {
+    if (validN == n && (sorted || std::is_sorted(timestamps, timestamps + n))) [[likely]] {
         if (timestamps[0] < firstTimestamp) {
             firstTimestamp = timestamps[0];
             firstValue = values[0];
@@ -138,81 +139,336 @@ void InMemorySeriesStats::update(const double* values, const uint64_t* timestamp
     }
 }
 
+namespace {
+// Validate correction targets before modifying values. Search independent keys
+// together so cache misses can overlap; select each half without a data-dependent
+// branch. The final comparison also permits returning the one-past-end position.
+[[gnu::noinline]] bool findCorrectionTargets(const uint64_t* data, size_t size, const uint64_t* keys, size_t count,
+                                             std::vector<size_t>& targets) {
+    constexpr size_t width = 8;
+    size_t i = 0;
+    for (; count - i >= width; i += width) {
+        std::array<size_t, width> base{};
+        size_t len = size;
+        while (len > 1) {
+            const size_t half = len / 2;
+            for (size_t k = 0; k < width; ++k)
+                base[k] = data[base[k] + half] < keys[i + k] ? base[k] + half : base[k];
+            len -= half;
+        }
+        for (size_t k = 0; k < width; ++k) {
+            base[k] += data[base[k]] < keys[i + k];
+            if (base[k] == size || data[base[k]] != keys[i + k])
+                return false;
+        }
+        targets.insert(targets.end(), base.begin(), base.end());
+    }
+    for (; i < count; ++i) {
+        size_t base = 0, len = size;
+        while (len > 1) {
+            const size_t half = len / 2;
+            base = data[base + half] < keys[i] ? base + half : base;
+            len -= half;
+        }
+        base += data[base] < keys[i];
+        if (base == size || data[base] != keys[i])
+            return false;
+        targets.push_back(base);
+    }
+    return true;
+}
+
+// Small finite corrections can update central moments without reading untouched
+// points. Keep the batch's mean/M2 in extended precision; retain the full scan
+// for special values, removed extrema and ill-conditioned variance updates.
+class OverwriteStatsUpdater {
+    InMemorySeriesStats& stats;
+    long double mean;
+    long double m2;
+    const double originalM2;
+    bool usable;
+
+    void addToSum(double value) {
+        const double y = value - stats.sumCompensation;
+        const double next = stats.sum + y;
+        stats.sumCompensation = (next - stats.sum) - y;
+        stats.sum = next;
+    }
+
+public:
+    explicit OverwriteStatsUpdater(InMemorySeriesStats& current)
+        : stats(current),
+          mean(current.mean),
+          m2(current.m2),
+          originalM2(current.m2),
+          usable(current.valid && current.count > 0 && std::isfinite(current.sum) &&
+                 std::isfinite(current.sumCompensation) && std::isfinite(current.mean) && std::isfinite(current.m2) &&
+                 current.m2 >= 0 && std::abs(current.mean) <= 1e6 * std::sqrt(current.m2 / current.count)) {}
+
+    void replace(double oldValue, double newValue, uint64_t timestamp) {
+        if (!usable)
+            return;
+        if (!std::isfinite(oldValue) || !std::isfinite(newValue) || (oldValue == stats.min && newValue > oldValue) ||
+            (oldValue == stats.max && newValue < oldValue)) {
+            usable = false;
+            return;
+        }
+        if (oldValue != newValue) {
+            const long double delta = static_cast<long double>(newValue) - oldValue;
+            const long double nextMean = mean + delta / stats.count;
+            m2 +=
+                delta * ((static_cast<long double>(oldValue) - mean) + (static_cast<long double>(newValue) - nextMean));
+            mean = nextMean;
+            // Separate terms retain small new values that would round away in
+            // a double-precision (newValue - oldValue) delta.
+            addToSum(-oldValue);
+            addToSum(newValue);
+            stats.min = std::min(stats.min, newValue);
+            stats.max = std::max(stats.max, newValue);
+        }
+        if (timestamp == stats.firstTimestamp)
+            stats.firstValue = newValue;
+        if (timestamp == stats.latestTimestamp)
+            stats.latestValue = newValue;
+    }
+
+    bool finish() {
+        const double updatedM2 = static_cast<double>(m2);
+        if (!usable || m2 < 0 || !std::isfinite(updatedM2) || !std::isfinite(static_cast<double>(mean)) ||
+            !std::isfinite(stats.sum) || !std::isfinite(stats.sumCompensation))
+            return false;
+        // Check binary scale boundaries, not just this batch's relative change.
+        // Many small decreases can otherwise amplify the old summary's error
+        // without any single batch removing half its M2. Crossing a lower
+        // exponent forces a fresh scan, bounding that amplification across
+        // successive corrections without storing another per-series counter.
+        if (originalM2 > 0 && (updatedM2 == 0 || std::ilogb(updatedM2) < std::ilogb(originalM2)))
+            return false;
+        stats.mean = static_cast<double>(mean);
+        stats.m2 = updatedM2;
+        return true;
+    }
+};
+// Keep extended-precision temporaries out of the common insert function's
+// register allocation and stack frame, including appends and small-series scans.
+[[gnu::noinline]] void overwriteDoubleValues(InMemorySeries<double>& series, const std::vector<double>& incoming,
+                                             const std::vector<size_t>& targets) {
+    OverwriteStatsUpdater updater(series.stats);
+    auto& values = series.values();
+    const auto& timestamps = series.timestamps();
+    for (size_t i = 0; i < targets.size(); ++i) {
+        const size_t target = targets[i];
+        updater.replace(values[target], incoming[i], timestamps[target]);
+        values[target] = incoming[i];
+    }
+    if (!updater.finish())
+        series.recomputeStats();
+}
+}  // namespace
+
 template <class T>
 void InMemorySeries<T>::insert(TimeStarInsert<T>&& insertRequest) {
     const auto& srcTimestamps = insertRequest.getTimestamps();
     if (srcTimestamps.empty()) [[unlikely]]
         return;
 
-    const size_t oldSize = timestamps.size();
+    const auto timestampBatch = insertRequest.sharedTimestampBatch();
     const size_t newSize = srcTimestamps.size();
+
+    // Plain in-order append of a sizeable batch: adopt it as a pending run.
+    // Nothing is copied — the value vector is moved in and the timestamps_ are
+    // kept by reference when the write's fields share them — and nothing can
+    // collide, because every new timestamp is later than everything held and
+    // the batch is strictly increasing. (A double series whose stats were
+    // invalidated by a deletion takes the general path, which rebuilds them.)
+    using timestar::memory_store_detail::RunAdoption;
+    const RunAdoption adoption = timestar::memory_store_detail::runAdoption;
+    if (newSize >= kMinAdoptedRunPoints && adoption != RunAdoption::Off &&
+        (empty() || srcTimestamps.front() > lastTimestamp()) &&
+        (timestampBatch ? timestampBatch->strictlyIncreasing
+                        : std::adjacent_find(srcTimestamps.begin(), srcTimestamps.end(), std::greater_equal<>()) ==
+                              srcTimestamps.end())) {
+        bool statsUsable = true;
+        if constexpr (std::is_same_v<T, double>) {
+            statsUsable = stats.valid || empty();
+        }
+        if (statsUsable) {
+            const bool forceCopy = adoption == RunAdoption::Foreign;
+            PendingRun run;
+            if (!forceCopy && timestar::isShardLocalMemory(srcTimestamps.data())) {
+                if (timestampBatch) {
+                    run.sharedTimestamps = timestampBatch->timestamps;
+                } else {
+                    run.ownedTimestamps = std::move(insertRequest.timestamps);
+                }
+            } else {
+                run.ownedTimestamps.assign(srcTimestamps.begin(), srcTimestamps.end());
+            }
+            if constexpr (std::is_same_v<T, bool>) {
+                // Bit-packed and an eighth of a byte a point: always copied
+                // rather than asking the bitset where its words live.
+                run.values.assign(insertRequest.values.begin(), insertRequest.values.end());
+            } else {
+                if (!forceCopy && timestar::isShardLocalMemory(insertRequest.values.data())) {
+                    run.values = std::move(insertRequest.values);
+                } else {
+                    run.values.reserve(newSize);
+                    run.values.insert(run.values.end(), std::make_move_iterator(insertRequest.values.begin()),
+                                      std::make_move_iterator(insertRequest.values.end()));
+                }
+            }
+            if constexpr (std::is_same_v<T, double>) {
+                if (empty()) {
+                    stats = InMemorySeriesStats{};
+                }
+                stats.update(run.values.data(), run.timestamps().data(), newSize, true);
+            }
+            pendingPoints_ += newSize;
+            pending_.push_back(std::move(run));
+            return;
+        }
+    }
+
+    // Everything else works on the consolidated series.
+    consolidate();
+    const size_t oldSize = timestamps_.size();
 
     // Last-write-wins invariant: this method never leaves two points with the
     // same timestamp in the series. Duplicates within a batch keep the last
     // occurrence (request order); duplicates against existing data keep the
     // incoming value. Running stats are updated with the surviving new points
-    // only, and fully recomputed when an existing point was overwritten.
+    // only. Corrections update finite statistics or rebuild when necessary.
 
     if (oldSize == 0) [[unlikely]] {
         // Series is empty -- take ownership of the entire vectors via move.
-        // takeTimestamps() materializes shared timestamps into owned if needed.
-        timestamps = insertRequest.takeTimestamps();
-        values = std::move(insertRequest.values);
+        // takeTimestamps() materializes shared timestamps_ into owned if needed.
+        timestamps_ = insertRequest.takeTimestamps();
+        values_ = std::move(insertRequest.values);
 
         // First insert -- check if already sorted using std::ranges::is_sorted.
         // In typical time-series workloads, data arrives chronologically, so this
         // check short-circuits the sort in the common case.
-        if (!std::ranges::is_sorted(timestamps)) [[unlikely]] {
-            sortPaired(0, timestamps.size());
+        if (timestampBatch ? !timestampBatch->sorted : !std::ranges::is_sorted(timestamps_)) [[unlikely]] {
+            sortPaired(0, timestamps_.size());
         }
-        dedupSuffixKeepLast(0);
+        if (!timestampBatch || !timestampBatch->strictlyIncreasing)
+            dedupSuffixKeepLast(0);
 
         if constexpr (std::is_same_v<T, double>) {
-            stats.update(values.data(), timestamps.data(), timestamps.size());
+            // An emptied series starts over: whatever the summary held
+            // describes points that are gone. (MemoryStore erases a series it
+            // empties, so this only matters to a series used on its own.)
+            stats = InMemorySeriesStats{};
+            stats.update(values_.data(), timestamps_.data(), timestamps_.size(), true);
         }
         return;
+    }
+
+    if constexpr (std::is_same_v<T, double>) {
+        // A deletion invalidates the whole summary. Extending its stale count,
+        // extrema or moments and marking it valid again would corrupt pushdown.
+        if (!stats.valid)
+            recomputeStats();
     }
 
     if (newSize > SIZE_MAX - oldSize) {
         throw std::runtime_error("InMemorySeries: size overflow");
     }
     const size_t totalSize = oldSize + newSize;
+    // Small corrections to existing points need neither a full-vector merge
+    // nor a timestamp copy. Locate all targets before mutating anything; a
+    // missing timestamp falls through to the normal insert path. Request order
+    // is retained, so repeated targets still keep the last incoming value.
+    if (newSize <= oldSize / 8 && srcTimestamps.front() <= timestamps_.back()) {
+        std::vector<size_t> targets;
+        targets.reserve(newSize);
+        // Tiny requests cannot overlap a group of searches. Keep the scalar
+        // standard search here: warm single-key requests benefit from branch
+        // prediction and avoid an out-of-line helper call.
+        bool allFound = true;
+        if (newSize < 8) {
+            for (uint64_t ts : srcTimestamps) {
+                const auto it = std::lower_bound(timestamps_.begin(), timestamps_.end(), ts);
+                if (it == timestamps_.end() || *it != ts) {
+                    allFound = false;
+                    break;
+                }
+                targets.push_back(static_cast<size_t>(it - timestamps_.begin()));
+            }
+        } else {
+            allFound = findCorrectionTargets(timestamps_.data(), oldSize, srcTimestamps.data(), newSize, targets);
+        }
+        if (allFound) {
+            if constexpr (std::is_same_v<T, double>) {
+                // For short series, the fused SIMD rebuild is cheaper than
+                // updating central moments for each correction individually.
+                if (oldSize / newSize < 128) {
+                    for (size_t i = 0; i < newSize; ++i)
+                        values_[targets[i]] = insertRequest.values[i];
+                    recomputeStats();
+                } else {
+                    overwriteDoubleValues(*this, insertRequest.values, targets);
+                }
+            } else {
+                for (size_t i = 0; i < newSize; ++i)
+                    values_[targets[i]] = std::move(insertRequest.values[i]);
+            }
+            return;
+        }
+    }
     // Grow geometrically when more capacity is needed. An exact-size reserve
     // here would leave capacity == size after every append, forcing the NEXT
     // append to realloc and memcpy the entire series — O(L) copied bytes per
     // batch instead of amortized O(1).
-    if (timestamps.capacity() < totalSize) {
+    if (timestamps_.capacity() < totalSize) {
         const size_t growCap = std::max(totalSize, oldSize * 2);
-        timestamps.reserve(growCap);
-        values.reserve(growCap);
+        timestamps_.reserve(growCap);
+        values_.reserve(growCap);
     }
 
     // Append new data. insert() with iterators is optimized by the STL to
     // perform a single memcpy/memmove for trivially copyable types (uint64_t, double, bool).
-    timestamps.insert(timestamps.end(), srcTimestamps.begin(), srcTimestamps.end());
-    values.insert(values.end(), std::make_move_iterator(insertRequest.values.begin()),
-                  std::make_move_iterator(insertRequest.values.end()));
+    timestamps_.insert(timestamps_.end(), srcTimestamps.begin(), srcTimestamps.end());
+    values_.insert(values_.end(), std::make_move_iterator(insertRequest.values.begin()),
+                   std::make_move_iterator(insertRequest.values.end()));
 
     // Sort the suffix if needed. In typical time-series workloads new data
     // arrives in chronological order, so the is_sorted scan short-circuits
     // the (stable) sort in the common case.
-    if (!std::ranges::is_sorted(std::ranges::subrange(timestamps.begin() + oldSize, timestamps.end()))) [[unlikely]] {
+    if (timestampBatch
+            ? !timestampBatch->sorted
+            : !std::ranges::is_sorted(std::ranges::subrange(timestamps_.begin() + oldSize, timestamps_.end())))
+        [[unlikely]] {
         sortPaired(oldSize, totalSize);
     }
     // Collapse duplicates within the batch: last write in request order wins.
-    dedupSuffixKeepLast(oldSize);
-
-    // Update running stats with the surviving new points. If the merge below
-    // overwrites existing points, stats are recomputed from scratch instead.
-    if constexpr (std::is_same_v<T, double>) {
-        stats.update(values.data() + oldSize, timestamps.data() + oldSize, timestamps.size() - oldSize);
-    }
+    if (!timestampBatch || !timestampBatch->strictlyIncreasing)
+        dedupSuffixKeepLast(oldSize);
 
     // Fast path: strictly appending (first new timestamp is later than the
-    // old tail). Equal timestamps must NOT take this path — that's an
+    // old tail). Equal timestamps_ must NOT take this path — that's an
     // overwrite of the old tail point, handled by the merge.
-    if (timestamps[oldSize] > timestamps[oldSize - 1]) [[likely]] {
+    if (timestamps_[oldSize] > timestamps_[oldSize - 1]) [[likely]] {
+        if constexpr (std::is_same_v<T, double>)
+            stats.update(values_.data() + oldSize, timestamps_.data() + oldSize, timestamps_.size() - oldSize, true);
         return;
+    }
+
+    // Decide whether statistics can be extended before the merge moves the
+    // suffix. Avoid calculating incoming stats only to discard them on LWW.
+    if constexpr (std::is_same_v<T, double>) {
+        bool willOverwrite = false;
+        auto old = timestamps_.begin();
+        const auto oldEnd = old + oldSize;
+        for (size_t i = oldSize; i < timestamps_.size(); ++i) {
+            old = std::lower_bound(old, oldEnd, timestamps_[i]);
+            if (old != oldEnd && *old == timestamps_[i]) {
+                willOverwrite = true;
+                break;
+            }
+        }
+        if (!willOverwrite)
+            stats.update(values_.data() + oldSize, timestamps_.data() + oldSize, timestamps_.size() - oldSize, true);
     }
 
     // Both [0, oldSize) and [oldSize, end) are sorted and internally
@@ -227,13 +483,35 @@ void InMemorySeries<T>::insert(TimeStarInsert<T>&& insertRequest) {
 }
 
 template <class T>
+void InMemorySeries<T>::consolidateSlow() const {
+    // Grow geometrically, as the append path does: a series that is read
+    // while it is being written consolidates repeatedly, and an exact-size
+    // reserve each time would recopy the whole series on every read.
+    const size_t total = timestamps_.size() + pendingPoints_;
+    if (timestamps_.capacity() < total) {
+        const size_t growCap = timestamps_.empty() ? total : std::max(total, timestamps_.size() * 2);
+        timestamps_.reserve(growCap);
+        values_.reserve(growCap);
+    }
+    for (auto& run : pending_) {
+        const auto& ts = run.timestamps();
+        timestamps_.insert(timestamps_.end(), ts.begin(), ts.end());
+        values_.insert(values_.end(), std::make_move_iterator(run.values.begin()),
+                       std::make_move_iterator(run.values.end()));
+    }
+    pending_.clear();
+    pending_.shrink_to_fit();
+    pendingPoints_ = 0;
+}
+
+template <class T>
 bool InMemorySeries<T>::dedupSuffixKeepLast(size_t from) {
-    const size_t n = timestamps.size();
+    const size_t n = timestamps_.size();
     if (n - from < 2)
         return false;
-    // Fast pre-check: no adjacent equal timestamps means nothing to collapse
+    // Fast pre-check: no adjacent equal timestamps_ means nothing to collapse
     // (the suffix is sorted, so duplicates would be adjacent).
-    if (std::adjacent_find(timestamps.begin() + from, timestamps.end()) == timestamps.end()) [[likely]] {
+    if (std::adjacent_find(timestamps_.begin() + from, timestamps_.end()) == timestamps_.end()) [[likely]] {
         return false;
     }
 
@@ -241,19 +519,19 @@ bool InMemorySeries<T>::dedupSuffixKeepLast(size_t from) {
     // run. Stable sort preserved request order, so "last" == newest write.
     size_t w = from;
     for (size_t r = from + 1; r < n; ++r) {
-        if (timestamps[r] == timestamps[w]) {
-            values[w] = std::move(values[r]);
+        if (timestamps_[r] == timestamps_[w]) {
+            values_[w] = std::move(values_[r]);
         } else {
             ++w;
             if (w != r) {
-                timestamps[w] = timestamps[r];
-                values[w] = std::move(values[r]);
+                timestamps_[w] = timestamps_[r];
+                values_[w] = std::move(values_[r]);
             }
         }
     }
     ++w;
-    timestamps.resize(w);
-    values.resize(w);
+    timestamps_.resize(w);
+    values_.resize(w);
     return true;
 }
 
@@ -261,7 +539,7 @@ template <class T>
 void InMemorySeries<T>::recomputeStats() {
     if constexpr (std::is_same_v<T, double>) {
         stats = InMemorySeriesStats{};
-        stats.update(values.data(), timestamps.data(), timestamps.size());
+        stats.update(values_.data(), timestamps_.data(), timestamps_.size(), true);
     }
 }
 
@@ -272,72 +550,78 @@ void InMemorySeries<T>::sortPaired(size_t from, size_t to) {
         return;
 
     // Build index array for the range [from, to). Sorting indices lets us apply
-    // the same permutation to both timestamps and values in a single pass.
+    // the same permutation to both timestamps_ and values_ in a single pass.
     std::vector<size_t> indices(count);
     std::iota(indices.begin(), indices.end(), from);
 
-    // Stable: equal timestamps keep request order so last-write-wins dedup
+    // Stable: equal timestamps_ keep request order so last-write-wins dedup
     // can identify the newest write as the last element of each run.
     std::stable_sort(indices.begin(), indices.end(),
-                     [this](size_t a, size_t b) { return timestamps[a] < timestamps[b]; });
+                     [this](size_t a, size_t b) { return timestamps_[a] < timestamps_[b]; });
 
     // Apply permutation via temporary timestamp vector. Values are applied
     // differently based on type: std::vector<bool> uses proxy references
     // that don't support std::move, so we use copy for that specialization.
     std::vector<uint64_t> sortedTs(count);
     for (size_t i = 0; i < count; ++i) {
-        sortedTs[i] = timestamps[indices[i]];
+        sortedTs[i] = timestamps_[indices[i]];
     }
-    std::copy(sortedTs.begin(), sortedTs.end(), timestamps.begin() + from);
+    std::copy(sortedTs.begin(), sortedTs.end(), timestamps_.begin() + from);
 
     if constexpr (std::is_same_v<T, bool>) {
         std::vector<bool> sortedVals(count);
         for (size_t i = 0; i < count; ++i) {
-            sortedVals[i] = static_cast<bool>(values[indices[i]]);
+            sortedVals[i] = static_cast<bool>(values_[indices[i]]);
         }
-        std::copy(sortedVals.begin(), sortedVals.end(), values.begin() + from);
+        std::copy(sortedVals.begin(), sortedVals.end(), values_.begin() + from);
     } else {
         std::vector<T> sortedVals(count);
         for (size_t i = 0; i < count; ++i) {
-            sortedVals[i] = std::move(values[indices[i]]);
+            sortedVals[i] = std::move(values_[indices[i]]);
         }
-        std::move(sortedVals.begin(), sortedVals.end(), values.begin() + from);
+        std::move(sortedVals.begin(), sortedVals.end(), values_.begin() + from);
     }
 }
 
 template <class T>
 bool InMemorySeries<T>::mergePaired(size_t midpoint) {
-    const size_t n = timestamps.size();
+    const size_t n = timestamps_.size();
     if (midpoint == 0 || midpoint >= n) [[unlikely]]
         return false;
 
-    // Merge two sorted runs: [0, midpoint) and [midpoint, n).
+    // The prefix before the first incoming timestamp cannot change. Leave it
+    // in place: late arrivals near the tail should not copy the whole series.
+    const size_t mergeStart = static_cast<size_t>(
+        std::lower_bound(timestamps_.begin(), timestamps_.begin() + midpoint, timestamps_[midpoint]) -
+        timestamps_.begin());
+
+    // Merge two sorted runs: [mergeStart, midpoint) and [midpoint, n).
     // We use a single-pass merge into temporary buffers. This is O(n) time
     // and O(n) space, but avoids the index indirection overhead of the old
     // approach and has better cache locality (sequential reads from both runs,
     // sequential writes to output).
-    // Both runs are internally duplicate-free; on equal timestamps the suffix
+    // Both runs are internally duplicate-free; on equal timestamps_ the suffix
     // run (newer write) wins and the prefix point is dropped (LWW).
     std::vector<uint64_t> mergedTs;
     std::vector<T> mergedVals;
-    mergedTs.reserve(n);
-    mergedVals.reserve(n);
+    mergedTs.reserve(n - mergeStart);
+    mergedVals.reserve(n - mergeStart);
 
     bool overwrote = false;
-    size_t i = 0, j = midpoint;
+    size_t i = mergeStart, j = midpoint;
     while (i < midpoint && j < n) {
-        if (timestamps[i] < timestamps[j]) {
-            mergedTs.push_back(timestamps[i]);
-            mergedVals.push_back(std::move(values[i]));
+        if (timestamps_[i] < timestamps_[j]) {
+            mergedTs.push_back(timestamps_[i]);
+            mergedVals.push_back(std::move(values_[i]));
             ++i;
-        } else if (timestamps[j] < timestamps[i]) {
-            mergedTs.push_back(timestamps[j]);
-            mergedVals.push_back(std::move(values[j]));
+        } else if (timestamps_[j] < timestamps_[i]) {
+            mergedTs.push_back(timestamps_[j]);
+            mergedVals.push_back(std::move(values_[j]));
             ++j;
         } else {
             // Equal timestamp: keep the incoming value, drop the old point.
-            mergedTs.push_back(timestamps[j]);
-            mergedVals.push_back(std::move(values[j]));
+            mergedTs.push_back(timestamps_[j]);
+            mergedVals.push_back(std::move(values_[j]));
             ++i;
             ++j;
             overwrote = true;
@@ -345,18 +629,26 @@ bool InMemorySeries<T>::mergePaired(size_t midpoint) {
     }
     // Append remaining elements from whichever run is not exhausted
     while (i < midpoint) {
-        mergedTs.push_back(timestamps[i]);
-        mergedVals.push_back(std::move(values[i]));
+        mergedTs.push_back(timestamps_[i]);
+        mergedVals.push_back(std::move(values_[i]));
         ++i;
     }
     while (j < n) {
-        mergedTs.push_back(timestamps[j]);
-        mergedVals.push_back(std::move(values[j]));
+        mergedTs.push_back(timestamps_[j]);
+        mergedVals.push_back(std::move(values_[j]));
         ++j;
     }
 
-    timestamps = std::move(mergedTs);
-    values = std::move(mergedVals);
+    if (mergeStart == 0) {
+        timestamps_ = std::move(mergedTs);
+        values_ = std::move(mergedVals);
+    } else {
+        const size_t mergedSize = mergeStart + mergedTs.size();
+        std::move(mergedTs.begin(), mergedTs.end(), timestamps_.begin() + mergeStart);
+        std::move(mergedVals.begin(), mergedVals.end(), values_.begin() + mergeStart);
+        timestamps_.resize(mergedSize);
+        values_.resize(mergedSize);
+    }
     return overwrote;
 }
 
@@ -444,11 +736,11 @@ void MemoryStore::insertMemory(TimeStarInsert<T>&& insertRequest) {
     // (std::visit for empty check + std::holds_alternative for type check + std::get for access).
     auto* typedSeries = std::get_if<InMemorySeries<T>>(&variantSeries);
 
-    if (!typedSeries || typedSeries->timestamps.empty()) {
+    if (!typedSeries || typedSeries->empty()) {
         // Either wrong type (e.g. default-constructed double when T != double) or empty.
         // Before overwriting, check whether the current variant has existing data of a different type.
         if (typedSeries == nullptr) {
-            bool hasData = std::visit([](const auto& s) { return !s.timestamps.empty(); }, variantSeries);
+            bool hasData = std::visit([](const auto& s) { return !s.empty(); }, variantSeries);
             if (hasData) {
                 throw std::runtime_error("Type mismatch: series " + insertRequest.seriesKey() +
                                          " already exists with a different type");
@@ -458,7 +750,31 @@ void MemoryStore::insertMemory(TimeStarInsert<T>&& insertRequest) {
         typedSeries = &std::get<InMemorySeries<T>>(variantSeries);
     }
 
+    // A sizeable batch whose shared timestamps are another shard's memory:
+    // hand the series this shard's copy instead, made once per write.
+    if (const auto& batch = insertRequest.sharedTimestampBatch();
+        batch && batch->timestamps->size() >= InMemorySeries<T>::kMinAdoptedRunPoints &&
+        timestar::memory_store_detail::runAdoption == timestar::memory_store_detail::RunAdoption::Auto &&
+        !timestar::isShardLocalMemory(batch->timestamps->data())) {
+        insertRequest.rebindSharedTimestamps(localTimestampBatch(batch));
+    }
+
     typedSeries->insert(std::move(insertRequest));
+}
+
+std::shared_ptr<const SharedTimestampBatch> MemoryStore::localTimestampBatch(
+    const std::shared_ptr<const SharedTimestampBatch>& foreign) {
+    // Same control block == same batch: the weak reference keeps that block
+    // from being reused for another batch while it is remembered here.
+    const bool sameBatch =
+        !lastForeignTimestamps_.owner_before(foreign) && !foreign.owner_before(lastForeignTimestamps_);
+    if (!sameBatch || !lastLocalTimestamps_) {
+        auto local = std::make_shared<SharedTimestampBatch>(*foreign);
+        local->timestamps = std::make_shared<const std::vector<uint64_t>>(*foreign->timestamps);
+        lastLocalTimestamps_ = std::move(local);
+        lastForeignTimestamps_ = foreign;
+    }
+    return lastLocalTimestamps_;
 }
 
 template <class T>
@@ -681,8 +997,8 @@ void MemoryStore::deleteRange(const SeriesId128& seriesId, uint64_t startTime, u
     // Actually remove data from memory based on variant type
     std::visit(
         [&](auto& inMemorySeries) {
-            auto& timestamps = inMemorySeries.timestamps;
-            auto& values = inMemorySeries.values;
+            auto& timestamps = inMemorySeries.timestamps();
+            auto& values = inMemorySeries.values();
 
             // Binary search for the deletion range on sorted timestamps
             auto startIt = std::lower_bound(timestamps.begin(), timestamps.end(), startTime);
@@ -705,8 +1021,7 @@ void MemoryStore::deleteRange(const SeriesId128& seriesId, uint64_t startTime, u
         variantSeries);
 
     // If all data was removed, remove the series entirely
-    bool isEmpty =
-        std::visit([](const auto& inMemorySeries) { return inMemorySeries.timestamps.empty(); }, variantSeries);
+    bool isEmpty = std::visit([](const auto& inMemorySeries) { return inMemorySeries.empty(); }, variantSeries);
 
     if (isEmpty) {
         series.erase(seriesId);

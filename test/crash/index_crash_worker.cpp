@@ -4,6 +4,7 @@
 #include "key_encoding.hpp"
 #include "placement_table.hpp"
 #include "series_key.hpp"
+#include "shard_count.hpp"
 
 #include <unistd.h>
 
@@ -29,7 +30,7 @@ int main(int argc, char** argv) {
     seastar::app_template app;
     return app.run(static_cast<int>(args.size()), args.data(), [&] {
         return seastar::async([&] {
-            timestar::setGlobalPlacement(timestar::PlacementTable::buildLocal(seastar::smp::count));
+            timestar::setGlobalPlacement(timestar::PlacementTable::buildLocal(timestar::shardCount()));
             if (mode.starts_with("marker-")) {
                 timestar::index::NativeIndex index(0);
                 index.open().get();

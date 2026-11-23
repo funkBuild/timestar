@@ -1,0 +1,86 @@
+[server]
+port = 8086
+log_level = "info"
+data_dir = "."
+shutdown_timeout_seconds = 30
+auth_enabled = false
+auth_token = ""
+
+[storage]
+wal_size_threshold = 67108864
+max_points_per_block = 3000
+tsm_bloom_fpr = 0.001
+tsm_cache_entries = 4096
+wal_max_concurrent_encoders = 4
+conversion_concurrency = 6
+ingest_min_free_bytes = 268435456
+wal_sync_mode = "always"
+wal_sync_interval_ms = 100
+[storage.compaction]
+max_concurrent = 2
+max_memory = 268435456
+batch_size = 10000
+files_per_merge = 4
+tier0_starvation_ceiling = 32
+tier0_shed_ceiling = 64
+deep_block_points_cap = 24000
+
+
+[http]
+max_write_body_size = 67108864
+max_query_body_size = 1048576
+max_series_count = 10000
+max_total_points = 10000000
+query_timeout_seconds = 30
+slow_query_threshold_ms = 500
+
+[index]
+bloom_filter_bits = 15
+block_size = 16384
+write_buffer_size = 16777216
+max_open_files = 1000
+max_file_size = 67108864
+series_cache_size = 1000000
+metadata_cache_bytes = 50331648
+discovery_cache_bytes = 16777216
+block_cache_bytes = 8388608
+compaction_rate_limit_mbps = 0
+day_bitmap_flush_interval_seconds = 30
+day_bitmap_rebuild_window_days = 32
+
+[engine]
+metadata_retry_interval_seconds = 5
+max_metadata_retry_ops = 10000
+retention_sweep_interval_minutes = 15
+tombstone_dead_fraction_threshold = 0.1
+max_tombstone_rewrites_per_sweep = 2
+max_downsample_rewrites_per_sweep = 2
+downsample_rewrite_min_reduction_factor = 1.25
+[engine.io_priority]
+query_shares = 100
+write_shares = 50
+compaction_shares = 333
+flush_shares = 500
+
+
+[streaming]
+max_subscriptions_per_shard = 100
+output_queue_size = 1024
+heartbeat_interval_seconds = 15
+
+[seastar]
+# All optional — omit to use Seastar defaults
+# smp = 4
+# memory = "8G"
+# reserve_memory = "512M"
+# poll_mode = false
+# task_quota_ms = 0.5
+# overprovisioned = false
+# thread_affinity = true
+# reactor_backend = "linux-aio"
+# blocked_reactor_notify_ms = 25
+# max_networking_io_control_blocks = 10000
+# unsafe_bypass_fsync = false
+# kernel_page_cache = false
+# max_task_backlog = 1000
+# io_properties_file = ""

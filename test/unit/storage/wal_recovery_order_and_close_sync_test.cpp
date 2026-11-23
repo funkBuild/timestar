@@ -107,9 +107,9 @@ seastar::future<> testWALRecoveryRespectsSequenceOrder() {
     auto& seriesData = std::get<InMemorySeries<double>>(it->second);
 
     // After insert(1000..5000) then deleteRange(2000..4000), should have: 1000, 5000
-    EXPECT_EQ(seriesData.values.size(), 2u);
-    EXPECT_DOUBLE_EQ(seriesData.values[0], 10.0);
-    EXPECT_DOUBLE_EQ(seriesData.values[1], 50.0);
+    EXPECT_EQ(seriesData.values().size(), 2u);
+    EXPECT_DOUBLE_EQ(seriesData.values()[0], 10.0);
+    EXPECT_DOUBLE_EQ(seriesData.values()[1], 50.0);
 
     co_return;
 }
@@ -172,7 +172,7 @@ seastar::future<> testWALReplayWrongOrderYieldsDifferentResult() {
 
     // Wrong order: the delete ran on an empty store (no-op), then the insert
     // added all 5 points. All data survives incorrectly.
-    EXPECT_EQ(wrongData.values.size(), 5u)
+    EXPECT_EQ(wrongData.values().size(), 5u)
         << "Wrong replay order should produce different (incorrect) results, "
            "demonstrating why sequence sorting is critical";
 
@@ -245,9 +245,9 @@ seastar::future<> testWALRecoveryMultipleFilesCorrectOrder() {
 
     // After: insert(1000,2000,3000) + insert(4000,5000) + delete[2000,4000]
     // Remaining: 1000, 5000
-    EXPECT_EQ(data.values.size(), 2u);
-    EXPECT_DOUBLE_EQ(data.values[0], 100.0);
-    EXPECT_DOUBLE_EQ(data.values[1], 500.0);
+    EXPECT_EQ(data.values().size(), 2u);
+    EXPECT_DOUBLE_EQ(data.values()[0], 100.0);
+    EXPECT_DOUBLE_EQ(data.values()[1], 500.0);
 
     co_return;
 }
@@ -304,12 +304,12 @@ seastar::future<> testWALCloseFlushesData() {
     if (it == recoveredStore->series.end())
         co_return;
     auto& s = std::get<InMemorySeries<double>>(it->second);
-    EXPECT_EQ(s.values.size(), 5u);
-    EXPECT_DOUBLE_EQ(s.values[0], 11.1);
-    EXPECT_DOUBLE_EQ(s.values[1], 22.2);
-    EXPECT_DOUBLE_EQ(s.values[2], 33.3);
-    EXPECT_DOUBLE_EQ(s.values[3], 44.4);
-    EXPECT_DOUBLE_EQ(s.values[4], 55.5);
+    EXPECT_EQ(s.values().size(), 5u);
+    EXPECT_DOUBLE_EQ(s.values()[0], 11.1);
+    EXPECT_DOUBLE_EQ(s.values()[1], 22.2);
+    EXPECT_DOUBLE_EQ(s.values()[2], 33.3);
+    EXPECT_DOUBLE_EQ(s.values()[3], 44.4);
+    EXPECT_DOUBLE_EQ(s.values()[4], 55.5);
 
     co_return;
 }
@@ -429,9 +429,9 @@ seastar::future<> testWALCloseFlushesAfterMixedOperations() {
         co_return;
     auto& s = std::get<InMemorySeries<double>>(it->second);
     // After insert(1000,2000,3000,4000) + deleteRange(2000,3000), remaining: 1000, 4000
-    EXPECT_EQ(s.values.size(), 2u);
-    EXPECT_DOUBLE_EQ(s.values[0], 10.0);
-    EXPECT_DOUBLE_EQ(s.values[1], 40.0);
+    EXPECT_EQ(s.values().size(), 2u);
+    EXPECT_DOUBLE_EQ(s.values()[0], 10.0);
+    EXPECT_DOUBLE_EQ(s.values()[1], 40.0);
 
     co_return;
 }
@@ -469,8 +469,8 @@ seastar::future<> testWALDoubleCloseIsSafe() {
     if (it == recoveredStore->series.end())
         co_return;
     auto& s = std::get<InMemorySeries<double>>(it->second);
-    EXPECT_EQ(s.values.size(), 1u);
-    EXPECT_DOUBLE_EQ(s.values[0], 99.9);
+    EXPECT_EQ(s.values().size(), 1u);
+    EXPECT_DOUBLE_EQ(s.values()[0], 99.9);
 
     co_return;
 }

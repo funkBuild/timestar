@@ -11,6 +11,7 @@
 #include "http/http_stream_handler.hpp"
 #include "http/http_write_handler.hpp"
 #include "http/proto_converters.hpp"
+#include "shard_count.hpp"
 #include "storage/shard_rebalancer.hpp"
 #include "timestar/version.hpp"
 #include "utils/data_dir_lock.hpp"
@@ -126,7 +127,6 @@ void set_routes(routes& r) {
                       }
                   }
                   timestar::http::setContentType(*rep, resFmt);
-                  rep->done();
                   return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
               },
               "json"));
@@ -148,7 +148,6 @@ void set_routes(routes& r) {
                           timestar::jsonEscape(timestar::BUILD_TIME), timestar::jsonEscape(timestar::COMPILER)));
                   }
                   timestar::http::setContentType(*rep, resFmt);
-                  rep->done();
                   return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
               },
               "json"));
@@ -326,7 +325,7 @@ int main(int argc, char** argv) {
 
             // Initialize virtual shard placement table (Phase 5)
             // Must be done BEFORE the rebalancer, which uses routeToCore().
-            auto pt = timestar::PlacementTable::buildLocal(seastar::smp::count);
+            auto pt = timestar::PlacementTable::buildLocal(timestar::shardCount());
             timestar::setGlobalPlacement(std::move(pt));
             timestar::savePlacement(dataRoot + "/placement.json");
 
@@ -334,16 +333,16 @@ int main(int argc, char** argv) {
             {
                 timestar::ShardRebalancer rebalancer(dataRoot);
                 // Recover from any previously interrupted rebalance first
-                rebalancer.recoverIfNeeded(seastar::smp::count).get();
+                rebalancer.recoverIfNeeded(timestar::shardCount()).get();
 
-                if (rebalancer.isRebalanceNeeded(seastar::smp::count)) {
+                if (rebalancer.isRebalanceNeeded(timestar::shardCount())) {
                     timestar::http_log.info("Shard count changed from {} to {}, starting rebalance...",
-                                            rebalancer.previousShardCount(), seastar::smp::count);
-                    rebalancer.execute(seastar::smp::count).get();
+                                            rebalancer.previousShardCount(), timestar::shardCount());
+                    rebalancer.execute(timestar::shardCount()).get();
                     timestar::http_log.info("Shard rebalance complete");
                 } else {
                     // Persist current shard count for next startup
-                    timestar::ShardRebalancer::writeShardCountMeta(dataRoot, seastar::smp::count);
+                    timestar::ShardRebalancer::writeShardCountMeta(dataRoot, timestar::shardCount());
                 }
             }
 
@@ -355,7 +354,7 @@ int main(int argc, char** argv) {
             // stop() was not called after a successful start().  If any step
             // below throws, we must stop the engine before the exception
             // propagates.  The guard is disarmed once startup succeeds.
-            auto engineGuard = seastar::defer([&] {
+            auto engineGuard = seastar::defer([&] noexcept {
                 g_engine.invoke_on_all([](Engine& engine) { return engine.stop(); }).get();
                 g_engine.stop().get();
             });
@@ -404,7 +403,7 @@ int main(int argc, char** argv) {
                     .get();
 
                 // Persist shard count after successful init
-                timestar::ShardRebalancer::writeShardCountMeta(dataRoot, seastar::smp::count);
+                timestar::ShardRebalancer::writeShardCountMeta(dataRoot, timestar::shardCount());
                 timestar::http_log.info("Engine init completed on all shards");
             } catch (const std::bad_alloc& e) {
                 timestar::http_log.error("bad_alloc during Engine init: {}", e.what());
@@ -465,9 +464,16 @@ int main(int argc, char** argv) {
                 // Seastar enforces this at the connection layer before buffering the full body.
                 auto maxContentLen =
                     std::max(timestar::config().http.max_write_body_size, timestar::config().http.max_query_body_size);
+                //
+                // Content streaming: handlers read the body themselves
+                // (lib/http/request_body.hpp), so each endpoint's own limit is
+                // enforced before anything is buffered and the body is held
+                // once rather than twice while it is assembled.
                 server->server()
-                    .invoke_on_all(
-                        [maxContentLen](httpd::http_server& s) { s.set_content_length_limit(maxContentLen); })
+                    .invoke_on_all([maxContentLen](httpd::http_server& s) {
+                        s.set_content_length_limit(maxContentLen);
+                        s.set_content_streaming(true);
+                    })
                     .get();
 
                 server->set_routes(set_routes).get();
@@ -476,7 +482,6 @@ int main(int argc, char** argv) {
                 // Exposes all per-shard TimeStar counters/gauges plus Seastar
                 // built-in metrics (reactor, I/O, scheduler, memory).
                 seastar::prometheus::config promConfig;
-                promConfig.metric_help = "TimeStar TSDB metrics";
                 promConfig.prefix = "timestar";
                 seastar::prometheus::add_prometheus_routes(server->server(), promConfig).get();
 

@@ -1,0 +1,26 @@
+Release build: timestar_http_server, timestar_perf_test, timestar_unit_test succeeded.
+Native insert/query benchmark binaries were also built successfully for the comparison.
+
+Full unit suite: 3916 tests, 3906 passed, 10 skipped, zero failures.
+Command (from /tmp/tsdb-opt-tests):
+/home/matt/Desktop/source/tsdb/build/test/timestar_unit_test -c 1 --cpuset 4 --memory 6G --overprovisioned
+The scratch directory contains a lib symlink to the repository for a source-inspection test.
+An initial run lacked that symlink and failed that one test; the corrected full rerun passed.
+
+Four-shard selection: 26 tests passed, zero skips/failures. Covers the nine shard-dependent skips above.
+The remaining CRC software-fallback skip is hardware-dependent.
+/home/matt/Desktop/source/tsdb/build/test/timestar_unit_test -c 4 --cpuset 0-3 --memory 6G --overprovisioned
+--gtest_filter=QueryOverlapCompletenessTest.DroppedSeriesFailsTheQueryAndIsLoggedUnconditionally:HttpWriteHandlerAtomicityBehavioralTest.*:EngineMetadataTest.*:EngineShardRoutingTest.*:QueryOptimizationBehaviorTest.*:FloatingJsonArrayTest.*:InsertOptimizationTest.*:TSMLRUCacheParallelTest.RangePrefetchSkipsIOAndIncludesExactBoundary:TimeScopedPostingsTest.SharedTimestampDaysPreserveGapsAfterReopen
+
+Existing performance tests: 15 passed, zero failures (tmpfs scratch).
+/home/matt/Desktop/source/tsdb/build/test/timestar_perf_test -c 1 --cpuset 4 --memory 4G --overprovisioned
+--gtest_filter=OptimizationBaseline.B1_*:OptimizationBaseline.B3_*:OptimizationBaseline.B8_*:OptimizationBaseline.B9_*:TsmReadPathBenchmark.*:QueryFoldBench.*
+
+Source/benchmark validation: git diff --check passed; Python drivers parse successfully.
+Full scratch logs: /tmp/tsdb-opt-tests/{full-unit-final,multi-shard,perf-final}.log
+Build log: /tmp/tsdb-opt-final-build.log
+
+New regression tests:
+test/unit/http/floating_json_array_test.cpp
+test/unit/http/query_optimization_behavior_test.cpp
+test/unit/storage/insert_optimization_test.cpp

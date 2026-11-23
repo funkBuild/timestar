@@ -1,0 +1,22 @@
+# median ms over 3 alternating rounds, 10 streams x 100k points. mb_final = end of previous round; mb_r3_new = lazy state, inlining left to the compiler; mb_r3_pinned = lazy state + pinned inlining (library build); pinned_agg = same source, aggregator compiled on its own
+layout       method             mb_final   mb_r3_new  _r3_pinned  pinned_agg   same-result
+blocky       avg                   7.497       7.387       7.470       7.402   yes
+blocky       latest                7.624       7.388       7.564       7.539   yes
+blocky       stddev(raw)          10.869       8.892       8.912       8.904   yes
+blocky       stddev(states)       14.361      14.427      14.480      14.439   yes
+short        avg                   4.092       4.122       3.591       3.595   yes
+short        latest                4.066       3.988       3.826       3.785   yes
+short        stddev(raw)           8.557       6.230       5.360       5.341   yes
+short        stddev(states)       21.816      22.814      21.941      21.533   yes
+pairs        avg                   4.926       6.497       5.124       5.151   yes
+pairs        latest                7.662       8.000       6.826       6.735   yes
+pairs        stddev(raw)          18.798       9.136       7.002       7.177   yes
+pairs        stddev(states)       21.800      24.749      22.512      22.473   yes
+interleaved  avg                   5.226       7.079       5.258       5.299   yes
+interleaved  latest                9.194       9.961       8.872       8.858   yes
+interleaved  stddev(raw)          18.191       9.486       7.361       7.327   yes
+interleaved  stddev(states)       22.794      25.242      22.910      23.184   yes
+halfaligned  avg                   4.670       6.176       4.707       4.705   yes
+halfaligned  latest                8.572       8.848       8.456       8.490   yes
+halfaligned  stddev(raw)           9.547      10.253       9.102       8.897   yes
+halfaligned  stddev(states)       16.179      18.700      16.863      16.872   yes

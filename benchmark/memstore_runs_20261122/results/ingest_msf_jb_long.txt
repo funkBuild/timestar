@@ -1,0 +1,12 @@
+base 5424657 4.99 617820 33009252 | 1500 OK, 0 HTTP errors, 0 connection failures
+new 5277254 4.92 613704 33009252 | 1500 OK, 0 HTTP errors, 0 connection failures
+new 5095283 4.97 609488 33009252 | 1500 OK, 0 HTTP errors, 0 connection failures
+base 5291501 5.05 611668 33009252 | 1500 OK, 0 HTTP errors, 0 connection failures
+base 5174304 4.91 615864 33009252 | 1500 OK, 0 HTTP errors, 0 connection failures
+new 5387566 4.9 617528 33009252 | 1500 OK, 0 HTTP errors, 0 connection failures
+new 5285631 4.96 611156 33009252 | 1500 OK, 0 HTTP errors, 0 connection failures
+base 5121023 4.84 620048 33009252 | 1500 OK, 0 HTTP errors, 0 connection failures
+base 5244447 4.98 613128 33009252 | 1500 OK, 0 HTTP errors, 0 connection failures
+new 5368349 4.98 611136 33009252 | 1500 OK, 0 HTTP errors, 0 connection failures
+new 5320018 4.95 611296 33009252 | 1500 OK, 0 HTTP errors, 0 connection failures
+base 5325119 4.9 611996 33009252 | 1500 OK, 0 HTTP errors, 0 connection failures

@@ -150,7 +150,6 @@ static std::optional<BlockHeaderInfo> parseHeaderAndDecodeTimestamps(const uint8
         return std::nullopt;
 
     tsScratchOut.clear();
-    tsScratchOut.reserve(timestampSize);
 
     auto timestampsSlice = blockSlice.getSlice(timestampBytes);
     auto [nSkipped, nTimestamps] =
@@ -188,22 +187,10 @@ static size_t decodeIntegerBlockIntoAggregator(const uint8_t* data, uint32_t blo
     if (!hdr || hdr->nTimestamps == 0)
         return 0;
 
-    // Decode zigzag-encoded integers into scratch, then convert to double for the aggregator.
-    static thread_local std::vector<uint64_t> zigzagScratch;
-    zigzagScratch.clear();
-    zigzagScratch.reserve(hdr->nSkipped + hdr->nTimestamps);
-    Slice valuesSlice(data + hdr->valueOffset, hdr->valueByteSize);
-    IntegerEncoder::decode(valuesSlice, hdr->nSkipped + hdr->nTimestamps, zigzagScratch);
-
     valScratch.clear();
-    valScratch.reserve(hdr->nTimestamps);
-    // The value decoder decodes whole FFOR groups, so zigzagScratch may hold up
-    // to a full group beyond nSkipped+nTimestamps; bound the loop so values stay
-    // in sync with the decoded timestamps.
-    const size_t valueEnd = std::min(hdr->nSkipped + hdr->nTimestamps, zigzagScratch.size());
-    for (size_t i = hdr->nSkipped; i < valueEnd; ++i) {
-        valScratch.push_back(static_cast<double>(ZigZag::zigzagDecode(zigzagScratch[i])));
-    }
+    Slice valuesSlice(data + hdr->valueOffset, hdr->valueByteSize);
+    IntegerEncoder::decodeSigned(valuesSlice, hdr->nSkipped + hdr->nTimestamps, hdr->nSkipped, hdr->nTimestamps,
+                                 valScratch);
 
     aggregator.addPoints(tsScratch, valScratch);
     return tsScratch.size();
@@ -822,7 +809,8 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
 // Sorts entries by file offset and merges adjacent reads into larger chunks
 // to reduce syscall count. A 256KB coalesce window typically merges 10-50
 // individual reads into 1-2 DMA operations.
-seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& seriesIds) {
+seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& seriesIds, uint64_t startTime,
+                                                uint64_t endTime) {
     // Collect entries that need fetching, with their file offsets for sorting
     struct FetchEntry {
         SeriesId128 id;
@@ -838,7 +826,7 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
         if (!seriesBloomFilter.contains(seriesId.getRawData()))
             continue;
         auto sparseIt = sparseIndex.find(seriesId);
-        if (sparseIt == sparseIndex.end())
+        if (sparseIt == sparseIndex.end() || sparseIt->second.minTime > endTime || sparseIt->second.maxTime < startTime)
             continue;
         toFetch.push_back({seriesId, sparseIt->second.fileOffset, sparseIt->second.entrySize});
     }
@@ -1244,12 +1232,13 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlockImpl(const TSM
                                      " but reader expects type " + std::to_string(static_cast<uint8_t>(expectedType)));
         }
 
-        auto blockResults = std::make_unique<TSMBlock<T>>(timestampSize);
+        auto blockResults = std::make_unique<TSMBlock<T>>(startTime == 0 && endTime == UINT64_MAX ? timestampSize : 0);
         auto timestampsSlice = blockSlice.getSlice(timestampBytes);
         std::tie(ctx.nSkipped, ctx.nTimestamps) =
             IntegerEncoder::decode(timestampsSlice, timestampSize, blockResults->timestamps, startTime, endTime);
         const size_t nSkipped = ctx.nSkipped;
         const size_t nTimestamps = ctx.nTimestamps;
+        blockResults->values.reserve(nTimestamps);
         ctx.valueByteSize = indexBlock.size - timestampBytes - BLOCK_HEADER_SIZE;
         const size_t valueByteSize = ctx.valueByteSize;
 
@@ -1270,15 +1259,7 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlockImpl(const TSM
             }
         } else if constexpr (std::is_same_v<T, int64_t>) {
             auto valuesSlice = blockSlice.getSlice(valueByteSize);
-            // Coroutine-local buffer — thread_local is unsafe in coroutines because
-            // another coroutine on the same thread could clear it during a co_await.
-            std::vector<uint64_t> rawUintScratch;
-            IntegerEncoder::decode(valuesSlice, timestampSize, rawUintScratch);
-            blockResults->values.reserve(nTimestamps);
-            size_t end = std::min(nSkipped + nTimestamps, rawUintScratch.size());
-            for (size_t i = nSkipped; i < end; ++i) {
-                blockResults->values.push_back(ZigZag::zigzagDecode(rawUintScratch[i]));
-            }
+            IntegerEncoder::decodeSigned(valuesSlice, timestampSize, nSkipped, nTimestamps, blockResults->values);
         }
 
         // Same count contract as decodeBlockFlat(): these per-block decoders build a
@@ -1462,10 +1443,11 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(Slice& blockSlice, uint32_t blockS
     }
 
     // Decode timestamps with time-range filtering
-    auto blockResults = std::make_unique<TSMBlock<T>>(timestampSize);
+    auto blockResults = std::make_unique<TSMBlock<T>>(startTime == 0 && endTime == UINT64_MAX ? timestampSize : 0);
     auto timestampsSlice = blockSlice.getSlice(timestampBytes);
     auto [nSkipped, nTimestamps] =
         IntegerEncoder::decode(timestampsSlice, timestampSize, blockResults->timestamps, startTime, endTime);
+    blockResults->values.reserve(nTimestamps);
 
     // Decode values based on type — guard against unsigned underflow before subtraction
     if (timestampBytes + BLOCK_HEADER_SIZE > blockSize) {
@@ -1491,15 +1473,7 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(Slice& blockSlice, uint32_t blockS
         }
     } else if constexpr (std::is_same_v<T, int64_t>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        // Coroutine-local buffer — thread_local is unsafe in coroutines because
-        // another coroutine on the same thread could clear it during a co_await.
-        std::vector<uint64_t> rawUintScratch;
-        IntegerEncoder::decode(valuesSlice, timestampSize, rawUintScratch);
-        blockResults->values.reserve(nTimestamps);
-        size_t end = std::min(nSkipped + nTimestamps, rawUintScratch.size());
-        for (size_t i = nSkipped; i < end; ++i) {
-            blockResults->values.push_back(ZigZag::zigzagDecode(rawUintScratch[i]));
-        }
+        IntegerEncoder::decodeSigned(valuesSlice, timestampSize, nSkipped, nTimestamps, blockResults->values);
     }
 
     // Same count contract as decodeBlockFlat(): these per-block decoders build a
@@ -1570,15 +1544,7 @@ static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t 
         }
     } else if constexpr (std::is_same_v<T, int64_t>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        // Coroutine-local buffer — thread_local is unsafe in coroutines because
-        // another coroutine on the same thread could clear it during a co_await.
-        std::vector<uint64_t> rawUintScratch;
-        IntegerEncoder::decode(valuesSlice, timestampSize, rawUintScratch);
-        size_t end = std::min(nSkipped + nTimestamps, rawUintScratch.size());
-        for (size_t i = nSkipped; i < end; ++i) {
-            outValues.push_back(ZigZag::zigzagDecode(rawUintScratch[i]));
-        }
-        produced = (end > nSkipped) ? (end - nSkipped) : 0;
+        produced = IntegerEncoder::decodeSigned(valuesSlice, timestampSize, nSkipped, nTimestamps, outValues);
     }
 
     // ---- THE COUNT CONTRACT, enforced once for every value type ----

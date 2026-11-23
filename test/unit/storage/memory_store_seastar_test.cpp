@@ -102,8 +102,8 @@ seastar::future<> testMemoryStoreInitFromWAL() {
         if (cpuIt == recoveredStore->series.end())
             co_return;
         auto& cpuData = std::get<InMemorySeries<double>>(cpuIt->second);
-        EXPECT_EQ(cpuData.values.size(), 2);
-        EXPECT_DOUBLE_EQ(cpuData.values[0], 25.5);
+        EXPECT_EQ(cpuData.values().size(), 2);
+        EXPECT_DOUBLE_EQ(cpuData.values()[0], 25.5);
 
         // Verify bool series
         TimeStarInsert<bool> statusInsert("status", "online");
@@ -119,7 +119,7 @@ seastar::future<> testMemoryStoreInitFromWAL() {
         if (appIt == recoveredStore->series.end())
             co_return;
         auto& appData = std::get<InMemorySeries<std::string>>(appIt->second);
-        EXPECT_EQ(appData.values[0], "running");
+        EXPECT_EQ(appData.values()[0], "running");
     }
 
     co_return;
@@ -149,7 +149,7 @@ seastar::future<> testMemoryStoreBatchInsert() {
     if (it == store->series.end())
         co_return;
     auto& data = std::get<InMemorySeries<double>>(it->second);
-    EXPECT_EQ(data.values.size(), 100);
+    EXPECT_EQ(data.values().size(), 100);
 
     co_await store->close();
     co_return;

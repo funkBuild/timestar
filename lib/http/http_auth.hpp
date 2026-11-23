@@ -67,7 +67,7 @@ public:
                                                                   std::unique_ptr<seastar::http::request> req,
                                                                   std::unique_ptr<seastar::http::reply> rep) override {
         if (auto deny = checkAuth(*req, token_)) {
-            deny->done("json");
+            deny->set_content_type("json");
             co_return std::move(deny);
         }
         co_return co_await inner_->handle(path, std::move(req), std::move(rep));

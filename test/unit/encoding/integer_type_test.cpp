@@ -8,7 +8,9 @@
 #include <gtest/gtest.h>
 
 #include <climits>
+#include <bit>
 #include <cstdint>
+#include <cstring>
 #include <numeric>
 #include <random>
 #include <string>
@@ -17,6 +19,66 @@
 
 // The variant used by the HTTP write handler and internally for field values.
 using TimeStarValue = std::variant<double, bool, std::string, int64_t>;
+
+TEST(IntegerSignedRangeTest, MatchesSignedOracleAcrossRangesAndUnalignedStreams) {
+    constexpr size_t n = 4097;
+    std::mt19937_64 rng(42);
+    for (int shape = 0; shape < 6; ++shape) {
+        std::vector<int64_t> input(n);
+        for (size_t i = 0; i < n; ++i) {
+            switch (shape) {
+                case 0: input[i] = -7; break;
+                case 1: input[i] = i; break;
+                case 2: input[i] = -static_cast<int64_t>(i); break;
+                case 3: input[i] = i % 2 ? INT64_MIN : INT64_MAX; break;
+                case 4: input[i] = std::bit_cast<int64_t>(rng()); break;
+                default: input[i] = i % 1024 == 0 ? INT64_MIN : static_cast<int64_t>(i % 127) - 63;
+            }
+        }
+        auto encoded = IntegerEncoder::encode(ZigZag::zigzagEncodeVector(input));
+        for (size_t offset = 0; offset < 8; ++offset) {
+            std::vector<uint8_t> bytes(offset + encoded.size());
+            std::memcpy(bytes.data() + offset, encoded.data.data(), encoded.size());
+            for (size_t total : {size_t{0}, size_t{1}, size_t{1023}, size_t{1025}, n, n + 7}) {
+                for (auto [skip, length] : std::vector<std::pair<size_t, size_t>>{
+                         {0, SIZE_MAX}, {1, 1}, {15, 17}, {16, 17}, {17, 17}, {1023, 3}, {1024, 128}, {n - 128, 128}, {n, 0}, {SIZE_MAX, SIZE_MAX}}) {
+                    SCOPED_TRACE(::testing::Message() << shape << ":" << offset << ":" << total << ":" << skip << ":" << length);
+                    size_t first = std::min(skip, std::min(total, n));
+                    size_t count = std::min(length, std::min(total, n) - first);
+                    std::vector<int64_t> result{123, -456};
+                    std::vector<double> doubles{123, -456};
+                    Slice slice(bytes.data() + offset, encoded.size());
+                    Slice doubleSlice(bytes.data() + offset, encoded.size());
+                    EXPECT_EQ(IntegerEncoder::decodeSigned(slice, total, skip, length, result), count);
+                    EXPECT_EQ(IntegerEncoder::decodeSigned(doubleSlice, total, skip, length, doubles), count);
+                    ASSERT_EQ(result.size(), count + 2);
+                    ASSERT_EQ(doubles.size(), count + 2);
+                    EXPECT_EQ(result[0], 123); EXPECT_EQ(result[1], -456);
+                    EXPECT_EQ(doubles[0], 123); EXPECT_EQ(doubles[1], -456);
+                    for (size_t j = 0; j < count; ++j) {
+                        ASSERT_EQ(result[j + 2], input[first + j]);
+                        ASSERT_EQ(doubles[j + 2], static_cast<double>(input[first + j]));
+                    }
+                    Slice reference(bytes.data() + offset, encoded.size());
+                    std::vector<uint64_t> raw;
+                    IntegerEncoder::decode(reference, total, raw);
+                    EXPECT_EQ(slice.offset, reference.offset);
+                    EXPECT_EQ(doubleSlice.offset, reference.offset);
+                }
+            }
+        }
+    }
+}
+
+TEST(IntegerSignedRangeTest, EmptySelectionDoesNotAllocate) {
+    std::vector<uint64_t> input(65537, 14);
+    auto encoded = IntegerEncoder::encode(input);
+    Slice slice(encoded.data.data(), encoded.size());
+    std::vector<int64_t> result;
+    EXPECT_EQ(IntegerEncoder::decodeSigned(slice, input.size(), input.size(), 0, result), 0);
+    EXPECT_EQ(result.capacity(), 0);
+    EXPECT_EQ(slice.offset, encoded.size());
+}
 
 class IntegerTypeTest : public ::testing::Test {
 protected:

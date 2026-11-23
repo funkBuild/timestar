@@ -134,6 +134,15 @@ struct HttpConfig {
     uint64_t max_total_points = 10000000;
     uint32_t query_timeout_seconds = 30;
     uint32_t slow_query_threshold_ms = 500;  // Log queries slower than this (0 = disabled)
+
+    // JSON /query results with at least this many points are streamed to an
+    // HTTP/1.1 client with chunked transfer encoding as they are formatted,
+    // instead of being assembled whole and sent with a Content-Length. The
+    // body bytes are identical; what changes is that the server holds a
+    // couple of ~512KB segments rather than the full body (twice, while it is
+    // copied into the connection). 0 disables streaming. Smaller results, and
+    // any HTTP/1.0 client, always get a Content-Length response.
+    uint64_t stream_response_min_points = 65536;
 };
 
 struct IndexConfig {
@@ -336,10 +345,11 @@ struct glz::meta<timestar::StorageConfig> {
 template <>
 struct glz::meta<timestar::HttpConfig> {
     using T = timestar::HttpConfig;
-    static constexpr auto value = object(
-        "max_write_body_size", &T::max_write_body_size, "max_query_body_size", &T::max_query_body_size,
-        "max_series_count", &T::max_series_count, "max_total_points", &T::max_total_points, "query_timeout_seconds",
-        &T::query_timeout_seconds, "slow_query_threshold_ms", &T::slow_query_threshold_ms);
+    static constexpr auto value =
+        object("max_write_body_size", &T::max_write_body_size, "max_query_body_size", &T::max_query_body_size,
+               "max_series_count", &T::max_series_count, "max_total_points", &T::max_total_points,
+               "query_timeout_seconds", &T::query_timeout_seconds, "slow_query_threshold_ms",
+               &T::slow_query_threshold_ms, "stream_response_min_points", &T::stream_response_min_points);
 };
 
 template <>

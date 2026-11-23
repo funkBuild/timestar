@@ -160,7 +160,7 @@ SEASTAR_TEST_F(IndexTransactionRecoveryTest, MissingSourceMetadataLeavesPruningD
 
 SEASTAR_TEST_F(IndexTransactionRecoveryTest, FailedBackgroundFlushCanBeRetriedWithoutRestart) {
     const auto previous = timestar::config();
-    auto restore = seastar::defer([&previous] { timestar::setGlobalConfig(previous); });
+    auto restore = seastar::defer([&previous] noexcept { timestar::setGlobalConfig(previous); });
     {
         NativeIndex index(0);
         co_await index.open();

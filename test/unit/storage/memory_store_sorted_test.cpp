@@ -20,21 +20,21 @@ protected:
     // Expects that value == timestamp * factor (for double series).
     template <typename T>
     void verifySorted(const InMemorySeries<T>& series) {
-        ASSERT_EQ(series.timestamps.size(), series.values.size());
-        for (size_t i = 1; i < series.timestamps.size(); ++i) {
-            EXPECT_LE(series.timestamps[i - 1], series.timestamps[i])
-                << "Timestamps not sorted at index " << i << ": " << series.timestamps[i - 1] << " > "
-                << series.timestamps[i];
+        ASSERT_EQ(series.timestamps().size(), series.values().size());
+        for (size_t i = 1; i < series.timestamps().size(); ++i) {
+            EXPECT_LE(series.timestamps()[i - 1], series.timestamps()[i])
+                << "Timestamps not sorted at index " << i << ": " << series.timestamps()[i - 1] << " > "
+                << series.timestamps()[i];
         }
     }
 
     // Helper: verify that each value equals its timestamp cast to double
     // (used when we set value = static_cast<double>(timestamp))
     void verifyPairing(const InMemorySeries<double>& series) {
-        for (size_t i = 0; i < series.timestamps.size(); ++i) {
-            EXPECT_DOUBLE_EQ(series.values[i], static_cast<double>(series.timestamps[i]))
-                << "Value/timestamp mismatch at index " << i << ": timestamp=" << series.timestamps[i]
-                << " value=" << series.values[i];
+        for (size_t i = 0; i < series.timestamps().size(); ++i) {
+            EXPECT_DOUBLE_EQ(series.values()[i], static_cast<double>(series.timestamps()[i]))
+                << "Value/timestamp mismatch at index " << i << ": timestamp=" << series.timestamps()[i]
+                << " value=" << series.values()[i];
         }
     }
 };
@@ -54,7 +54,7 @@ TEST_F(MemoryStoreSortedTest, InOrderInsertsRemainSorted) {
 
     verifySorted(series);
     verifyPairing(series);
-    EXPECT_EQ(series.timestamps.size(), 5);
+    EXPECT_EQ(series.timestamps().size(), 5);
 }
 
 // --- Test: Out-of-order single batch results in sorted data ---
@@ -72,7 +72,7 @@ TEST_F(MemoryStoreSortedTest, OutOfOrderSingleBatchGetsSorted) {
 
     verifySorted(series);
     verifyPairing(series);
-    EXPECT_EQ(series.timestamps.size(), 5);
+    EXPECT_EQ(series.timestamps().size(), 5);
 }
 
 // --- Test: Multiple sequential batches with in-order data ---
@@ -95,7 +95,7 @@ TEST_F(MemoryStoreSortedTest, MultipleInOrderBatches) {
 
     verifySorted(series);
     verifyPairing(series);
-    EXPECT_EQ(series.timestamps.size(), 6);
+    EXPECT_EQ(series.timestamps().size(), 6);
 }
 
 // --- Test: Second batch arrives before first batch's timestamps ---
@@ -118,13 +118,13 @@ TEST_F(MemoryStoreSortedTest, LateArrivingBatch) {
 
     verifySorted(series);
     verifyPairing(series);
-    EXPECT_EQ(series.timestamps.size(), 6);
+    EXPECT_EQ(series.timestamps().size(), 6);
 
     // Verify the order is correct
-    EXPECT_EQ(series.timestamps[0], 1000);
-    EXPECT_EQ(series.timestamps[5], 6000);
-    EXPECT_DOUBLE_EQ(series.values[0], 1000.0);
-    EXPECT_DOUBLE_EQ(series.values[5], 6000.0);
+    EXPECT_EQ(series.timestamps()[0], 1000);
+    EXPECT_EQ(series.timestamps()[5], 6000);
+    EXPECT_DOUBLE_EQ(series.values()[0], 1000.0);
+    EXPECT_DOUBLE_EQ(series.values()[5], 6000.0);
 }
 
 // --- Test: Interleaved timestamps from different batches ---
@@ -147,11 +147,11 @@ TEST_F(MemoryStoreSortedTest, InterleavedBatches) {
 
     verifySorted(series);
     verifyPairing(series);
-    EXPECT_EQ(series.timestamps.size(), 6);
+    EXPECT_EQ(series.timestamps().size(), 6);
 
     // Verify exact order
     for (size_t i = 0; i < 6; ++i) {
-        EXPECT_EQ(series.timestamps[i], (i + 1) * 1000);
+        EXPECT_EQ(series.timestamps()[i], (i + 1) * 1000);
     }
 }
 
@@ -171,7 +171,7 @@ TEST_F(MemoryStoreSortedTest, EmptyInsertNoOp) {
 
     verifySorted(series);
     verifyPairing(series);
-    EXPECT_EQ(series.timestamps.size(), 2);
+    EXPECT_EQ(series.timestamps().size(), 2);
 }
 
 // --- Test: Empty insert into empty series ---
@@ -181,8 +181,8 @@ TEST_F(MemoryStoreSortedTest, EmptyInsertIntoEmptySeries) {
     TimeStarInsert<double> emptyInsert("test", "field");
     series.insert(std::move(emptyInsert));
 
-    EXPECT_EQ(series.timestamps.size(), 0);
-    EXPECT_EQ(series.values.size(), 0);
+    EXPECT_EQ(series.timestamps().size(), 0);
+    EXPECT_EQ(series.values().size(), 0);
 }
 
 // --- Test: Single-element insert ---
@@ -193,9 +193,9 @@ TEST_F(MemoryStoreSortedTest, SingleElementInsert) {
     insert.addValue(42000, 42000.0);
     series.insert(std::move(insert));
 
-    EXPECT_EQ(series.timestamps.size(), 1);
-    EXPECT_EQ(series.timestamps[0], 42000);
-    EXPECT_DOUBLE_EQ(series.values[0], 42000.0);
+    EXPECT_EQ(series.timestamps().size(), 1);
+    EXPECT_EQ(series.timestamps()[0], 42000);
+    EXPECT_DOUBLE_EQ(series.values()[0], 42000.0);
 }
 
 // --- Test: Single element inserted before existing data ---
@@ -214,9 +214,9 @@ TEST_F(MemoryStoreSortedTest, SingleElementBeforeExisting) {
 
     verifySorted(series);
     verifyPairing(series);
-    EXPECT_EQ(series.timestamps.size(), 2);
-    EXPECT_EQ(series.timestamps[0], 1000);
-    EXPECT_EQ(series.timestamps[1], 5000);
+    EXPECT_EQ(series.timestamps().size(), 2);
+    EXPECT_EQ(series.timestamps()[0], 1000);
+    EXPECT_EQ(series.timestamps()[1], 5000);
 }
 
 // --- Test: Duplicate timestamps ---
@@ -237,17 +237,17 @@ TEST_F(MemoryStoreSortedTest, DuplicateTimestamps) {
     series.insert(std::move(insert2));
 
     verifySorted(series);
-    ASSERT_EQ(series.timestamps.size(), 4);
+    ASSERT_EQ(series.timestamps().size(), 4);
 
     // Strictly increasing (duplicates collapsed), rewritten values win
-    for (size_t i = 1; i < series.timestamps.size(); ++i) {
-        EXPECT_LT(series.timestamps[i - 1], series.timestamps[i]);
+    for (size_t i = 1; i < series.timestamps().size(); ++i) {
+        EXPECT_LT(series.timestamps()[i - 1], series.timestamps()[i]);
     }
-    EXPECT_EQ(series.timestamps, (std::vector<uint64_t>{1000, 2000, 3000, 4000}));
-    EXPECT_DOUBLE_EQ(series.values[0], 1.0);
-    EXPECT_DOUBLE_EQ(series.values[1], 20.0);  // overwritten by insert2
-    EXPECT_DOUBLE_EQ(series.values[2], 30.0);  // overwritten by insert2
-    EXPECT_DOUBLE_EQ(series.values[3], 40.0);
+    EXPECT_EQ(series.timestamps(), (std::vector<uint64_t>{1000, 2000, 3000, 4000}));
+    EXPECT_DOUBLE_EQ(series.values()[0], 1.0);
+    EXPECT_DOUBLE_EQ(series.values()[1], 20.0);  // overwritten by insert2
+    EXPECT_DOUBLE_EQ(series.values()[2], 30.0);  // overwritten by insert2
+    EXPECT_DOUBLE_EQ(series.values()[3], 40.0);
 }
 
 // --- Test: Large random batch is correctly sorted ---
@@ -269,7 +269,7 @@ TEST_F(MemoryStoreSortedTest, LargeRandomBatch) {
 
     verifySorted(series);
     verifyPairing(series);
-    EXPECT_EQ(series.timestamps.size(), 1000);
+    EXPECT_EQ(series.timestamps().size(), 1000);
 }
 
 // --- Test: Multiple random batches merge correctly ---
@@ -296,10 +296,10 @@ TEST_F(MemoryStoreSortedTest, MultipleRandomBatches) {
     }
 
     verifySorted(series);
-    EXPECT_EQ(series.timestamps.size(), distinct.size());
+    EXPECT_EQ(series.timestamps().size(), distinct.size());
     // No duplicate timestamps survive
-    for (size_t i = 1; i < series.timestamps.size(); ++i) {
-        EXPECT_LT(series.timestamps[i - 1], series.timestamps[i]);
+    for (size_t i = 1; i < series.timestamps().size(); ++i) {
+        EXPECT_LT(series.timestamps()[i - 1], series.timestamps()[i]);
     }
 }
 
@@ -317,20 +317,20 @@ TEST_F(MemoryStoreSortedTest, BoolValuesStayPaired) {
     series.insert(std::move(insert));
 
     verifySorted(series);
-    EXPECT_EQ(series.timestamps.size(), 5);
+    EXPECT_EQ(series.timestamps().size(), 5);
 
     // Verify pairing: timestamp -> expected value
     // After sorting by timestamp: 1000->true, 2000->false, 3000->true, 4000->true, 5000->false
-    EXPECT_EQ(series.timestamps[0], 1000);
-    EXPECT_EQ(series.values[0], true);
-    EXPECT_EQ(series.timestamps[1], 2000);
-    EXPECT_EQ(series.values[1], false);
-    EXPECT_EQ(series.timestamps[2], 3000);
-    EXPECT_EQ(series.values[2], true);
-    EXPECT_EQ(series.timestamps[3], 4000);
-    EXPECT_EQ(series.values[3], true);
-    EXPECT_EQ(series.timestamps[4], 5000);
-    EXPECT_EQ(series.values[4], false);
+    EXPECT_EQ(series.timestamps()[0], 1000);
+    EXPECT_EQ(series.values()[0], true);
+    EXPECT_EQ(series.timestamps()[1], 2000);
+    EXPECT_EQ(series.values()[1], false);
+    EXPECT_EQ(series.timestamps()[2], 3000);
+    EXPECT_EQ(series.values()[2], true);
+    EXPECT_EQ(series.timestamps()[3], 4000);
+    EXPECT_EQ(series.values()[3], true);
+    EXPECT_EQ(series.timestamps()[4], 5000);
+    EXPECT_EQ(series.values()[4], false);
 }
 
 // --- Test: String values stay paired after sorting ---
@@ -346,16 +346,16 @@ TEST_F(MemoryStoreSortedTest, StringValuesStayPaired) {
     series.insert(std::move(insert));
 
     verifySorted(series);
-    EXPECT_EQ(series.timestamps.size(), 4);
+    EXPECT_EQ(series.timestamps().size(), 4);
 
-    EXPECT_EQ(series.timestamps[0], 1000);
-    EXPECT_EQ(series.values[0], "first");
-    EXPECT_EQ(series.timestamps[1], 2000);
-    EXPECT_EQ(series.values[1], "second");
-    EXPECT_EQ(series.timestamps[2], 3000);
-    EXPECT_EQ(series.values[2], "third");
-    EXPECT_EQ(series.timestamps[3], 4000);
-    EXPECT_EQ(series.values[3], "fourth");
+    EXPECT_EQ(series.timestamps()[0], 1000);
+    EXPECT_EQ(series.values()[0], "first");
+    EXPECT_EQ(series.timestamps()[1], 2000);
+    EXPECT_EQ(series.values()[1], "second");
+    EXPECT_EQ(series.timestamps()[2], 3000);
+    EXPECT_EQ(series.values()[2], "third");
+    EXPECT_EQ(series.timestamps()[3], 4000);
+    EXPECT_EQ(series.values()[3], "fourth");
 }
 
 // --- Test: Multiple out-of-order string batches ---
@@ -381,14 +381,14 @@ TEST_F(MemoryStoreSortedTest, MultipleStringBatchesOutOfOrder) {
     series.insert(std::move(insert3));
 
     verifySorted(series);
-    EXPECT_EQ(series.timestamps.size(), 6);
+    EXPECT_EQ(series.timestamps().size(), 6);
 
-    EXPECT_EQ(series.values[0], "one");
-    EXPECT_EQ(series.values[1], "two");
-    EXPECT_EQ(series.values[2], "three");
-    EXPECT_EQ(series.values[3], "four");
-    EXPECT_EQ(series.values[4], "five");
-    EXPECT_EQ(series.values[5], "six");
+    EXPECT_EQ(series.values()[0], "one");
+    EXPECT_EQ(series.values()[1], "two");
+    EXPECT_EQ(series.values()[2], "three");
+    EXPECT_EQ(series.values()[3], "four");
+    EXPECT_EQ(series.values()[4], "five");
+    EXPECT_EQ(series.values()[5], "six");
 }
 
 // --- Test: insertMemory through MemoryStore maintains order ---
@@ -416,14 +416,14 @@ TEST_F(MemoryStoreSortedTest, InsertMemoryMaintainsOrder) {
     auto result = store.querySeries<double>(seriesId);
     ASSERT_NE(result, nullptr);
 
-    EXPECT_EQ(result->timestamps.size(), 6);
-    for (size_t i = 1; i < result->timestamps.size(); ++i) {
-        EXPECT_LE(result->timestamps[i - 1], result->timestamps[i]) << "Timestamps not sorted at index " << i;
+    EXPECT_EQ(result->timestamps().size(), 6);
+    for (size_t i = 1; i < result->timestamps().size(); ++i) {
+        EXPECT_LE(result->timestamps()[i - 1], result->timestamps()[i]) << "Timestamps not sorted at index " << i;
     }
 
     // Verify pairing
-    for (size_t i = 0; i < result->timestamps.size(); ++i) {
-        EXPECT_DOUBLE_EQ(result->values[i], static_cast<double>(result->timestamps[i]));
+    for (size_t i = 0; i < result->timestamps().size(); ++i) {
+        EXPECT_DOUBLE_EQ(result->values()[i], static_cast<double>(result->timestamps()[i]));
     }
 }
 
@@ -446,9 +446,9 @@ TEST_F(MemoryStoreSortedTest, NewBatchStartsAtExactBoundary) {
     series.insert(std::move(insert2));
 
     verifySorted(series);
-    ASSERT_EQ(series.timestamps.size(), 5);
-    EXPECT_EQ(series.timestamps[2], 3000);
-    EXPECT_DOUBLE_EQ(series.values[2], 30000.0);  // rewritten value visible
+    ASSERT_EQ(series.timestamps().size(), 5);
+    EXPECT_EQ(series.timestamps()[2], 3000);
+    EXPECT_DOUBLE_EQ(series.values()[2], 30000.0);  // rewritten value visible
 }
 
 // --- Test: Three batches where middle batch is out of order internally ---
@@ -476,7 +476,7 @@ TEST_F(MemoryStoreSortedTest, MiddleBatchInternallyUnsorted) {
 
     verifySorted(series);
     verifyPairing(series);
-    EXPECT_EQ(series.timestamps.size(), 7);
+    EXPECT_EQ(series.timestamps().size(), 7);
 }
 
 // --- Test: All same timestamps ---
@@ -492,9 +492,9 @@ TEST_F(MemoryStoreSortedTest, AllSameTimestamps) {
     verifySorted(series);
     // Equal timestamps collapse to a single point; the LAST value in request
     // order wins (last-write-wins)
-    ASSERT_EQ(series.timestamps.size(), 1);
-    EXPECT_EQ(series.timestamps[0], 1000);
-    EXPECT_DOUBLE_EQ(series.values[0], 3.0);
+    ASSERT_EQ(series.timestamps().size(), 1);
+    EXPECT_EQ(series.timestamps()[0], 1000);
+    EXPECT_DOUBLE_EQ(series.values()[0], 3.0);
 }
 
 // --- Test: Reverse-order data ---
@@ -512,5 +512,5 @@ TEST_F(MemoryStoreSortedTest, ReverseOrderData) {
 
     verifySorted(series);
     verifyPairing(series);
-    EXPECT_EQ(series.timestamps.size(), 5);
+    EXPECT_EQ(series.timestamps().size(), 5);
 }

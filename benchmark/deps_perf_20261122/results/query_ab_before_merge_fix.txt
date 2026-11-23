@@ -1,0 +1,19 @@
+query                                            points | server ms before -> after (x)      | client ms before -> after (x)   same result
+blocky: avg all hosts, no interval              1000000 |    5.448 ->    5.409 ( 1.01x, pairs 0.59-1.03) |   44.786 ->   41.605 ( 1.08x)  True
+blocky: max all hosts, no interval              1000000 |    5.470 ->    5.430 ( 1.01x, pairs 0.55-1.01) |   44.793 ->   41.554 ( 1.08x)  True
+blocky: latest all hosts, no interval           1000000 |    5.498 ->    5.374 ( 1.02x, pairs 0.58-1.03) |   51.329 ->   45.024 ( 1.14x)  True
+blocky: stddev all hosts, no interval           1000000 |   10.024 ->    9.036 ( 1.11x, pairs 0.63-1.12) |   25.342 ->   23.018 ( 1.10x)  True
+blocky: avg by rack, no interval                1000000 |    5.507 ->    5.355 ( 1.03x, pairs 0.66-1.04) |   45.468 ->   51.261 ( 0.89x)  True
+blocky: avg all hosts, 1h buckets                 16668 |    2.697 ->    2.559 ( 1.05x, pairs 1.03-1.08) |    3.372 ->    3.163 ( 1.07x)  True
+interleaved: avg all hosts, no interval         1000000 |   10.565 ->   11.725 ( 0.90x, pairs 0.88-0.91) |   60.676 ->   48.797 ( 1.24x)  True
+interleaved: max all hosts, no interval         1000000 |   10.507 ->   11.687 ( 0.90x, pairs 0.89-0.90) |   49.598 ->   48.292 ( 1.03x)  True
+interleaved: latest all hosts, no interval      1000000 |   12.842 ->   14.037 ( 0.91x, pairs 0.90-0.92) |   52.220 ->   50.245 ( 1.04x)  True
+interleaved: stddev all hosts, no interval      1000000 |   22.437 ->   21.762 ( 1.03x, pairs 1.02-1.37) |   36.487 ->   36.134 ( 1.01x)  True
+interleaved: avg by rack, no interval           1000000 |    9.508 ->   10.811 ( 0.88x, pairs 0.87-1.51) |   49.164 ->   52.144 ( 0.94x)  True
+interleaved: avg all hosts, 1h buckets             1668 |    2.592 ->    2.267 ( 1.14x, pairs 1.07-3.12) |    2.793 ->    2.424 ( 1.15x)  True
+aligned: avg all hosts, no interval              100000 |    3.960 ->    3.890 ( 1.02x, pairs 0.99-2.09) |    7.105 ->    6.919 ( 1.03x)  True
+aligned: max all hosts, no interval              100000 |    3.890 ->    3.769 ( 1.03x, pairs 1.01-2.03) |    6.721 ->    6.800 ( 0.99x)  True
+aligned: latest all hosts, no interval           100000 |    3.655 ->    3.514 ( 1.04x, pairs 0.99-2.03) |    6.829 ->    6.423 ( 1.06x)  True
+aligned: stddev all hosts, no interval           100000 |   14.120 ->   14.534 ( 0.97x, pairs 0.77-1.81) |   17.850 ->   17.531 ( 1.02x)  True
+aligned: avg by rack, no interval                200000 |    4.173 ->    4.063 ( 1.03x, pairs 1.01-1.40) |   10.258 ->    9.854 ( 1.04x)  True
+aligned: avg all hosts, 1h buckets                 1668 |    2.575 ->    2.268 ( 1.14x, pairs 1.09-1.29) |    2.836 ->    2.462 ( 1.15x)  True

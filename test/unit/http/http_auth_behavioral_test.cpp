@@ -159,7 +159,7 @@ TEST_F(AuthHandlerWrapperTest, RepeatedRequestsIndependentlyAuthorized) {
 class CheckAuthEdgeCaseTest : public ::testing::Test {};
 
 TEST_F(CheckAuthEdgeCaseTest, SchemeIsCaseSensitive) {
-    seastar::http::request req;
+    seastar::http::request req{};
     req._headers["Authorization"] = "bearer secret-token-123";
 
     auto result = th::checkAuth(req, "secret-token-123");
@@ -171,11 +171,11 @@ TEST_F(CheckAuthEdgeCaseTest, SchemeIsCaseSensitive) {
 TEST_F(CheckAuthEdgeCaseTest, TokenPrefixAndSuperstringRejected) {
     const std::string expected = "secret123";
 
-    seastar::http::request shorter;
+    seastar::http::request shorter{};
     shorter._headers["Authorization"] = "Bearer secret12";
     EXPECT_NE(th::checkAuth(shorter, expected), nullptr) << "token prefix must not authenticate";
 
-    seastar::http::request longer;
+    seastar::http::request longer{};
     longer._headers["Authorization"] = "Bearer secret1234";
     EXPECT_NE(th::checkAuth(longer, expected), nullptr) << "token superstring must not authenticate";
 }
@@ -183,15 +183,15 @@ TEST_F(CheckAuthEdgeCaseTest, TokenPrefixAndSuperstringRejected) {
 TEST_F(CheckAuthEdgeCaseTest, WhitespaceVariantsRejected) {
     const std::string expected = "secret-token-123";
 
-    seastar::http::request trailing;
+    seastar::http::request trailing{};
     trailing._headers["Authorization"] = "Bearer secret-token-123 ";
     EXPECT_NE(th::checkAuth(trailing, expected), nullptr) << "trailing space becomes part of the token";
 
-    seastar::http::request doubleSpace;
+    seastar::http::request doubleSpace{};
     doubleSpace._headers["Authorization"] = "Bearer  secret-token-123";
     EXPECT_NE(th::checkAuth(doubleSpace, expected), nullptr) << "double space yields a leading-space token";
 
-    seastar::http::request leading;
+    seastar::http::request leading{};
     leading._headers["Authorization"] = " Bearer secret-token-123";
     EXPECT_NE(th::checkAuth(leading, expected), nullptr) << "leading space breaks the scheme prefix";
 }
@@ -199,11 +199,11 @@ TEST_F(CheckAuthEdgeCaseTest, WhitespaceVariantsRejected) {
 TEST_F(CheckAuthEdgeCaseTest, EmptyExpectedTokenNeverAuthorizes) {
     // wrapWithAuth("") disables auth entirely, but checkAuth itself must not
     // treat an empty expected token as a wildcard.
-    seastar::http::request withToken;
+    seastar::http::request withToken{};
     withToken._headers["Authorization"] = "Bearer anything";
     EXPECT_NE(th::checkAuth(withToken, ""), nullptr);
 
-    seastar::http::request bearerOnly;
+    seastar::http::request bearerOnly{};
     bearerOnly._headers["Authorization"] = "Bearer ";
     EXPECT_NE(th::checkAuth(bearerOnly, ""), nullptr) << "'Bearer ' with no token is malformed";
 }

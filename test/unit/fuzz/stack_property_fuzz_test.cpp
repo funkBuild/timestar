@@ -53,6 +53,7 @@
 #include "../../../lib/http/http_write_handler.hpp"
 #include "../../../lib/storage/tsm_writer.hpp"
 #include "../../test_helpers.hpp"
+#include "request_body.hpp"
 
 #include <glaze/json.hpp>
 
@@ -433,7 +434,7 @@ Workload generateWorkload(size_t index, uint64_t seed) {
 
 std::unique_ptr<seastar::http::request> jsonRequest(const std::string& body) {
     auto req = std::make_unique<seastar::http::request>();
-    req->content = body;
+    timestar::http::injectedBody(*req) = body;
     req->_headers["Content-Type"] = "application/json";
     return req;
 }

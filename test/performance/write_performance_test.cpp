@@ -1,5 +1,6 @@
 #include "../test_helpers.hpp"
 #include "engine.hpp"
+#include "shard_count.hpp"
 #include "timestar_value.hpp"
 
 #include <gtest/gtest.h>
@@ -61,7 +62,7 @@ seastar::future<> testWriteThroughput(int numSeries, int pointsPerSeries) {
             }
 
             // Determine shard based on measurement
-            size_t shard = std::hash<std::string>{}(insert.measurement) % seastar::smp::count;
+            size_t shard = std::hash<std::string>{}(insert.measurement) % timestar::shardCount();
 
             writes.push_back(engineSharded.invoke_on(
                 shard, [insert = std::move(insert), &totalPointsWritten, pointsPerSeries](Engine& engine) mutable {
@@ -147,7 +148,7 @@ seastar::future<> testConcurrentWrites() {
                     insert.addValue(baseTime + p * 1000000, valueDist(gen));
                 }
 
-                size_t shard = std::hash<std::string>{}(insert.measurement) % seastar::smp::count;
+                size_t shard = std::hash<std::string>{}(insert.measurement) % timestar::shardCount();
                 engineSharded
                     .invoke_on(shard, [insert = std::move(insert)](
                                           Engine& engine) mutable { return engine.insert(std::move(insert)); })
@@ -220,7 +221,7 @@ seastar::future<> testBatchWritePerformance() {
                     insert.addValue(baseTime + p * 1000000, valueDist(gen));
                 }
 
-                size_t shard = std::hash<std::string>{}(insert.measurement) % seastar::smp::count;
+                size_t shard = std::hash<std::string>{}(insert.measurement) % timestar::shardCount();
                 batchWrites.push_back(engineSharded.invoke_on(
                     shard,
                     [insert = std::move(insert)](Engine& engine) mutable { return engine.insert(std::move(insert)); }));

@@ -1,7 +1,8 @@
 #include "native_index.hpp"
 
 #include "../key_encoding.hpp"
-#include "series_key.hpp"           // for buildSeriesKey
+#include "series_key.hpp"  // for buildSeriesKey
+#include "shard_count.hpp"
 #include "tsm.hpp"                  // for TSMValueType definition
 #include "value_type_dispatch.hpp"  // for valueTypeName
 
@@ -142,9 +143,9 @@ private:
 
 NativeIndex::NativeIndex(int shardId)
     : shardId_(shardId),
-      blockCache_(timestar::config().index.block_cache_bytes / std::max(1u, seastar::smp::count)),
-      seriesMetadataCache_(timestar::config().index.metadata_cache_bytes / std::max(1u, seastar::smp::count)),
-      discoveryCache_(timestar::config().index.discovery_cache_bytes / std::max(1u, seastar::smp::count)) {}
+      blockCache_(timestar::config().index.block_cache_bytes / std::max(1u, timestar::shardCount())),
+      seriesMetadataCache_(timestar::config().index.metadata_cache_bytes / std::max(1u, timestar::shardCount())),
+      discoveryCache_(timestar::config().index.discovery_cache_bytes / std::max(1u, timestar::shardCount())) {}
 
 NativeIndex::~NativeIndex() {
     // Stop the periodic WAL sync and day-bitmap flush from firing after
@@ -360,7 +361,7 @@ seastar::future<> NativeIndex::open() {
         // adds are idempotent, so over-repairing is safe.)
         uint32_t watermark = !repairAll && wmVal.has_value() ? ke::decodeLocalId(*wmVal) : 0;
         postingsRepairInProgress_ = true;
-        auto repairGuard = seastar::defer([this] { postingsRepairInProgress_ = false; });
+        auto repairGuard = seastar::defer([this] noexcept { postingsRepairInProgress_ = false; });
         uint32_t repaired = 0;
         std::string bitmapCacheKey;
         for (uint32_t id = watermark; id < localIdMap_.nextId(); ++id) {
@@ -1028,7 +1029,7 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
     // Broadcasts take the same mutex, so neither can overwrite the other's union.
     auto schemaUnits = co_await seastar::get_units(schemaMutex_, 1);
     bool schemaCommitted = false;
-    auto invalidateOnFailure = seastar::defer([this, &schemaCommitted] {
+    auto invalidateOnFailure = seastar::defer([this, &schemaCommitted] noexcept {
         if (!schemaCommitted) {
             fieldsCache_.clear();
             tagsCache_.clear();
@@ -1069,7 +1070,7 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
     // permanently invisible to tag-filtered and time-scoped queries.
     uint32_t localId = localIdMap_.getOrAssign(seriesId);
     auto pendingId = pendingPostingsIds_.insert(localId);
-    auto finishPostings = seastar::defer([this, pendingId] { pendingPostingsIds_.erase(pendingId); });
+    auto finishPostings = seastar::defer([this, pendingId] noexcept { pendingPostingsIds_.erase(pendingId); });
     batch.put(ke::encodeLocalIdForwardKey(localId), seriesId.toBytes());
     batch.put(ke::encodeLocalIdCounterKey(), ke::encodeLocalId(localId + 1));
     // A failed earlier creation may have assigned this ID before a flush
@@ -3756,6 +3757,13 @@ seastar::future<double> NativeIndex::estimateTagCardinality(const std::string& m
     key.push_back('\0');
     key += tagValue;
 
+    // Low-cardinality tag values deliberately have no HLL. A complete cached
+    // bitmap already supplies the exact answer, without another KV miss or key.
+    if (auto bitmap = bitmapCache_.find(key); bitmap != bitmapCache_.end() && !bitmap->second.loading &&
+                                              bitmap->second.bitmap.cardinality() < kTagHllMinCardinality) {
+        co_return static_cast<double>(bitmap->second.bitmap.cardinality());
+    }
+
     // A sketch is only trusted at or above kTagHllMinCardinality. Sketches
     // are maintained only above the threshold, so a sub-threshold estimate
     // means a stale sketch persisted by an older version that has since been
@@ -3816,17 +3824,26 @@ seastar::future<SeriesId128> NativeIndex::indexInsert(const TimeStarInsert<T>& i
         std::string dayCacheKey;
         uint32_t lastDay = UINT32_MAX;
         bool newDayMembership = false;
-        for (uint64_t ts : insert.getTimestamps()) {
-            uint32_t day = ke::dayBucketFromNs(ts);
-            if (day != lastDay) {
+        if (const auto& batch = insert.sharedTimestampBatch()) {
+            for (uint32_t day : batch->days) {
                 buildDayBitmapCacheKey(dayCacheKey, insert.measurement, day);
-                // addChecked: invalidate cached day-scoped discovery when an
-                // existing series first appears in a day (see recordDaySpan).
-                if (co_await addDayMembership(dayCacheKey, localId)) {
+                if (co_await addDayMembership(dayCacheKey, localId))
                     newDayMembership = true;
-                }
                 noteRecordedDay(day);
-                lastDay = day;
+            }
+        } else {
+            for (uint64_t ts : insert.getTimestamps()) {
+                uint32_t day = ke::dayBucketFromNs(ts);
+                if (day != lastDay) {
+                    buildDayBitmapCacheKey(dayCacheKey, insert.measurement, day);
+                    // addChecked: invalidate cached day-scoped discovery when an
+                    // existing series first appears in a day (see recordDaySpan).
+                    if (co_await addDayMembership(dayCacheKey, localId)) {
+                        newDayMembership = true;
+                    }
+                    noteRecordedDay(day);
+                    lastDay = day;
+                }
             }
         }
         if (newDayMembership) {
@@ -3878,7 +3895,7 @@ seastar::future<SchemaUpdate> NativeIndex::indexMetadataBatchWithSchema(const st
 seastar::future<> NativeIndex::applySchemaUpdate(SchemaUpdate update) {
     auto schemaUnits = co_await seastar::get_units(schemaMutex_, 1);
     bool schemaCommitted = false;
-    auto invalidateOnFailure = seastar::defer([this, &schemaCommitted] {
+    auto invalidateOnFailure = seastar::defer([this, &schemaCommitted] noexcept {
         if (!schemaCommitted) {
             fieldsCache_.clear();
             tagsCache_.clear();

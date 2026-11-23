@@ -1,5 +1,6 @@
 #pragma once
 
+#include "content_negotiation.hpp"
 #include "field_values.hpp"
 #include "native_index.hpp"
 #include "query_parser.hpp"
@@ -36,6 +37,7 @@ namespace timestar::http {
 
 // Forward declarations for executeQuery phase types (defined in http_query_handler.cpp)
 struct SeriesQueryContext;
+struct PerShardDiscovery;
 struct SeriesDiscoveryResult;
 struct ShardQueryResult;
 struct ShardFanOutResult;
@@ -87,6 +89,11 @@ public:
     // Validate request body size and content type (public for testing).
     // Returns a reply with an error if validation fails, or nullptr if valid.
     std::unique_ptr<seastar::http::reply> validateRequest(const seastar::http::request& req) const;
+    // The 413 for a body over maxQueryBodySize(), in the negotiated format.
+    static std::unique_ptr<seastar::http::reply> payloadTooLargeReply(timestar::http::WireFormat resFmt);
+    // Whether a successful JSON result goes out as a chunked stream rather
+    // than a single Content-Length body (http.stream_response_min_points).
+    static bool shouldStreamResponse(const seastar::http::request& req, const QueryResponse& response);
 
     // Main query handler
     seastar::future<std::unique_ptr<seastar::http::reply>> handleQuery(std::unique_ptr<seastar::http::request> req);
@@ -147,7 +154,7 @@ private:
     // Phase 2: fan out query execution to shards that own series
     // (consumes the per-shard context vectors in seriesByShard).
     seastar::future<ShardFanOutResult> fanOutShardQueries(const QueryRequest& request,
-                                                          std::vector<std::vector<SeriesQueryContext>>& seriesByShard);
+                                                          std::vector<PerShardDiscovery>& seriesByShard);
 
     // Phase 3a/3b: partial merge + aggregation finalize into `response`.
     // Return std::nullopt on success; a complete error QueryResponse on early exit.

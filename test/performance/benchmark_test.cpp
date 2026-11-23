@@ -1,6 +1,7 @@
 #include "../test_helpers.hpp"
 #include "engine.hpp"
 #include "query_result.hpp"
+#include "shard_count.hpp"
 #include "timestar_value.hpp"
 
 #include <gtest/gtest.h>
@@ -317,11 +318,11 @@ TEST_F(BenchmarkTest, InsertAndQueryPerformance) {
 
         // Memory usage estimate (if available)
         std::cout << "\n### RESOURCE USAGE ###" << std::endl;
-        std::cout << "Shards used:     " << seastar::smp::count << std::endl;
+        std::cout << "Shards used:     " << timestar::shardCount() << std::endl;
 
         // Check disk usage
         size_t totalDiskUsage = 0;
-        for (int i = 0; i < seastar::smp::count; ++i) {
+        for (int i = 0; i < timestar::shardCount(); ++i) {
             std::string shardPath = "shard_" + std::to_string(i);
             if (fs::exists(shardPath)) {
                 for (const auto& entry : fs::recursive_directory_iterator(shardPath)) {

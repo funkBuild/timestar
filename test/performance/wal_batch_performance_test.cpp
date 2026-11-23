@@ -202,12 +202,12 @@ TEST_F(WALBatchPerformanceTest, VerifyDataIntegrity) {
                 ASSERT_NE(result, nullptr);
 
                 const auto& series = *result;
-                EXPECT_EQ(series.timestamps.size(), 10);
-                EXPECT_EQ(series.values.size(), 10);
+                EXPECT_EQ(series.timestamps().size(), 10);
+                EXPECT_EQ(series.values().size(), 10);
 
                 for (int i = 0; i < 10; i++) {
-                    EXPECT_EQ(series.timestamps[i], 1000 + i);
-                    EXPECT_DOUBLE_EQ(series.values[i], s * 10.0 + i);
+                    EXPECT_EQ(series.timestamps()[i], 1000 + i);
+                    EXPECT_DOUBLE_EQ(series.values()[i], s * 10.0 + i);
                 }
             }
         }

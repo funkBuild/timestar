@@ -1,0 +1,26 @@
+INFO  2026-09-11 16:59:41,022 seastar - Reactor backend: linux-aio
+INFO  2026-09-11 16:59:41,022 seastar - Perf-based stall detector creation failed (EACCESS), try setting /proc/sys/kernel/perf_event_paranoid to 1 or less to enable kernel backtraces: falling back to posix timer.
+Note: Google Test filter = QueryFoldBench.*
+[==========] Running 5 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 5 tests from QueryFoldBench
+[ RUN      ] QueryFoldBench.Q1_AddPointsRangeMultiBucket
+[Q1] addPointsRange multi-bucket AVG: 0.368 ms for 1000000 pts (2713.9 Mpts/s), checksum=50009657.076
+[       OK ] QueryFoldBench.Q1_AddPointsRangeMultiBucket (15 ms)
+[ RUN      ] QueryFoldBench.Q2_ScalarFoldAvgPerPoint
+[Q2] scalar per-point AVG fold: 4.154 ms for 1000000 pts (240.7 Mpts/s), checksum=50009657.076
+[       OK ] QueryFoldBench.Q2_ScalarFoldAvgPerPoint (37 ms)
+[ RUN      ] QueryFoldBench.Q3_SimdMinMaxSum
+[Q3] SIMD kernels, 4000000 doubles: sum=0.372 ms (86.1 GB/s)  min=0.410 ms (78.1 GB/s)  max=0.433 ms (73.9 GB/s)
+[       OK ] QueryFoldBench.Q3_SimdMinMaxSum (63 ms)
+[ RUN      ] QueryFoldBench.Q4_StddevBatchFold
+[Q4] STDDEV batch fold: 0.153 ms for 1000000 pts (6516.3 Mpts/s), stddev=14.150273
+[       OK ] QueryFoldBench.Q4_StddevBatchFold (10 ms)
+[ RUN      ] QueryFoldBench.Q5_AddTimestampsOnlyMultiBucket
+[Q5] addTimestampsOnly multi-bucket COUNT: 0.262 ms for 1000000 pts (3819.0 Mpts/s), count=1000000
+[       OK ] QueryFoldBench.Q5_AddTimestampsOnlyMultiBucket (9 ms)
+[----------] 5 tests from QueryFoldBench (136 ms total)
+
+[----------] Global test environment tear-down
+[==========] 5 tests from 1 test suite ran. (136 ms total)
+[  PASSED  ] 5 tests.

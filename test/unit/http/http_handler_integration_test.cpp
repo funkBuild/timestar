@@ -32,11 +32,11 @@
 #include "../../test_helpers.hpp"
 
 // HTTP handlers
+#include "../../../lib/http/http_delete_handler.hpp"
 #include "../../../lib/http/http_metadata_handler.hpp"
 #include "../../../lib/http/http_query_handler.hpp"
 #include "../../../lib/http/http_write_handler.hpp"
-
-#include "../../../lib/http/http_delete_handler.hpp"
+#include "request_body.hpp"
 
 using namespace timestar;
 namespace fs = std::filesystem;
@@ -90,7 +90,7 @@ protected:
 
     static std::unique_ptr<seastar::http::request> makeWriteRequest(const std::string& body) {
         auto req = std::make_unique<seastar::http::request>();
-        req->content = body;
+        timestar::http::injectedBody(*req) = body;
         req->_headers["Content-Type"] = "application/json";
         return req;
     }
@@ -108,13 +108,13 @@ protected:
             body += R"(,"aggregationInterval":")" + aggregationInterval + R"(")";
         }
         body += "}";
-        req->content = body;
+        timestar::http::injectedBody(*req) = body;
         return req;
     }
 
     static std::unique_ptr<seastar::http::request> makeDeleteRequest(const std::string& body) {
         auto req = std::make_unique<seastar::http::request>();
-        req->content = body;
+        timestar::http::injectedBody(*req) = body;
         req->_headers["Content-Type"] = "application/json";
         return req;
     }
@@ -123,10 +123,10 @@ protected:
                                                                        const std::string& tag = "") {
         auto req = std::make_unique<seastar::http::request>();
         if (!measurement.empty()) {
-            req->query_parameters["measurement"] = measurement;
+            req->set_query_param("measurement", measurement);
         }
         if (!tag.empty()) {
-            req->query_parameters["tag"] = tag;
+            req->set_query_param("tag", tag);
         }
         return req;
     }
@@ -638,7 +638,7 @@ TEST_F(HttpHandlerIntegrationTest, QueryInvalidJsonReturnsError) {
         HttpQueryHandler handler(&eng.eng);
 
         auto req = std::make_unique<seastar::http::request>();
-        req->content = "not json";
+        timestar::http::injectedBody(*req) = "not json";
         req->_headers["Content-Type"] = "application/json";
 
         auto rep = handler.handleQuery(std::move(req)).get();

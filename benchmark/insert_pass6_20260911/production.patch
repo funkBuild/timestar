@@ -1,0 +1,79 @@
+--- a/lib/storage/wal.cpp
++++ b/lib/storage/wal.cpp
+@@ -468,8 +468,18 @@
+ //   [uint32_t entryLength]  -- CRC + payload size
+ //   [uint32_t CRC32]        -- over the payload bytes
+ //   [payload bytes ...]
++// A batch keeps only the last shared timestamp encoding, already stored in
++// its output buffer. Offsets survive reallocations; insertRequests owns the
++// immutable timestamp vectors throughout the synchronous encoding phase.
++struct WAL::TimestampEncodingCache {
++    const std::vector<uint64_t>* timestamps = nullptr;
++    size_t offset = 0;
++    size_t size = 0;
++};
++
+ template <class T>
+-void WAL::encodeInsertEntry(AlignedBuffer& buffer, TimeStarInsert<T>& insertRequest) {
++void WAL::encodeInsertEntry(AlignedBuffer& buffer, TimeStarInsert<T>& insertRequest,
++                            TimestampEncodingCache* timestampCache) {
+     // Record where this entry starts so we can backpatch the header
+     const size_t entryStart = buffer.size();
+ 
+@@ -512,7 +522,17 @@
+         buffer.write(static_cast<uint32_t>(0));  // placeholder for encoded size
+ 
+         const size_t startPos = buffer.size();
+-        IntegerEncoder::encodeInto(tsVec, buffer);
++        const bool shared = static_cast<bool>(insertRequest.sharedTimestampBatch());
++        if (timestampCache && shared && timestampCache->timestamps == &tsVec) {
++            // Grow before obtaining the source pointer: the append can move
++            // the buffer. Source bytes precede startPos and cannot overlap.
++            auto* dst = buffer.grow_uninit(timestampCache->size);
++            std::memcpy(dst, buffer.data.data() + timestampCache->offset, timestampCache->size);
++        } else {
++            IntegerEncoder::encodeInto(tsVec, buffer);
++            if (timestampCache && shared)
++                *timestampCache = {&tsVec, startPos, buffer.size() - startPos};
++        }
+         encodedTsSize = buffer.size() - startPos;
+         buffer.writeAt(sizePos, static_cast<uint32_t>(encodedTsSize));
+     }
+@@ -676,8 +696,9 @@
+     AlignedBuffer buffer;
+     buffer.reserve(estimatedTotal);
+ 
++    TimestampEncodingCache timestampCache;
+     for (auto& insertRequest : insertRequests) {
+-        encodeInsertEntry(buffer, insertRequest);
++        encodeInsertEntry(buffer, insertRequest, &timestampCache);
+     }
+ 
+     const size_t totalSize = buffer.size();
+@@ -1182,4 +1203,4 @@
+ template seastar::future<WALInsertResult> WAL::insertBatch<std::string>(
+     std::vector<TimeStarInsert<std::string>>& insertRequests);
+ template seastar::future<WALInsertResult> WAL::insertBatch<int64_t>(
+-    std::vector<TimeStarInsert<int64_t>>& insertRequests);
+\ No newline at end of file
++    std::vector<TimeStarInsert<int64_t>>& insertRequests);
+--- a/lib/storage/wal.hpp
++++ b/lib/storage/wal.hpp
+@@ -101,6 +101,7 @@
+ 
+ class WAL {
+ private:
++    struct TimestampEncodingCache;
+     // WAL segment size limit — initialized from config in init()
+     size_t maxWalSize_ = 16 * 1024 * 1024;  // default 16 MiB, overridden by config
+     // Identity & file
+@@ -202,7 +203,8 @@
+     // for pre-allocating sufficient capacity.  Non-static: updates
+     // _compressionStats with observed compression ratios after encoding.
+     template <class T>
+-    void encodeInsertEntry(AlignedBuffer& buffer, TimeStarInsert<T>& insertRequest);
++    void encodeInsertEntry(AlignedBuffer& buffer, TimeStarInsert<T>& insertRequest,
++                           TimestampEncodingCache* timestampCache = nullptr);
+ 
+ public:
+     // Delete range operation

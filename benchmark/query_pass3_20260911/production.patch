@@ -1,0 +1,598 @@
+--- a/lib/query/aggregator.cpp
++++ b/lib/query/aggregator.cpp
+@@ -268,8 +268,9 @@
+ // state for a 3.5M-point STDDEV merge). The state is finalized as the heap
+ // advances, so neither raw nor merged inputs expand into a full state vector.
+ // Keep the smaller state yield chunk for the more expensive folds.
++template <class Output>
+ static seastar::future<> nWayMergeStates(std::vector<PartialAggregationResult*>& partials, std::vector<uint64_t>& outTs,
+-                                         std::vector<AggregatedPoint>& outPoints, AggregationMethod method) {
++                                         std::vector<Output>& outPoints, AggregationMethod method) {
+     const bool needsRaw = (method == AggregationMethod::MEDIAN || method == AggregationMethod::EXACT_MEDIAN);
+     return nWayHeapMerge<AggregationState>(
+         partials, outTs, outPoints,
+@@ -293,7 +294,10 @@
+             }
+         },
+         [method](uint64_t timestamp, AggregationState& state) {
+-            return AggregatedPoint{timestamp, state.getValue(method), state.count};
++            if constexpr (std::is_same_v<Output, double>)
++                return state.getValue(method);
++            else
++                return AggregatedPoint{timestamp, state.getValue(method), state.count};
+         },
+         kYieldChunkStates);
+ }
+@@ -544,7 +548,7 @@
+ }
+ 
+ seastar::future<std::vector<GroupedAggregationResult>> Aggregator::mergePartialAggregationsGrouped(
+-    std::vector<PartialAggregationResult>& partialResults, AggregationMethod method) {
++    std::vector<PartialAggregationResult>& partialResults, AggregationMethod method, bool compactOutput) {
+     if (partialResults.empty()) {
+         co_return std::vector<GroupedAggregationResult>{};
+     }
+@@ -680,7 +684,7 @@
+ 
+                     if (groupPartials.size() == 1) {
+                         // Single partial — zero-copy move, no merge needed.
+-                        if (method == AggregationMethod::COUNT) {
++                        if (method == AggregationMethod::COUNT && !compactOutput) {
+                             auto& ts = first->sortedTimestamps;
+                             auto& vals = first->sortedValues;
+                             groupedResult.points.reserve(ts.size());
+@@ -702,6 +706,16 @@
+                         } else {
+                             groupedResult.rawTimestamps = std::move(first->sortedTimestamps);
+                             groupedResult.rawValues = std::move(first->sortedValues);
++                            if (method == AggregationMethod::COUNT) {
++                                for (auto& value : groupedResult.rawValues) {
++                                    if (!std::isnan(value))
++                                        value = 1.0;
++                                    if (++sinceYield >= kYieldChunkPoints) {
++                                        sinceYield = 0;
++                                        co_await seastar::coroutine::maybe_yield();
++                                    }
++                                }
++                            }
+                         }
+                     } else {
+                         // Multiple partials — use O(KN log K) N-way merge.
+@@ -717,7 +731,8 @@
+                             co_await nWayMergeRawValues(groupPartials, method, mergedTs, mergedVals, mergedCounts);
+                         }
+ 
+-                        groupedResult.points.reserve(mergedTs.size());
++                        if (!compactOutput)
++                            groupedResult.points.reserve(mergedTs.size());
+                         for (size_t i = 0; i < mergedTs.size(); ++i) {
+                             double finalValue = mergedVals[i];
+                             if (mergedCounts[i] == 0) [[unlikely]] {
+@@ -731,12 +746,19 @@
+                             } else if (method == AggregationMethod::COUNT) {
+                                 finalValue = static_cast<double>(mergedCounts[i]);
+                             }
+-                            groupedResult.points.push_back({mergedTs[i], finalValue, mergedCounts[i]});
++                            if (compactOutput)
++                                mergedVals[i] = finalValue;
++                            else
++                                groupedResult.points.push_back({mergedTs[i], finalValue, mergedCounts[i]});
+                             if (++sinceYield >= kYieldChunkPoints) {
+                                 sinceYield = 0;
+                                 co_await seastar::coroutine::maybe_yield();
+                             }
+                         }
++                        if (compactOutput) {
++                            groupedResult.rawTimestamps = std::move(mergedTs);
++                            groupedResult.rawValues = std::move(mergedVals);
++                        }
+                     }
+                 } else {
+                     // State-needing methods (SPREAD/STDDEV/STDVAR/MEDIAN), or a
+@@ -745,7 +767,31 @@
+                     // addValue, which skips NaN) — no conversion pre-pass.
+                     const bool needsRaw =
+                         (method == AggregationMethod::MEDIAN || method == AggregationMethod::EXACT_MEDIAN);
+-                    if (groupPartials.size() == 1 && groupPartials[0]->sortedStates.empty()) {
++                    if (compactOutput && groupPartials.size() > 1) {
++                        co_await nWayMergeStates(groupPartials, groupedResult.rawTimestamps, groupedResult.rawValues,
++                                                 method);
++                    } else if (compactOutput) {
++                        auto* first = groupPartials[0];
++                        groupedResult.rawTimestamps = std::move(first->sortedTimestamps);
++                        if (first->sortedStates.empty())
++                            groupedResult.rawValues = std::move(first->sortedValues);
++                        else
++                            groupedResult.rawValues.reserve(first->sortedStates.size());
++                        for (size_t i = 0; i < groupedResult.rawTimestamps.size(); ++i) {
++                            if (!first->sortedStates.empty()) {
++                                groupedResult.rawValues.push_back(first->sortedStates[i].getValue(method));
++                            } else {
++                                AggregationState state;
++                                state.collectRaw = needsRaw;
++                                state.addValue(groupedResult.rawValues[i], groupedResult.rawTimestamps[i]);
++                                groupedResult.rawValues[i] = state.getValue(method);
++                            }
++                            if (++sinceYield >= kYieldChunkPoints) {
++                                sinceYield = 0;
++                                co_await seastar::coroutine::maybe_yield();
++                            }
++                        }
++                    } else if (groupPartials.size() == 1 && groupPartials[0]->sortedStates.empty()) {
+                         // Single RAW partial: finalize per point through a
+                         // singleton state — no merged state vector at all.
+                         auto* first = groupPartials[0];
+--- a/lib/query/aggregator.hpp
++++ b/lib/query/aggregator.hpp
+@@ -539,8 +539,10 @@
+     // Merge partial aggregations with metadata preserved (reduce phase).
+     // Coroutine: yields between groups and inside the per-point merge loops
+     // (same stall rationale as createPartialAggregations).
++    // compactOutput keeps unbucketed results in timestamp/value arrays when
++    // the consumer does not need per-point contributor counts (HTTP responses).
+     static seastar::future<std::vector<GroupedAggregationResult>> mergePartialAggregationsGrouped(
+-        std::vector<PartialAggregationResult>& partialResults, AggregationMethod method);
++        std::vector<PartialAggregationResult>& partialResults, AggregationMethod method, bool compactOutput = false);
+ 
+     // ========================================================================
+     // LEGACY COMPATIBILITY
+--- a/lib/http/http_query_handler.cpp
++++ b/lib/http/http_query_handler.cpp
+@@ -1326,8 +1326,7 @@
+ 
+     if (contexts.empty()) {
+         // All series resolved by batch or streaming path — skip standard path.
+-    } else if (bucketAnchor == 0 && !booleansAsNumeric &&
+-               canStreamAggregation(aggregation, aggregationInterval)) {
++    } else if (bucketAnchor == 0 && !booleansAsNumeric && canStreamAggregation(aggregation, aggregationInterval)) {
+         // ---- STREAMING AGGREGATION PATH ----
+         // Fold per-series results into accumulators without
+         // materializing all raw data.  O(groups x buckets)
+@@ -2014,7 +2013,7 @@
+         } else {
+             // Duplicate groupKeys — must merge partials before finalizing
+             auto groupedResults =
+-                co_await Aggregator::mergePartialAggregationsGrouped(sqr.partialResults, request.aggregation);
++                co_await Aggregator::mergePartialAggregationsGrouped(sqr.partialResults, request.aggregation, true);
+ 
+             response.series.reserve(groupedResults.size());
+             for (auto& groupedResult : groupedResults) {
+@@ -2179,7 +2178,7 @@
+ 
+         // OPTIMIZATION & FIX: Use grouped merge to preserve metadata associations
+         auto groupedResults =
+-            co_await Aggregator::mergePartialAggregationsGrouped(allPartialResults, request.aggregation);
++            co_await Aggregator::mergePartialAggregationsGrouped(allPartialResults, request.aggregation, true);
+ 
+         LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Merged into {} grouped results", groupedResults.size());
+ 
+--- a/lib/http/response_formatter.cpp
++++ b/lib/http/response_formatter.cpp
+@@ -20,16 +20,24 @@
+ // Buffer helper — direct char* writes, no per-element string::append()
+ // ──────────────────────────────────────────────────────────────────────
+ //
+-// All array serialisation writes through a raw char* pointer into a
+-// pre-sized std::string.  The string is grown with resize() when needed
+-// (which zero-fills on growth) and trimmed with resize() at the end
+-// (which just moves the NUL terminator — no copy).
++// Write directly into reserved string storage, committing only initialized
++// bytes after each append. resize_and_overwrite avoids zero-filling unused
++// worst-case capacity before the serializer immediately overwrites it.
+ 
+ namespace {
+ 
+ // Maximum bytes a single numeric value can produce (sign + 20 digits + dot + 17 mantissa + e + sign + 3 exp)
+ static constexpr size_t MAX_NUM_LEN = 32;
+ 
++// Writers must not throw, must stay within maxBytes, and must return the
++// initialized end. No uninitialized spare bytes become part of the string.
++template <class Writer>
++inline size_t appendUninitialized(std::string& buf, size_t pos, size_t maxBytes, Writer writer) {
++    buf.resize_and_overwrite(
++        pos + maxBytes, [pos, &writer](char* data, size_t) { return static_cast<size_t>(writer(data + pos) - data); });
++    return buf.size();
++}
++
+ // ── JSON string helpers ─────────────────────────────────────────────
+ 
+ // Returns true if `sv` contains a character that requires JSON escaping.
+@@ -48,105 +56,79 @@
+ // Append a JSON-escaped string to `buf` starting at position `pos`.
+ // Returns the new position.
+ inline size_t appendJsonStringEscaped(std::string& buf, size_t pos, std::string_view sv) {
+-    // Worst case: every char becomes \uXXXX (6 bytes) + 2 quotes
+-    size_t worstCase = sv.size() * 6 + 2;
+-    if (pos + worstCase > buf.size()) {
+-        buf.resize(std::max(buf.size() * 2, pos + worstCase));
+-    }
+-    char* p = buf.data() + pos;
+-    *p++ = '"';
+-    for (char c : sv) {
+-        switch (c) {
+-            case '"':
+-                *p++ = '\\';
+-                *p++ = '"';
+-                break;
+-            case '\\':
+-                *p++ = '\\';
+-                *p++ = '\\';
+-                break;
+-            case '\n':
+-                *p++ = '\\';
+-                *p++ = 'n';
+-                break;
+-            case '\r':
+-                *p++ = '\\';
+-                *p++ = 'r';
+-                break;
+-            case '\t':
+-                *p++ = '\\';
+-                *p++ = 't';
+-                break;
+-            default:
+-                if (static_cast<unsigned char>(c) < 0x20) {
+-                    // \uXXXX
+-                    static constexpr char hex[] = "0123456789abcdef";
++    // Worst case: every char becomes \uXXXX plus the two quotes.
++    return appendUninitialized(buf, pos, sv.size() * 6 + 2, [sv](char* p) {
++        *p++ = '"';
++        for (char c : sv) {
++            switch (c) {
++                case '"':
++                    *p++ = '\\';
++                    *p++ = '"';
++                    break;
++                case '\\':
+                     *p++ = '\\';
+-                    *p++ = 'u';
+-                    *p++ = '0';
+-                    *p++ = '0';
+-                    *p++ = hex[(static_cast<unsigned char>(c) >> 4) & 0xf];
+-                    *p++ = hex[static_cast<unsigned char>(c) & 0xf];
+-                } else {
+-                    *p++ = c;
+-                }
++                    *p++ = '\\';
++                    break;
++                case '\n':
++                    *p++ = '\\';
++                    *p++ = 'n';
++                    break;
++                case '\r':
++                    *p++ = '\\';
++                    *p++ = 'r';
++                    break;
++                case '\t':
++                    *p++ = '\\';
++                    *p++ = 't';
++                    break;
++                default:
++                    if (static_cast<unsigned char>(c) < 0x20) {
++                        // \uXXXX
++                        static constexpr char hex[] = "0123456789abcdef";
++                        *p++ = '\\';
++                        *p++ = 'u';
++                        *p++ = '0';
++                        *p++ = '0';
++                        *p++ = hex[(static_cast<unsigned char>(c) >> 4) & 0xf];
++                        *p++ = hex[static_cast<unsigned char>(c) & 0xf];
++                    } else {
++                        *p++ = c;
++                    }
++            }
+         }
+-    }
+-    *p++ = '"';
+-    return static_cast<size_t>(p - buf.data());
++        *p++ = '"';
++        return p;
++    });
+ }
+ 
+ // Append a JSON string to `buf` at position `pos`.
+ // Fast path: if no escaping needed, direct memcpy.
+ inline size_t appendJsonString(std::string& buf, size_t pos, std::string_view sv) {
+     if (!needsEscaping(sv)) [[likely]] {
+-        size_t need = sv.size() + 2;  // quotes
+-        if (pos + need > buf.size()) {
+-            buf.resize(std::max(buf.size() * 2, pos + need));
+-        }
+-        char* p = buf.data() + pos;
+-        *p++ = '"';
+-        std::memcpy(p, sv.data(), sv.size());
+-        p += sv.size();
+-        *p++ = '"';
+-        return pos + need;
++        return appendUninitialized(buf, pos, sv.size() + 2, [sv](char* p) {
++            *p++ = '"';
++            std::memcpy(p, sv.data(), sv.size());
++            p += sv.size();
++            *p++ = '"';
++            return p;
++        });
+     }
+     return appendJsonStringEscaped(buf, pos, sv);
+ }
+ 
+ // Append raw bytes (no escaping).
+ inline size_t appendRaw(std::string& buf, size_t pos, std::string_view sv) {
+-    if (pos + sv.size() > buf.size()) {
+-        buf.resize(std::max(buf.size() * 2, pos + sv.size()));
+-    }
+-    std::memcpy(buf.data() + pos, sv.data(), sv.size());
+-    return pos + sv.size();
++    return appendUninitialized(buf, pos, sv.size(), [sv](char* p) {
++        std::memcpy(p, sv.data(), sv.size());
++        return p + sv.size();
++    });
+ }
+ 
+ inline size_t appendChar(std::string& buf, size_t pos, char c) {
+-    if (pos >= buf.size()) {
+-        buf.resize(std::max(buf.size() * 2, pos + 1));
+-    }
+-    buf[pos] = c;
+-    return pos + 1;
+-}
+-
+-// ── Ensure buffer has room for N elements of at most MAX_NUM_LEN each ─
+-
+-inline void ensureArraySpace(std::string& buf, size_t pos, size_t count) {
+-    // Each element: up to MAX_NUM_LEN digits + 1 comma
+-    size_t need = count * (MAX_NUM_LEN + 1) + 2;  // + brackets
+-    if (pos + need > buf.size()) {
+-        // Grow to exactly what is needed rather than doubling.
+-        //
+-        // The initial estimate in format() now covers the true worst case, so
+-        // reaching here at all is unusual. When it does happen, doubling a buffer
+-        // that is already proportional to the response wastes up to half of it
+-        // and, worse, transiently holds old + new: at the 10M-point limit that is
+-        // ~560 MB live plus ~840 MB during the copy. Exact growth costs an extra
+-        // realloc in the rare case and bounds the peak in all of them.
+-        buf.resize(pos + need);
+-    }
++    return appendUninitialized(buf, pos, 1, [c](char* p) {
++        *p++ = c;
++        return p;
++    });
+ }
+ 
+ // ── Array serialisers ────────────────────────────────────────────────
+@@ -164,50 +146,46 @@
+ // Write a uint64_t slice using glz::to_chars (digit-pair tables).
+ inline size_t appendUint64Slice(std::string& buf, size_t pos, const std::vector<uint64_t>& arr, size_t from,
+                                 size_t to) {
+-    ensureArraySpace(buf, pos, to - from);
+-    char* p = buf.data() + pos;
+-    for (size_t i = from; i < to; ++i) {
+-        if (i > 0)
+-            *p++ = ',';
+-        p = glz::to_chars(p, arr[i]);
+-    }
+-    return static_cast<size_t>(p - buf.data());
++    return appendUninitialized(buf, pos, (to - from) * (MAX_NUM_LEN + 1), [&](char* p) {
++        for (size_t i = from; i < to; ++i) {
++            if (i > 0)
++                *p++ = ',';
++            p = glz::to_chars(p, arr[i]);
++        }
++        return p;
++    });
+ }
+ 
+ // Write a double slice using glz::to_chars (Dragonbox).
+ // NaN and Inf are written as JSON null.
+ inline size_t appendDoubleSlice(std::string& buf, size_t pos, const std::vector<double>& arr, size_t from, size_t to) {
+-    ensureArraySpace(buf, pos, to - from);
+-    char* p = buf.data() + pos;
+-    for (size_t i = from; i < to; ++i) {
+-        if (i > 0)
+-            *p++ = ',';
+-        // Dragonbox handles NaN/Inf by writing "null" (4 bytes)
+-        p = glz::to_chars(p, arr[i]);
+-    }
+-    return static_cast<size_t>(p - buf.data());
++    return appendUninitialized(buf, pos, (to - from) * (MAX_NUM_LEN + 1), [&](char* p) {
++        for (size_t i = from; i < to; ++i) {
++            if (i > 0)
++                *p++ = ',';
++            // Dragonbox handles NaN/Inf by writing "null" (4 bytes)
++            p = glz::to_chars(p, arr[i]);
++        }
++        return p;
++    });
+ }
+ 
+ // Write a bool slice.
+ inline size_t appendBoolSlice(std::string& buf, size_t pos, const std::vector<bool>& arr, size_t from, size_t to) {
+-    // Max 6 bytes per element ("false,")
+-    size_t need = (to - from) * 6 + 2;
+-    if (pos + need > buf.size()) {
+-        buf.resize(std::max(buf.size() * 2, pos + need));
+-    }
+-    char* p = buf.data() + pos;
+-    for (size_t i = from; i < to; ++i) {
+-        if (i > 0)
+-            *p++ = ',';
+-        if (arr[i]) {
+-            std::memcpy(p, "true", 4);
+-            p += 4;
+-        } else {
+-            std::memcpy(p, "false", 5);
+-            p += 5;
++    return appendUninitialized(buf, pos, (to - from) * 6, [&](char* p) {
++        for (size_t i = from; i < to; ++i) {
++            if (i > 0)
++                *p++ = ',';
++            if (arr[i]) {
++                std::memcpy(p, "true", 4);
++                p += 4;
++            } else {
++                std::memcpy(p, "false", 5);
++                p += 5;
++            }
+         }
+-    }
+-    return static_cast<size_t>(p - buf.data());
++        return p;
++    });
+ }
+ 
+ // Write a string slice.
+@@ -223,14 +201,14 @@
+ 
+ // Write an int64_t slice using glz::to_chars.
+ inline size_t appendInt64Slice(std::string& buf, size_t pos, const std::vector<int64_t>& arr, size_t from, size_t to) {
+-    ensureArraySpace(buf, pos, to - from);
+-    char* p = buf.data() + pos;
+-    for (size_t i = from; i < to; ++i) {
+-        if (i > 0)
+-            *p++ = ',';
+-        p = glz::to_chars(p, arr[i]);
+-    }
+-    return static_cast<size_t>(p - buf.data());
++    return appendUninitialized(buf, pos, (to - from) * (MAX_NUM_LEN + 1), [&](char* p) {
++        for (size_t i = from; i < to; ++i) {
++            if (i > 0)
++                *p++ = ',';
++            p = glz::to_chars(p, arr[i]);
++        }
++        return p;
++    });
+ }
+ 
+ // Write a full uint64_t array (brackets included) in yield-bounded slices.
+@@ -277,33 +255,12 @@
+ // ──────────────────────────────────────────────────────────────────────
+ 
+ seastar::future<std::string> ResponseFormatter::format(QueryResponse& response) {
+-    // Pre-allocate for the WORST case each point can serialise to, so the buffer
+-    // never has to grow.
+-    //
+-    // The old estimate of 28 bytes/point was not an over-estimate at all: a point
+-    // emits TWO array elements (its timestamp and its value), and
+-    // ensureArraySpace budgets MAX_NUM_LEN + 1 for each, i.e. 66 bytes/point. So
+-    // every non-trivial response blew the estimate and hit the growth path, which
+-    // then doubled -- 28N of estimate becoming 56N of buffer, with old and new
+-    // both live during the copy.
+-    size_t estimate = static_cast<size_t>(response.statistics.pointCount) * (2 * (MAX_NUM_LEN + 1)) + 512;
++    // Reserve the numeric worst case, but touch only bytes actually written.
++    // String fields and metadata can grow beyond this estimate as before.
++    const size_t estimate = static_cast<size_t>(response.statistics.pointCount) * (2 * (MAX_NUM_LEN + 1)) + 512;
+     std::string buf;
+-    // resize() zero-fills: one call for a 10M-point response memsets ~660MB in
+-    // a single reactor task (observed as a 65ms stall at 3.5M points).  Grow in
+-    // bounded steps with a preemption check between them — reserve() first so
+-    // the steps never reallocate/copy, only zero-fill.
+-    constexpr size_t RESIZE_STEP = 16 << 20;  // 16 MB per step (~4-8ms of zero-fill)
+     buf.reserve(estimate);
+-    while (buf.size() < estimate) {
+-        buf.resize(std::min(estimate, buf.size() + RESIZE_STEP));
+-        co_await seastar::coroutine::maybe_yield();
+-    }
+-    size_t pos = 0;
+-
+-    // {"status":"success","series":[
+-    constexpr std::string_view header = R"({"status":"success","series":[)";
+-    std::memcpy(buf.data(), header.data(), header.size());
+-    pos = header.size();
++    size_t pos = appendRaw(buf, 0, R"({"status":"success","series":[)");
+ 
+     bool firstSeries = true;
+     for (auto& series : response.series) {
+@@ -327,19 +284,16 @@
+             // Write "key=value" as a JSON string with proper escaping
+             if (!needsEscaping(key) && !needsEscaping(value)) [[likely]] {
+                 // Fast path: no escaping needed
+-                size_t need = key.size() + value.size() + 4;
+-                if (pos + need > buf.size()) {
+-                    buf.resize(std::max(buf.size() * 2, pos + need));
+-                }
+-                char* p = buf.data() + pos;
+-                *p++ = '"';
+-                std::memcpy(p, key.data(), key.size());
+-                p += key.size();
+-                *p++ = '=';
+-                std::memcpy(p, value.data(), value.size());
+-                p += value.size();
+-                *p++ = '"';
+-                pos = static_cast<size_t>(p - buf.data());
++                pos = appendUninitialized(buf, pos, key.size() + value.size() + 3, [&](char* p) {
++                    *p++ = '"';
++                    std::memcpy(p, key.data(), key.size());
++                    p += key.size();
++                    *p++ = '=';
++                    std::memcpy(p, value.data(), value.size());
++                    p += value.size();
++                    *p++ = '"';
++                    return p;
++                });
+             } else {
+                 // Slow path: escape key and/or value
+                 std::string kv;
+@@ -372,25 +326,20 @@
+ 
+     // ],"statistics":{"series_count":N,"point_count":N,"execution_time_ms":N}}
+     pos = appendRaw(buf, pos, R"(],"statistics":{"series_count":)");
+-    // Ensure room for the statistics footer (~120 bytes max)
+-    if (pos + 128 > buf.size()) {
+-        buf.resize(pos + 128);
+-    }
+-    char* p = buf.data() + pos;
+-    p = glz::to_chars(p, static_cast<int64_t>(response.statistics.seriesCount));
+-    constexpr std::string_view ptKey = R"(,"point_count":)";
+-    std::memcpy(p, ptKey.data(), ptKey.size());
+-    p += ptKey.size();
+-    p = glz::to_chars(p, static_cast<int64_t>(response.statistics.pointCount));
+-    constexpr std::string_view execKey = R"(,"execution_time_ms":)";
+-    std::memcpy(p, execKey.data(), execKey.size());
+-    p += execKey.size();
+-    p = glz::to_chars(p, response.statistics.executionTimeMs);
+-    *p++ = '}';
+-    *p++ = '}';
+-    pos = static_cast<size_t>(p - buf.data());
+-
+-    buf.resize(pos);
++    appendUninitialized(buf, pos, 128, [&](char* p) {
++        p = glz::to_chars(p, static_cast<int64_t>(response.statistics.seriesCount));
++        constexpr std::string_view ptKey = R"(,"point_count":)";
++        std::memcpy(p, ptKey.data(), ptKey.size());
++        p += ptKey.size();
++        p = glz::to_chars(p, static_cast<int64_t>(response.statistics.pointCount));
++        constexpr std::string_view execKey = R"(,"execution_time_ms":)";
++        std::memcpy(p, execKey.data(), execKey.size());
++        p += execKey.size();
++        p = glz::to_chars(p, response.statistics.executionTimeMs);
++        *p++ = '}';
++        *p++ = '}';
++        return p;
++    });
+     co_return buf;
+ }
+ 
+diff --git a/bin/timestar_query_bench.cpp b/bin/timestar_query_bench.cpp
+index 39ff40d..51521b8 100644
+--- a/bin/timestar_query_bench.cpp
++++ b/bin/timestar_query_bench.cpp
+@@ -309,14 +309,18 @@ static future<QueryResult> runQuery(socket_address addr, const QueryDef& def) {
+ 
+         auto t0 = clk::now();
+         bool ok = false;
+-        sstring respBody;
++        std::string respBody;
+ 
+         try {
+             co_await client->make_request(
+                 std::move(req), [&ok, &respBody](const http::reply& rep, input_stream<char>&& body_in) -> future<> {
+                     auto body = std::move(body_in);
+                     ok = (static_cast<int>(rep._status) >= 200 && static_cast<int>(rep._status) < 300);
+-                    sstring acc;
++                    // sstring::append reallocates and copies the entire prefix
++                    // on each chunk. Use geometric growth so large-response
++                    // timings measure the query and transfer, not quadratic
++                    // copying in the benchmark client.
++                    std::string acc;
+                     auto buf = co_await body.read();
+                     while (!buf.empty()) {
+                         acc.append(buf.get(), buf.size());

@@ -73,16 +73,9 @@ run_bench "integer_decode_MBps" \
     "Decode throughput.*MB/s" \
     's/.*throughput:[^0-9]*([0-9.]+) MB\/s.*/\1/'
 
-# Bool encoder (BitPack — first data row, "All true")
-run_bench "bool_bitpack_encode_ns_per_val" \
-    "$BUILD_DIR/test/benchmark/bool_encoder_benchmark" \
-    "BitPack.*PASS" \
-    's/.*BitPack\s+([0-9.]+)\s+([0-9.]+)\s+.*/\1/'
-
-run_bench "bool_bitpack_decode_ns_per_val" \
-    "$BUILD_DIR/test/benchmark/bool_encoder_benchmark" \
-    "BitPack.*PASS" \
-    's/.*BitPack\s+([0-9.]+)\s+([0-9.]+)\s+.*/\2/'
+# (The BitPack bool encoder and its `bool_encoder_benchmark` were removed with
+# the legacy encoders; their two metrics went with them. Bool encoding is
+# covered by the perf gates in test/timestar_perf_test.)
 
 echo ""
 echo "Writing results to $RESULTS_FILE"

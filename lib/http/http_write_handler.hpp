@@ -3,6 +3,7 @@
 #include "content_negotiation.hpp"
 #include "engine.hpp"
 #include "field_values.hpp"
+#include "plain_write_batch.hpp"
 #include "series_id.hpp"
 #include "timestar_config.hpp"
 #include "timestar_value.hpp"
@@ -256,6 +257,23 @@ private:
         const json_value_t::array_t& writes_array, uint64_t defaultTimestampNs, size_t& entriesSkipped,
         size_t& totalWritesProcessed);
 
+    // The lookup both candidate builders use: find or create the candidate for
+    // `seriesKey`, applying Integer->Float promotion and disambiguating
+    // conflicting types or full candidates under "<key>#n".
+    static CoalesceCandidate& findOrCreateCoalesceCandidate(
+        tsl::robin_map<std::string, CoalesceCandidate>& candidates, const std::string& seriesKey,
+        std::string_view measurement, std::shared_ptr<const std::map<std::string, std::string>> tags,
+        std::string_view fieldName, TSMValueType valueType, size_t numValuesToAdd, const std::string& groupKey);
+
+    // Plain-batch front-end (plain_write_batch.hpp): the candidates
+    // buildCoalesceCandidates would produce from the DOM of the same body,
+    // built from the scanner's flat arrays without a DOM.
+    static tsl::robin_map<std::string, CoalesceCandidate> buildPlainCoalesceCandidates(
+        const timestar::http::PlainWriteBatch& batch, uint64_t defaultTimestampNs, size_t& entriesSkipped,
+        size_t& totalWritesProcessed);
+    static std::vector<MultiWritePoint> coalescePlainBatch(const timestar::http::PlainWriteBatch& batch,
+                                                           uint64_t defaultTimestampNs, size_t& entriesSkippedOut);
+
     // coalesceWrites phase 2 (field-array assembly): convert candidates into
     // MultiWritePoints, merging same-group candidates with compatible
     // timestamps into multi-field points. Emits sub-MIN_COALESCE_COUNT
@@ -273,8 +291,9 @@ private:
     // Phase 1: read the request body (buffered or streamed) and enforce size
     // limits. Returns true with `body` viewing the bytes; returns false with
     // the error response fully assembled in `rep`.
-    seastar::future<bool> readWriteBody(seastar::http::request& req, std::string& bodyStorage, std::string_view& body,
-                                        timestar::http::WireFormat resFmt, seastar::http::reply& rep);
+    seastar::future<bool> readWriteBody(seastar::http::request& req, seastar::sstring& bodyStorage,
+                                        std::string_view& body, timestar::http::WireFormat resFmt,
+                                        seastar::http::reply& rep);
 
     // Phase 2: protobuf fast write path; fully assembles the response in `rep`.
     seastar::future<> handleProtobufWrite(std::string_view body, uint64_t defaultTimestampNs,
@@ -291,6 +310,15 @@ private:
     seastar::future<bool> processBatchWrites(const json_value_t::array_t& writes_array, uint64_t defaultTimestampNs,
                                              int64_t& pointsWritten, timestar::http::WireFormat resFmt,
                                              seastar::http::reply& rep);
+
+    // Phase 4 after coalescing (shared by the DOM and plain-batch front-ends):
+    // validate, accumulate per shard, dispatch, report. Same return contract.
+    seastar::future<bool> processCoalescedWrites(std::vector<MultiWritePoint> coalescedWrites, size_t coalesceSkipped,
+                                                 int64_t& pointsWritten, timestar::http::WireFormat resFmt,
+                                                 seastar::http::reply& rep);
+
+    // Largest "writes" array accepted in one request.
+    static constexpr size_t MAX_BATCH_WRITES = 100000;
 
     // Create error response JSON
     std::string createErrorResponse(const std::string& error);
@@ -320,6 +348,17 @@ public:
     // since spaces don't participate in tag value key encoding.
     // Returns empty string if valid, or an error description if invalid.
     static std::string validateTagValue(const std::string& value, const std::string& context);
+
+    // Test seam: how a {"writes":[...]} body coalesces, as a canonical text
+    // dump (one block per emitted point, sorted, then the skipped-entry
+    // count). With
+    // `plainPath` the body goes through the plain-batch scanner and
+    // `*accepted` reports whether the scanner took it (the dump is empty when
+    // it did not); otherwise it goes through the JSON DOM, `*accepted`
+    // reporting whether the body parsed as a batch at all. The two dumps must
+    // be identical for every body the scanner accepts.
+    static std::string describeCoalescedBatch(std::string_view body, uint64_t defaultTimestampNs, bool plainPath,
+                                              bool* accepted = nullptr);
 
     // Parse and validate a single write point from JSON string (for testing without Seastar).
     // Throws std::runtime_error if JSON is invalid or names contain reserved characters.

@@ -12,9 +12,11 @@
 #include "proto_converters.hpp"
 #include "query_parser.hpp"
 #include "query_runner.hpp"
+#include "request_body.hpp"
 #include "response_formatter.hpp"
 #include "series_key.hpp"
 #include "series_matcher.hpp"
+#include "shard_count.hpp"
 #include "yield_policy.hpp"
 
 #include <algorithm>
@@ -24,6 +26,7 @@
 #include <numeric>
 #include <seastar/core/loop.hh>
 #include <seastar/core/lowres_clock.hh>
+#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/core/with_timeout.hh>
@@ -59,10 +62,21 @@ namespace timestar::http {
 // Includes pre-computed SeriesId128 to eliminate redundant hash computations.
 // Defined at namespace level so streaming group-by helpers can reference it.
 struct SeriesQueryContext {
+    // The cached immutable snapshot owns the referenced strings and tag map.
+    // Holding it here also covers timeout continuations and cache eviction.
+    std::shared_ptr<const std::vector<IndexBackend::SeriesWithMetadata>> metadataOwner;
     std::string seriesKey;
-    SeriesId128 seriesId;  // Pre-computed from seriesKey — avoids rehashing in QueryRunner
-    std::string field;
-    std::map<std::string, std::string> tags;
+    SeriesId128 seriesId;
+    const std::string& field;
+    const std::map<std::string, std::string>& tags;
+
+    SeriesQueryContext(std::shared_ptr<const std::vector<IndexBackend::SeriesWithMetadata>> owner,
+                       const IndexBackend::SeriesWithMetadata& swm)
+        : metadataOwner(std::move(owner)),
+          seriesKey(buildSeriesKey(swm.metadata.measurement, swm.metadata.tags, swm.metadata.field)),
+          seriesId(swm.seriesId),
+          field(swm.metadata.field),
+          tags(swm.metadata.tags) {}
 };
 
 // ---------------------------------------------------------------------------
@@ -73,20 +87,14 @@ struct SeriesQueryContext {
 // per-group accumulators instead of materializing all raw data.  Memory goes
 // from O(points) to O(groups x buckets).
 
-// Returns true when a group-by query can use the streaming path.
-// MEDIAN and EXACT_MEDIAN are NOT streamable (both need raw values).
 // Returns true when the query can use streaming aggregation (fold per-block
 // into accumulators instead of materializing all raw data).
+// MEDIAN and EXACT_MEDIAN need raw values.
 //
-// Requires EITHER group-by tags OR an aggregation interval — without both,
-// the old path returns raw timestamp/value pairs which internal callers
-// (DerivedQueryExecutor, ForecastExecutor) depend on for formula evaluation.
-static bool canStreamAggregation(AggregationMethod method, const std::vector<std::string>& groupByTags,
-                                 uint64_t aggregationInterval) {
-    if (!isStreamableMethod(method))
-        return false;
-    // Need at least one of: group-by (fold into groups) or bucketing (fold into buckets)
-    return !groupByTags.empty() || aggregationInterval > 0;
+// Bucketed queries can fold directly into bounded group/bucket state. Without
+// an interval, use compact sorted partials and the final N-way group merge.
+static bool canStreamAggregation(AggregationMethod method, uint64_t aggregationInterval) {
+    return isStreamableMethod(method) && aggregationInterval > 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -385,7 +393,7 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
     struct GroupAccumulator {
         // One AggregationState per bucket; with interval == 0 the "bucket" is
         // the point's own timestamp, so every distinct timestamp survives.
-        std::unordered_map<uint64_t, AggregationState> bucketStates;
+        timestar::BucketStateMap bucketStates;
         // Metadata
         std::string groupKey;
         size_t groupKeyHash = 0;
@@ -458,7 +466,7 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
         for (const auto& ctx : contexts) {
             prefetchIds.push_back(ctx.seriesId);
         }
-        co_await engine.prefetchSeriesIndices(prefetchIds);
+        co_await engine.prefetchSeriesIndices(prefetchIds, startTime, endTime);
     }
 
     // ---- Phase 3: Helper lambdas for folding values into groups ----
@@ -481,9 +489,7 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
 
         if (aggregationInterval > 0 && !pr.bucketStates.empty()) {
             // Bucketed: merge each bucket state
-            for (auto& [bucketTs, state] : pr.bucketStates) {
-                group.bucketStates[bucketTs].mergeForMethod(state, aggregation);
-            }
+            timestar::foldSeriesBucketsIntoGroup(group.bucketStates, pr.bucketStates, aggregation, /*consume=*/false);
         } else if (!pr.sortedTimestamps.empty()) {
             // Raw values from pushdown: fold each value
             for (size_t i = 0; i < pr.sortedTimestamps.size(); ++i) {
@@ -652,9 +658,9 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
                         if (aggregationInterval > 0) {
                             BlockAggregator agg(aggregationInterval, startTime, endTime, aggregation, true);
                             agg.addPoints(result.timestamps, result.values);
-                            for (auto& [bucketTs, state] : agg.takeBucketStates()) {
-                                group->bucketStates[bucketTs].mergeForMethod(std::move(state), aggregation);
-                            }
+                            auto seriesStates = agg.takeBucketStates();
+                            timestar::foldSeriesBucketsIntoGroup(group->bucketStates, seriesStates, aggregation,
+                                                                 /*consume=*/true);
                         } else {
                             // interval == 0, method keeps the time axis: one state
                             // per distinct timestamp.  BlockAggregator's bucketed
@@ -743,7 +749,9 @@ seastar::future<> HttpQueryHandler::finalizeSingleShardPartials(std::vector<Part
                     co_await seastar::coroutine::maybe_yield();
                 }
             }
-            std::sort(tvPairs.begin(), tvPairs.end());
+            if (!partial.bucketStates.sortedByKey()) {
+                std::sort(tvPairs.begin(), tvPairs.end());
+            }
             timestamps.reserve(n);
             values.reserve(n);
             for (auto& [ts, val] : tvPairs) {
@@ -881,23 +889,27 @@ struct QueryTimingInfo {
     }
 };
 
-std::unique_ptr<seastar::http::reply> HttpQueryHandler::validateRequest(const seastar::http::request& req) const {
-    auto resFmt = timestar::http::responseFormat(req);
+std::unique_ptr<seastar::http::reply> HttpQueryHandler::payloadTooLargeReply(timestar::http::WireFormat resFmt) {
+    auto rep = std::make_unique<seastar::http::reply>();
+    rep->set_status(seastar::http::reply::status_type::payload_too_large);
+    auto maxBytes = maxQueryBodySize();
+    auto msg = "Request body too large (max " + std::to_string(maxBytes / 1024) + "KB)";
+    if (timestar::http::isProtobuf(resFmt)) {
+        rep->_content = timestar::proto::formatQueryError("PAYLOAD_TOO_LARGE", msg);
+    } else {
+        auto errObj = glz::obj{"status", "error", "message", msg, "error", msg};
+        rep->_content = glz::write_json(errObj).value_or("{\"status\":\"error\"}");
+    }
+    timestar::http::setContentType(*rep, resFmt);
+    return rep;
+}
 
-    // Check body size limit
-    if (req.content.size() > maxQueryBodySize()) {
-        auto rep = std::make_unique<seastar::http::reply>();
-        rep->set_status(seastar::http::reply::status_type::payload_too_large);
-        auto maxBytes = maxQueryBodySize();
-        auto msg = "Request body too large (max " + std::to_string(maxBytes / 1024) + "KB)";
-        if (timestar::http::isProtobuf(resFmt)) {
-            rep->_content = timestar::proto::formatQueryError("PAYLOAD_TOO_LARGE", msg);
-        } else {
-            auto errObj = glz::obj{"status", "error", "message", msg, "error", msg};
-            rep->_content = glz::write_json(errObj).value_or("{\"status\":\"error\"}");
-        }
-        timestar::http::setContentType(*rep, resFmt);
-        return rep;
+std::unique_ptr<seastar::http::reply> HttpQueryHandler::validateRequest(const seastar::http::request& req) const {
+    // Body size limit for a request whose body is already in memory. A
+    // request arriving through the HTTP server is streamed, and handleQuery
+    // enforces the same limit while reading it (readRequestBody).
+    if (timestar::http::injectedBody(req).size() > maxQueryBodySize()) {
+        return payloadTooLargeReply(timestar::http::responseFormat(req));
     }
 
     // Content-Type validation is handled by the content negotiation layer
@@ -907,6 +919,14 @@ std::unique_ptr<seastar::http::reply> HttpQueryHandler::validateRequest(const se
     return nullptr;  // Validation passed
 }
 
+bool HttpQueryHandler::shouldStreamResponse(const seastar::http::request& req, const QueryResponse& response) {
+    const uint64_t minPoints = timestar::config().http.stream_response_min_points;
+    // Chunked transfer encoding does not exist before HTTP/1.1. A handler
+    // invoked directly (tests, internal callers) carries no version and gets
+    // the body in the reply, as it always did.
+    return minPoints != 0 && response.statistics.pointCount >= minPoints && req._version == "1.1";
+}
+
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQuery(
     std::unique_ptr<seastar::http::request> req) {
     auto rep = std::make_unique<seastar::http::reply>();
@@ -914,10 +934,19 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
     auto resFmt = timestar::http::responseFormat(*req);
 
     try {
-        // Validate request body size
+        // Validate the request, then read its body under the size limit.
         auto validationError = validateRequest(*req);
         if (validationError) {
             co_return validationError;
+        }
+        seastar::sstring body;
+        const auto bodyStatus = co_await timestar::http::readRequestBody(*req, maxQueryBodySize(), body);
+        if (bodyStatus == timestar::http::BodyStatus::TooLarge) {
+            co_return payloadTooLargeReply(resFmt);
+        }
+        if (bodyStatus == timestar::http::BodyStatus::Incomplete) {
+            timestar::http::replyIncompleteBody(*rep, resFmt);
+            co_return rep;
         }
 
         // Parse request body
@@ -926,7 +955,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
 
         if (timestar::http::isProtobuf(reqFmt)) {
             // Parse protobuf request
-            auto parsed = timestar::proto::parseQueryRequest(req->content.data(), req->content.size());
+            auto parsed = timestar::proto::parseQueryRequest(body.data(), body.size());
             queryStr = parsed.query;
 
             // Build a GlazeQueryRequest-compatible struct to reuse parseQueryRequest()
@@ -959,7 +988,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
         } else {
             // Parse JSON request body using Glaze
             GlazeQueryRequest glazeRequest;
-            auto parse_error = glz::read_json(glazeRequest, req->content);
+            auto parse_error = glz::read_json(glazeRequest, body);
 
             if (parse_error) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
@@ -998,6 +1027,9 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
 
         // Calculate execution time
         response.statistics.executionTimeMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
+        // Kept for the summary log below: a streamed response is moved into
+        // its body writer.
+        [[maybe_unused]] const double executionTimeMs = response.statistics.executionTimeMs;
 
         // Format response
         if (response.success) {
@@ -1033,8 +1065,16 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
                 }
 
                 rep->_content = co_await timestar::proto::formatQueryResponseYielding(protoResp);
+            } else if (shouldStreamResponse(*req, response)) {
+                // Large result: format straight onto the connection in
+                // segments (chunked transfer encoding) rather than building
+                // the whole body first. The writer runs after this handler
+                // returns, so it owns the response.
+                rep->write_body("json", [response = std::move(response)](seastar::output_stream<char>& out) mutable {
+                    return ResponseFormatter::streamBody(response, out);
+                });
             } else {
-                rep->_content = co_await formatQueryResponse(response);
+                rep->_content = co_await ResponseFormatter::formatBody(response);
             }
         } else {
             rep->set_status(seastar::http::reply::status_type::internal_server_error);
@@ -1053,7 +1093,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
                        "ExecutionTime: {:.2f}ms",
                        queryStr, queryRequest.startTime, queryRequest.endTime,
                        queryRequest.aggregationInterval ? std::to_string(queryRequest.aggregationInterval) : "none",
-                       response.statistics.executionTimeMs);
+                       executionTimeMs);
 
     } catch (const std::exception& e) {
         if (engineSharded) {
@@ -1181,7 +1221,11 @@ QueryRequest HttpQueryHandler::parseQueryRequest(const GlazeQueryRequest& glazeR
 
 // Per-shard discovery result
 struct PerShardDiscovery {
-    std::vector<SeriesQueryContext> contexts;
+    // The coordinator receives an opaque handle, never the context contents.
+    // Destruction on timeout/limit errors is returned to the owning shard.
+    seastar::foreign_ptr<std::unique_ptr<std::vector<SeriesQueryContext>>> contexts;
+    size_t seriesCount = 0;
+    std::vector<bool> knownGroupKeys;
     bool limitExceeded = false;
     size_t discovered = 0;
     size_t limit = 0;
@@ -1189,7 +1233,7 @@ struct PerShardDiscovery {
 
 // Combined result of the discovery phase across all shards.
 struct SeriesDiscoveryResult {
-    std::vector<std::vector<SeriesQueryContext>> seriesByShard;
+    std::vector<PerShardDiscovery> seriesByShard;
     bool limitExceeded = false;
     size_t discovered = 0;
     size_t limit = 0;
@@ -1316,8 +1360,7 @@ static seastar::future<ShardQueryResult> executeShardQuery(
 
     if (contexts.empty()) {
         // All series resolved by batch or streaming path — skip standard path.
-    } else if (bucketAnchor == 0 && !booleansAsNumeric &&
-               canStreamAggregation(aggregation, groupByTags, aggregationInterval)) {
+    } else if (bucketAnchor == 0 && !booleansAsNumeric && canStreamAggregation(aggregation, aggregationInterval)) {
         // ---- STREAMING AGGREGATION PATH ----
         // Fold per-series results into accumulators without
         // materializing all raw data.  O(groups x buckets)
@@ -1346,7 +1389,7 @@ static seastar::future<ShardQueryResult> executeShardQuery(
             for (const auto& ctx : contexts) {
                 prefetchIds.push_back(ctx.seriesId);
             }
-            co_await engine.prefetchSeriesIndices(prefetchIds);
+            co_await engine.prefetchSeriesIndices(prefetchIds, startTime, endTime);
         }
 
         // Use max_concurrent_for_each to avoid creating thousands of
@@ -1657,6 +1700,9 @@ static seastar::future<ShardQueryResult> executeShardQuery(
     // Combine pushdown partials with fallback partials
     partialResults.insert(partialResults.end(), std::make_move_iterator(pushdownPartials.begin()),
                           std::make_move_iterator(pushdownPartials.end()));
+    if (aggregationInterval == 0)
+        co_await Aggregator::compactAlignedPartialGroups(partialResults, aggregation);
+
     auto partialAggEnd = std::chrono::high_resolution_clock::now();
     [[maybe_unused]] double partialAggMs =
         std::chrono::duration<double, std::milli>(partialAggEnd - partialAggStart).count();  // used by LOG_QUERY_PATH
@@ -1681,7 +1727,7 @@ static seastar::future<ShardQueryResult> executeShardQuery(
 // shard-0 bottleneck.  Sets timedOut when the discovery phase exceeds the
 // query timeout, and limitExceeded when a shard hit the series limit.
 seastar::future<SeriesDiscoveryResult> HttpQueryHandler::discoverSeriesAcrossShards(const QueryRequest& request) {
-    unsigned shardCount = seastar::smp::count;
+    unsigned shardCount = timestar::shardCount();
     if (shardCount == 0)
         shardCount = 1;
 
@@ -1709,7 +1755,8 @@ seastar::future<SeriesDiscoveryResult> HttpQueryHandler::discoverSeriesAcrossSha
                     s,
                     [measurement = request.measurement, scopes = exactScopes, patternScopes = patternScopes,
                      fields = request.fields, startTime = request.startTime, endTime = request.endTime,
-                     maxSeries = maxSeriesCount()](Engine& engine) -> seastar::future<PerShardDiscovery> {
+                     maxSeries = maxSeriesCount(),
+                     groupByTags = request.groupByTags](Engine& engine) -> seastar::future<PerShardDiscovery> {
                         auto& index = engine.getIndex();
                         std::unordered_set<std::string> fieldFilter(fields.begin(), fields.end());
                         // Wide-range optimisation: use discovery cache for ranges > 365 days.
@@ -1748,9 +1795,11 @@ seastar::future<SeriesDiscoveryResult> HttpQueryHandler::discoverSeriesAcrossSha
                             swmPtr = cachedPtr.get();
                         }
 
-                        result.contexts.reserve(swmPtr->size());
+                        std::vector<SeriesQueryContext> contexts;
+                        contexts.reserve(swmPtr->size());
+                        result.knownGroupKeys.resize(groupByTags.size(), false);
 
-                        // Context building copies strings + a tag map per series;
+                        // Context building allocates a series key per series;
                         // at high cardinality (thousands of series) this loop was
                         // an observed 150ms reactor stall — yield periodically.
                         size_t sinceYield = 0;
@@ -1759,13 +1808,10 @@ seastar::future<SeriesDiscoveryResult> HttpQueryHandler::discoverSeriesAcrossSha
                             if (!patternScopes.empty() && !SeriesMatcher::matches(swm.metadata.tags, patternScopes)) {
                                 continue;
                             }
-                            SeriesQueryContext ctx;
-                            ctx.seriesKey =
-                                buildSeriesKey(swm.metadata.measurement, swm.metadata.tags, swm.metadata.field);
-                            ctx.seriesId = swm.seriesId;
-                            ctx.field = swm.metadata.field;
-                            ctx.tags = swm.metadata.tags;
-                            result.contexts.push_back(std::move(ctx));
+                            contexts.emplace_back(cachedPtr, swm);
+                            for (size_t k = 0; k < groupByTags.size(); ++k)
+                                result.knownGroupKeys[k] =
+                                    result.knownGroupKeys[k] || swm.metadata.tags.contains(groupByTags[k]);
 
                             if (++sinceYield >= 512) {
                                 sinceYield = 0;
@@ -1773,6 +1819,10 @@ seastar::future<SeriesDiscoveryResult> HttpQueryHandler::discoverSeriesAcrossSha
                             }
                         }
 
+                        result.seriesCount = contexts.size();
+                        if (!contexts.empty())
+                            result.contexts = seastar::make_foreign(
+                                std::make_unique<std::vector<SeriesQueryContext>>(std::move(contexts)));
                         co_return result;
                     })
                 .then([s](PerShardDiscovery result) { return std::make_pair(s, std::move(result)); });
@@ -1801,7 +1851,7 @@ seastar::future<SeriesDiscoveryResult> HttpQueryHandler::discoverSeriesAcrossSha
             discoveryResult.limit = perShard.limit;
             break;
         }
-        discoveryResult.seriesByShard[s] = std::move(perShard.contexts);
+        discoveryResult.seriesByShard[s] = std::move(perShard);
     }
 
     // A grouping key must resolve to a real tag key, exactly as a scope key
@@ -1813,21 +1863,13 @@ seastar::future<SeriesDiscoveryResult> HttpQueryHandler::discoverSeriesAcrossSha
     // dropped.  Resolved against the discovered series rather than the tag
     // index so a schema broadcast still in flight cannot turn a valid grouping
     // into an empty result.
-    if (!discoveryResult.limitExceeded && !request.groupByTags.empty()) {
-        for (const auto& groupByTag : request.groupByTags) {
+    if (!discoveryResult.limitExceeded) {
+        for (size_t k = 0; k < request.groupByTags.size(); ++k) {
             bool known = false;
-            for (const auto& contexts : discoveryResult.seriesByShard) {
-                for (const auto& ctx : contexts) {
-                    if (ctx.tags.contains(groupByTag)) {
-                        known = true;
-                        break;
-                    }
-                }
-                if (known)
-                    break;
-            }
+            for (const auto& shard : discoveryResult.seriesByShard)
+                known |= k < shard.knownGroupKeys.size() && shard.knownGroupKeys[k];
             if (!known) {
-                discoveryResult.seriesByShard.assign(shardCount, {});
+                discoveryResult.seriesByShard.clear();
                 co_return discoveryResult;
             }
         }
@@ -1839,13 +1881,13 @@ seastar::future<SeriesDiscoveryResult> HttpQueryHandler::discoverSeriesAcrossSha
 // Phase 2: fan out query execution to every shard that owns series.
 // Consumes (moves from) the per-shard context vectors in seriesByShard.
 // Sets timedOut when the shard query phase exceeds the query timeout.
-seastar::future<ShardFanOutResult> HttpQueryHandler::fanOutShardQueries(
-    const QueryRequest& request, std::vector<std::vector<SeriesQueryContext>>& seriesByShard) {
+seastar::future<ShardFanOutResult> HttpQueryHandler::fanOutShardQueries(const QueryRequest& request,
+                                                                        std::vector<PerShardDiscovery>& seriesByShard) {
     std::vector<seastar::future<std::pair<unsigned, ShardQueryResult>>> futures;
     for (unsigned shardId = 0; shardId < seriesByShard.size(); ++shardId) {
-        if (seriesByShard[shardId].empty())
+        if (seriesByShard[shardId].seriesCount == 0)
             continue;
-        auto& shardContexts = seriesByShard[shardId];
+        auto& shardContexts = seriesByShard[shardId].contexts;
         auto f =
             engineSharded
                 ->invoke_on(shardId,
@@ -1857,7 +1899,7 @@ seastar::future<ShardFanOutResult> HttpQueryHandler::fanOutShardQueries(
                                 // executeShardQuery takes its parameters by value: they are moved
                                 // into the coroutine frame at invocation, so the closure (and its
                                 // captures) need not outlive the returned future.
-                                return executeShardQuery(engine, shardId, std::move(contexts), std::move(measurement),
+                                return executeShardQuery(engine, shardId, std::move(*contexts), std::move(measurement),
                                                          startTime, endTime, aggregation, aggregationInterval,
                                                          bucketAnchor, booleansAsNumeric, std::move(groupByTags));
                             })
@@ -2005,7 +2047,7 @@ seastar::future<std::optional<QueryResponse>> HttpQueryHandler::finalizeSingleSh
         } else {
             // Duplicate groupKeys — must merge partials before finalizing
             auto groupedResults =
-                co_await Aggregator::mergePartialAggregationsGrouped(sqr.partialResults, request.aggregation);
+                co_await Aggregator::mergePartialAggregationsGrouped(sqr.partialResults, request.aggregation, true);
 
             response.series.reserve(groupedResults.size());
             for (auto& groupedResult : groupedResults) {
@@ -2170,7 +2212,7 @@ seastar::future<std::optional<QueryResponse>> HttpQueryHandler::finalizeMultiSha
 
         // OPTIMIZATION & FIX: Use grouped merge to preserve metadata associations
         auto groupedResults =
-            co_await Aggregator::mergePartialAggregationsGrouped(allPartialResults, request.aggregation);
+            co_await Aggregator::mergePartialAggregationsGrouped(allPartialResults, request.aggregation, true);
 
         LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Merged into {} grouped results", groupedResults.size());
 
@@ -2376,8 +2418,8 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(QueryRequest reque
         size_t totalSeriesFound = 0;
         size_t shardsWithData = 0;
         for (const auto& contexts : seriesByShard) {
-            if (!contexts.empty()) {
-                totalSeriesFound += contexts.size();
+            if (contexts.seriesCount != 0) {
+                totalSeriesFound += contexts.seriesCount;
                 ++shardsWithData;
             }
         }
@@ -2478,7 +2520,7 @@ std::string HttpQueryHandler::createErrorResponse(const std::string& code, const
 
 // Test-only utility: production query path iterates shards inline in executeQuery().
 std::vector<unsigned> HttpQueryHandler::determineTargetShards(const QueryRequest& /*request*/) {
-    unsigned shardCount = seastar::smp::count;
+    unsigned shardCount = timestar::shardCount();
     if (shardCount == 0)
         shardCount = 1;  // test environment default
     std::vector<unsigned> shards(shardCount);

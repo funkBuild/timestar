@@ -1,0 +1,243 @@
+--- a/lib/encoding/alp/alp_ffor.hpp
++++ b/lib/encoding/alp/alp_ffor.hpp
+@@ -29,6 +29,15 @@
+ 
+ namespace detail {
+ 
++// Packed words may begin at any byte offset in a WAL or TSM payload.
++// Fixed-size memcpy permits native loads without an alignment requirement.
++inline uint64_t load_packed_word(const void* input, size_t index) {
++    uint64_t word;
++    std::memcpy(&word, static_cast<const uint8_t*>(input) + index * sizeof(word), sizeof(word));
++    return word;
++}
++
++
+ // Pack values into words for a known power-of-2 bit-width.
+ // Template parameter BW must be one of {1, 2, 4, 8, 16, 32}.
+ // Values per word = 64 / BW.
+@@ -67,14 +76,14 @@
+ 
+ // Unpack values from words for a known power-of-2 bit-width.
+ template <unsigned BW>
+-inline void unpack_pow2_u64(const uint64_t* in, size_t count, uint64_t base, uint64_t* out) {
++inline void unpack_pow2_u64(const void* in, size_t count, uint64_t base, uint64_t* out) {
+     constexpr unsigned VPW = 64 / BW;
+     constexpr uint64_t mask = (1ULL << BW) - 1;
+     const size_t n_words = ffor_packed_words(count, BW);
+ 
+     size_t i = 0;
+     for (size_t w = 0; w < n_words && i < count; ++w) {
+-        uint64_t word = in[w];
++        uint64_t word = load_packed_word(in, w);
+         for (unsigned j = 0; j < VPW && i < count; ++j, ++i) {
+             out[i] = base + ((word >> (j * BW)) & mask);
+         }
+@@ -327,8 +336,8 @@
+     }
+ }
+ 
+-// Unsigned unpack variant for ALP_RD right-parts
+-inline void ffor_unpack_u64(const uint64_t* in, size_t count, uint64_t base, uint8_t bw, uint64_t* out) {
++// Unsigned unpack variant for ALP_RD right-parts and byte-aligned timestamps.
++inline void ffor_unpack_u64(const void* in, size_t count, uint64_t base, uint8_t bw, uint64_t* out) {
+     if (count == 0)
+         return;
+ 
+@@ -341,7 +350,7 @@
+ 
+     if (bw >= 64) {
+         for (size_t i = 0; i < count; ++i) {
+-            out[i] = base + in[i];
++            out[i] = base + detail::load_packed_word(in, i);
+         }
+         return;
+     }
+@@ -378,11 +387,11 @@
+         const size_t word_idx = bit_pos >> 6;
+         const unsigned bit_idx = bit_pos & 63;
+ 
+-        uint64_t delta = (in[word_idx] >> bit_idx) & mask;
++        uint64_t delta = (detail::load_packed_word(in, word_idx) >> bit_idx) & mask;
+ 
+         if (bit_idx + bw > 64) {
+             const unsigned overflow_bits = bit_idx + bw - 64;
+-            delta |= (in[word_idx + 1] & ((1ULL << overflow_bits) - 1)) << (64 - bit_idx);
++            delta |= (detail::load_packed_word(in, word_idx + 1) & ((1ULL << overflow_bits) - 1)) << (64 - bit_idx);
+         }
+ 
+         out[i] = base + delta;
+--- a/lib/encoding/integer/integer_encoder_ffor.cpp
++++ b/lib/encoding/integer/integer_encoder_ffor.cpp
+@@ -82,8 +82,7 @@
+ 
+     // Scalar tail: process remaining elements that don't fill a full vector
+     for (; i < count; ++i) {
+-        int64_t x = (static_cast<int64_t>(base[i + 2]) - static_cast<int64_t>(base[i + 1])) -
+-                    (static_cast<int64_t>(base[i + 1]) - static_cast<int64_t>(base[i]));
++        const int64_t x = std::bit_cast<int64_t>((base[i + 2] - base[i + 1]) - (base[i + 1] - base[i]));
+         uint64_t zz = (static_cast<uint64_t>(x) << 1) ^ static_cast<uint64_t>(x >> 63);
+         out[i] = zz;
+         if (zz < cur_min)
+@@ -334,6 +333,14 @@
+     }
+ }
+ 
++// Keep the unpack loop separate from block-header and exception state. Inlining
++// it here spills loop invariants on the measured GCC build after removing the
++// aligned scratch copy; an out-of-line call keeps them in registers.
++[[gnu::noinline]] void unpackTimestampWords(const uint8_t* packed, size_t count, uint64_t base, uint8_t bw,
++                                           uint64_t* out) {
++    timestar::alp::ffor_unpack_u64(packed, count, base, bw, out);
++}
++
+ // Decode one block of zigzag values from the Slice into a caller-provided buffer.
+ // Writes exactly `hdr.block_count` values to `out`. Returns the block count.
+ // The caller must ensure `out` has room for at least kBlockSize (1024) elements.
+@@ -376,14 +383,9 @@
+         const uint8_t* packed_ptr = s.data + s.offset;
+         s.offset += packed_bytes;
+ 
+-        // Copy to an aligned stack buffer -- the source slice may not be 8-byte
+-        // aligned, and reinterpret_cast<const uint64_t*> on unaligned data
+-        // is UB (crashes with SIGBUS on ARM / Graviton).
+-        // Max packed_words = ceil(kBlockSize * 64 / 64) = kBlockSize = 1024 (8KB stack).
+-        alignas(8) uint64_t aligned_packed[IntegerEncoderFFOR::kBlockSize];
+-        std::memcpy(aligned_packed, packed_ptr, packed_bytes);
+-
+-        timestar::alp::ffor_unpack_u64(aligned_packed, hdr.block_count, hdr.base, hdr.bw, out);
++        // The unpacker reads byte-aligned words directly; no aligned packed
++        // scratch buffer or extra payload pass is needed.
++        unpackTimestampWords(packed_ptr, hdr.block_count, hdr.base, hdr.bw, out);
+     }
+ 
+     // Patch exceptions
+@@ -483,12 +485,9 @@
+ 
+             if (zz_idx < block_count && val_idx < sz) {
+                 // Second value: zigzag(delta)
+-                // Precondition: all input values must fit in int64_t (< 2^63).
+-                // This holds for nanosecond timestamps (until year ~2262) and ZigZag-encoded
+-                // int64_t values (range 0..2^63-1 for non-negative originals).
+-                // Two's complement subtraction is correct even for values near INT64_MAX,
+-                // as long as the delta between consecutive values fits in int64_t.
+-                int64_t delta = static_cast<int64_t>(values[1]) - static_cast<int64_t>(values[0]);
++                // Deltas use modulo-2^64 arithmetic, including timestamps
++                // crossing the signed boundary or moving backwards.
++                const int64_t delta = std::bit_cast<int64_t>(values[1] - values[0]);
+                 zz = ZigZag::zigzagEncode(delta);
+                 zigzag[1] = zz;
+                 if (zz < block_min)
+@@ -510,9 +509,8 @@
+         }
+ 
+         if (dd_count > 0) {
+-            // uint64_t wrap-around arithmetic inside the kernel is bit-identical
+-            // to the signed delta-of-delta formulation (two's complement); valid
+-            // for nanosecond timestamps until year ~2262.
++            // Unsigned modular arithmetic in every SIMD lane and scalar tail
++            // preserves the full uint64_t domain without signed overflow.
+             ffor_enc::dispatchDoDZigZagEncodeAndMinMax(&values[val_idx - 2], &zigzag[zz_idx], dd_count, &block_min,
+                                                        &block_max);
+ 
+@@ -523,8 +521,8 @@
+         // Scalar tail: any remaining delta-of-delta values not covered by the SIMD dispatch.
+         // val_idx is always >= 2 here (first two values handled above).
+         for (; zz_idx < block_count && val_idx < sz; ++zz_idx, ++val_idx) {
+-            int64_t D = (static_cast<int64_t>(values[val_idx]) - static_cast<int64_t>(values[val_idx - 1])) -
+-                        (static_cast<int64_t>(values[val_idx - 1]) - static_cast<int64_t>(values[val_idx - 2]));
++            const int64_t D = std::bit_cast<int64_t>((values[val_idx] - values[val_idx - 1]) -
++                                                    (values[val_idx - 1] - values[val_idx - 2]));
+             uint64_t zz = ZigZag::zigzagEncode(D);
+             zigzag[zz_idx] = zz;
+             if (zz < block_min)
+@@ -616,7 +614,7 @@
+     // =========================================================================
+     if (minTime == 0 && maxTime == UINT64_MAX) {
+         uint64_t last_decoded = 0;
+-        int64_t delta = 0;
++        uint64_t delta = 0;
+         size_t global_idx = 0;
+         size_t total_decoded = 0;
+ 
+@@ -642,7 +640,7 @@
+             // Handle value[1]: zigzag(delta)
+             if (global_idx == 1 && local_i < emit_count) {
+                 delta = ZigZag::zigzagDecode(blockBuf[local_i]);
+-                last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
++                last_decoded += delta;
+                 blockBuf[local_i] = last_decoded;
+                 local_i++;
+                 global_idx = 2;
+@@ -653,7 +651,7 @@
+             // push_back (capacity check + end-pointer round-trip through memory).
+             for (; local_i < emit_count; ++local_i) {
+                 delta += ZigZag::zigzagDecode(blockBuf[local_i]);
+-                last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
++                last_decoded += delta;
+                 blockBuf[local_i] = last_decoded;
+             }
+ 
+@@ -672,7 +670,7 @@
+     // Delta reconstruction state carried across blocks.
+     // global_idx tracks our position in the logical sequence (0 = first value ever).
+     uint64_t last_decoded = 0;
+-    int64_t delta = 0;
++    uint64_t delta = 0;
+     size_t global_idx = 0;
+     size_t total_decoded = 0;
+ 
+@@ -723,7 +721,7 @@
+         // Handle value[1] of the entire sequence (zigzag(delta))
+         if (global_idx == 1 && local_i < emit_count) {
+             delta = ZigZag::zigzagDecode(blockBuf[local_i]);
+-            last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
++            last_decoded += delta;
+             if (last_decoded < minTime) {
+                 nSkipped++;
+             } else if (last_decoded <= maxTime) {
+@@ -745,7 +743,7 @@
+             int64_t dd3 = ZigZag::zigzagDecode(blockBuf[local_i + 3]);
+ 
+             delta += dd0;
+-            last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
++            last_decoded += delta;
+             if (last_decoded < minTime) {
+                 nSkipped++;
+             } else if (last_decoded > maxTime) {
+@@ -756,7 +754,7 @@
+             }
+ 
+             delta += dd1;
+-            last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
++            last_decoded += delta;
+             if (last_decoded < minTime) {
+                 nSkipped++;
+             } else if (last_decoded > maxTime) {
+@@ -767,7 +765,7 @@
+             }
+ 
+             delta += dd2;
+-            last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
++            last_decoded += delta;
+             if (last_decoded < minTime) {
+                 nSkipped++;
+             } else if (last_decoded > maxTime) {
+@@ -778,7 +776,7 @@
+             }
+ 
+             delta += dd3;
+-            last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
++            last_decoded += delta;
+             if (last_decoded < minTime) {
+                 nSkipped++;
+             } else if (last_decoded > maxTime) {
+@@ -793,7 +791,7 @@
+         for (; local_i < emit_count; ++local_i) {
+             int64_t dd = ZigZag::zigzagDecode(blockBuf[local_i]);
+             delta += dd;
+-            last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
++            last_decoded += delta;
+ 
+             if (last_decoded < minTime) {
+                 nSkipped++;

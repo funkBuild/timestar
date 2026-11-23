@@ -400,10 +400,10 @@ TEST_F(TSMStringTest, MemoryStoreWithStrings) {
     ASSERT_NE(it, store->series.end());
 
     auto& seriesData = std::get<InMemorySeries<std::string>>(it->second);
-    EXPECT_EQ(seriesData.timestamps.size(), 5);
-    EXPECT_EQ(seriesData.values.size(), 5);
-    EXPECT_EQ(seriesData.values[0], "System started");
-    EXPECT_EQ(seriesData.values[4], "System shutdown");
+    EXPECT_EQ(seriesData.timestamps().size(), 5);
+    EXPECT_EQ(seriesData.values().size(), 5);
+    EXPECT_EQ(seriesData.values()[0], "System started");
+    EXPECT_EQ(seriesData.values()[4], "System shutdown");
 }
 
 SEASTAR_TEST_F(TSMStringTest, StringSeriesCompression) {

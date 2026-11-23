@@ -429,7 +429,8 @@ public:
     seastar::future<> readSparseIndex();
     seastar::future<TSMIndexEntry*> getFullIndexEntry(const SeriesId128& seriesId);
     // Bulk prefetch: warm the full index cache for multiple series in parallel
-    seastar::future<> prefetchFullIndexEntries(const std::vector<SeriesId128>& seriesIds);
+    seastar::future<> prefetchFullIndexEntries(const std::vector<SeriesId128>& seriesIds, uint64_t startTime = 0,
+                                               uint64_t endTime = UINT64_MAX);
 
     template <class T>
     seastar::future<> readSeries(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,

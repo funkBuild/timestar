@@ -91,13 +91,18 @@ SEASTAR_TEST_F(IndexWalCrc32cTest, WalRoundtripVerifiesCrc32c) {
 TEST_F(IndexWalCrc32cTest, SoftwareFallbackUsesCrc32cPolynomial) {
     std::string src;
     {
+        // Absolute path from the build system: a path relative to the working
+        // directory made this test skip whenever it ran from anywhere but the
+        // build root (ctest runs it from build/test).
+#ifdef INDEX_WAL_SOURCE_PATH
+        std::ifstream ifs(INDEX_WAL_SOURCE_PATH);
+#else
         std::ifstream ifs("../lib/index/native/index_wal.cpp");
+#endif
         src.assign(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
     }
 
-    if (src.empty()) {
-        GTEST_SKIP() << "Could not read index_wal.cpp for source inspection";
-    }
+    ASSERT_FALSE(src.empty()) << "Could not read index_wal.cpp for source inspection";
 
     // The CRC32C Castagnoli reflected polynomial is 0x82F63B78
     EXPECT_NE(src.find("0x82F63B78"), std::string::npos)

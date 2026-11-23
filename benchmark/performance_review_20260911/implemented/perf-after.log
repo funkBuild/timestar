@@ -1,0 +1,538 @@
+INFO  2026-09-11 15:52:00,438 seastar - Reactor backend: linux-aio
+INFO  2026-09-11 15:52:00,439 seastar - Perf-based stall detector creation failed (EACCESS), try setting /proc/sys/kernel/perf_event_paranoid to 1 or less to enable kernel backtraces: falling back to posix timer.
+Note: Google Test filter = OptimizationBaseline.B1_*:OptimizationBaseline.B3_*:OptimizationBaseline.B8_*:OptimizationBaseline.B9_*:TsmReadPathBenchmark.*:QueryFoldBench.*
+[==========] Running 15 tests from 3 test suites.
+[----------] Global test environment set-up.
+[----------] 4 tests from OptimizationBaseline
+[ RUN      ] OptimizationBaseline.B1_AggregatorMergeScaling
+
+╔══════════════════════════════════════════════════════════════════╗
+║  B1: Aggregator Merge Scaling                                  ║
+╚══════════════════════════════════════════════════════════════════╝
+
+  ── Same-timestamps (element-wise fold, O(N)) ──
+  K=   1      0.00 ms  (1666666666667 pts/sec)
+  K=   5      0.03 ms  (9377344336 pts/sec)
+  K=  10      0.06 ms  (8861006256 pts/sec)
+  K=  25      0.41 ms  (3064146059 pts/sec)
+  K=  50      0.88 ms  (2827328277 pts/sec)
+  K= 100      1.60 ms  (3118427913 pts/sec)
+
+  ── Different-timestamps (N-way heap merge, O(KN log K)) ──
+  K=   1      0.30 ms  (165511397 pts/sec)
+  K=   5      1.58 ms  (157786844 pts/sec)
+  K=  10      4.07 ms  (122904509 pts/sec)
+  K=  25     15.63 ms  (79990565 pts/sec)
+  K=  50     54.06 ms  (46247621 pts/sec)
+  K= 100    122.33 ms  (40871611 pts/sec)
+
+  ── Old pairwise merge O(K²N) (reference) ──
+  K=   1      0.00 ms  (714285714286 pts/sec)
+  K=   5      1.40 ms  (178971558 pts/sec)
+  K=  10      5.12 ms  (97655773 pts/sec)
+  K=  25     36.39 ms  (34348838 pts/sec)
+  K=  50    142.45 ms  (17549631 pts/sec)
+  K= 100    619.03 ms  (8077148 pts/sec)
+
+[       OK ] OptimizationBaseline.B1_AggregatorMergeScaling (1112 ms)
+[ RUN      ] OptimizationBaseline.B3_NativeIndexInsertCacheOverhead
+
+╔══════════════════════════════════════════════════════════════════╗
+║  B3: NativeIndex Insert Cache & Allocation Overhead            ║
+╚══════════════════════════════════════════════════════════════════╝
+INFO  2026-09-11 15:52:01,559 [shard 0:main] timestar.native_index - NativeIndex opened at: /tmp/tsdb-opt-tests/shard_0/native_index (0 SSTables, 2 MemTable entries, 0 local IDs)
+      10 hosts →    200 series:      0.54 ms total  (373492 series/sec)
+    getOrCreateSeriesId (10 hosts)                    min=   0.001  avg=   0.003  p50=   0.002  p95=   0.005  max=   0.046 ms  (n=200)
+      50 hosts →   1000 series:      2.22 ms total  (450576 series/sec)
+    getOrCreateSeriesId (50 hosts)                    min=   0.000  avg=   0.002  p50=   0.002  p95=   0.003  max=   0.057 ms  (n=1000)
+     100 hosts →   2000 series:      3.95 ms total  (506219 series/sec)
+    getOrCreateSeriesId (100 hosts)                   min=   0.000  avg=   0.002  p50=   0.002  p95=   0.003  max=   0.030 ms  (n=2000)
+     500 hosts →  10000 series:     27.60 ms total  (362296 series/sec)
+    getOrCreateSeriesId (500 hosts)                   min=   0.000  avg=   0.003  p50=   0.003  p95=   0.004  max=   0.570 ms  (n=10000)
+    1000 hosts →  20000 series:     53.19 ms total  (376020 series/sec)
+    getOrCreateSeriesId (1000 hosts)                  min=   0.000  avg=   0.003  p50=   0.003  p95=   0.004  max=   0.707 ms  (n=20000)
+
+  Cache sizes after all inserts:
+    Series dedup cache:  26600 entries
+    Metadata cache:      26600 entries (13.6 MB)
+    Discovery cache:     0 entries (0.0 MB)
+INFO  2026-09-11 15:52:01,651 [shard 0:main] timestar.native_index - Flushing immutable MemTable: 89843 entries, 10477887 approx bytes
+INFO  2026-09-11 15:52:01,672 [shard 0:main] timestar.native_index - SSTable write starting for file 1
+INFO  2026-09-11 15:52:01,673 [shard 0:main] timestar.native_index - SSTable write complete: 89843 entries, 1815468 bytes
+INFO  2026-09-11 15:52:01,680 [shard 0:main] timestar.native_index - NativeIndex closed on shard 0
+
+[       OK ] OptimizationBaseline.B3_NativeIndexInsertCacheOverhead (131 ms)
+[ RUN      ] OptimizationBaseline.B8_EngineInsertPath
+
+╔══════════════════════════════════════════════════════════════════╗
+║  B8: Engine Insert Path (SeriesId roundtrip + alloc overhead)  ║
+╚══════════════════════════════════════════════════════════════════╝
+INFO  2026-09-11 15:52:01,688 [shard 0:main] timestar.native_index - NativeIndex opened at: /tmp/tsdb-opt-tests/shard_0/native_index (0 SSTables, 2 MemTable entries, 0 local IDs)
+INFO  2026-09-11 15:52:01,688 [shard 0:main] timestar.tsm - TSMFileManager init. shardId=0
+INFO  2026-09-11 15:52:01,688 [shard 0:main] timestar.wal - WALFileManager::init starting for shard 0
+INFO  2026-09-11 15:52:01,688 [shard 0:main] timestar.wal - WAL file manager initialization complete for shard 0
+  500 inserts x 100 pts = 50000 total points
+  Total:      36.43 ms  (1372416 pts/sec)
+  Latency: min=0.058  avg=0.073  p50=0.063  p95=0.110  p99=0.138  max=0.202 ms
+INFO  2026-09-11 15:52:01,725 [shard 0:main] timestar.engine - [ENGINE_STOP] Starting shutdown on shard 0
+INFO  2026-09-11 15:52:01,725 [shard 0:main] timestar.engine - [ENGINE_STOP] Closing insert gate (0 in-flight) on shard 0
+INFO  2026-09-11 15:52:01,725 [shard 0:main] timestar.engine - [ENGINE_STOP] Insert gate closed (0ms) on shard 0
+INFO  2026-09-11 15:52:01,725 [shard 0:main] timestar.engine - [ENGINE_STOP] Streaming gate closed (0ms) on shard 0
+INFO  2026-09-11 15:52:01,725 [shard 0:main] timestar.engine - [ENGINE_STOP] Retention drained (0ms) on shard 0
+INFO  2026-09-11 15:52:01,725 [shard 0:main] timestar.engine - [ENGINE_STOP] Compaction loop stopped (0ms) on shard 0
+INFO  2026-09-11 15:52:01,725 [shard 0:main] timestar.tsm - TSMFileManager stopped on shard 0
+INFO  2026-09-11 15:52:01,725 [shard 0:main] timestar.engine - [ENGINE_STOP] TSM files closed (0ms) on shard 0
+INFO  2026-09-11 15:52:01,725 [shard 0:main] timestar.wal - [WAL_CLOSE] Starting WAL file manager close on shard 0
+INFO  2026-09-11 15:52:01,725 [shard 0:main] timestar.wal - [WAL_CLOSE] Draining 0 background TSM conversions on shard 0
+INFO  2026-09-11 15:52:01,725 [shard 0:main] timestar.wal - [WAL_CLOSE] Background TSM conversions drained on shard 0
+INFO  2026-09-11 15:52:01,725 [shard 0:main] timestar.wal - [WAL_CLOSE] Flushing memory store 0 to TSM on shard 0
+INFO  2026-09-11 15:52:01,725 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 0 to TSM on shard 0
+INFO  2026-09-11 15:52:01,739 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_0.tsm (tier 0): 100 series, bloom filter: 1440 bytes
+INFO  2026-09-11 15:52:01,740 [shard 0:main] timestar.wal - Successfully converted WAL 0 to TSM on shard 0 | 2048000 -> 576373 bytes (71.9% reclaimed)
+INFO  2026-09-11 15:52:01,740 [shard 0:main] timestar.wal - [WAL_CLOSE] Successfully flushed store 0 to TSM on shard 0
+INFO  2026-09-11 15:52:01,740 [shard 0:main] timestar.wal - [WAL_CLOSE] WAL file manager closed on shard 0
+INFO  2026-09-11 15:52:01,740 [shard 0:main] timestar.engine - [ENGINE_STOP] WAL closed (14ms) on shard 0
+INFO  2026-09-11 15:52:01,740 [shard 0:main] timestar.native_index - Flushing immutable MemTable: 882 entries, 510553 approx bytes
+INFO  2026-09-11 15:52:01,741 [shard 0:main] timestar.native_index - SSTable write starting for file 1
+INFO  2026-09-11 15:52:01,741 [shard 0:main] timestar.native_index - SSTable write complete: 882 entries, 12215 bytes
+INFO  2026-09-11 15:52:01,741 [shard 0:main] timestar.native_index - NativeIndex closed on shard 0
+INFO  2026-09-11 15:52:01,741 [shard 0:main] timestar.engine - [ENGINE_STOP] Index closed (15ms) on shard 0
+INFO  2026-09-11 15:52:01,741 [shard 0:main] timestar.engine - [ENGINE_STOP] Shutdown complete (15ms) on shard 0
+
+[       OK ] OptimizationBaseline.B8_EngineInsertPath (57 ms)
+[ RUN      ] OptimizationBaseline.B9_QueryParserAllocation
+
+╔══════════════════════════════════════════════════════════════════╗
+║  B9: Query Parser Allocation Overhead                          ║
+╚══════════════════════════════════════════════════════════════════╝
+  simple            0.64 ms total  (0.0001 ms/parse, 15587565 parses/sec)
+  1-field           0.62 ms total  (0.0001 ms/parse, 16112738 parses/sec)
+  1-scope           1.01 ms total  (0.0001 ms/parse, 9888370 parses/sec)
+  3-scopes          2.22 ms total  (0.0002 ms/parse, 4512177 parses/sec)
+  group-by          1.80 ms total  (0.0002 ms/parse, 5552912 parses/sec)
+  complex           3.51 ms total  (0.0004 ms/parse, 2852039 parses/sec)
+
+[       OK ] OptimizationBaseline.B9_QueryParserAllocation (9 ms)
+[----------] 4 tests from OptimizationBaseline (1311 ms total)
+
+[----------] 5 tests from QueryFoldBench
+[ RUN      ] QueryFoldBench.Q1_AddPointsRangeMultiBucket
+[Q1] addPointsRange multi-bucket AVG: 0.369 ms for 1000000 pts (2712.8 Mpts/s), checksum=50009657.076
+[       OK ] QueryFoldBench.Q1_AddPointsRangeMultiBucket (11 ms)
+[ RUN      ] QueryFoldBench.Q2_ScalarFoldAvgPerPoint
+[Q2] scalar per-point AVG fold: 4.224 ms for 1000000 pts (236.7 Mpts/s), checksum=50009657.076
+[       OK ] QueryFoldBench.Q2_ScalarFoldAvgPerPoint (37 ms)
+[ RUN      ] QueryFoldBench.Q3_SimdMinMaxSum
+Reactor stalled for 66 ms on shard 0, in scheduling group main. Backtrace: 0x7091d1 0x6b24a3 0x6b2a0b 0x6b2bf7 0x45caf 0xa506f 0x1558db 0x155cc4 0x8afa3e 0x8a2f15 0x8a30b4 0x8a32f0 0x8a8068 0x8a8576 0x105129 0x103fec
+[Q3] SIMD kernels, 4000000 doubles: sum=0.450 ms (71.1 GB/s)  min=0.447 ms (71.6 GB/s)  max=0.431 ms (74.3 GB/s)
+[       OK ] QueryFoldBench.Q3_SimdMinMaxSum (46 ms)
+[ RUN      ] QueryFoldBench.Q4_StddevBatchFold
+[Q4] STDDEV batch fold: 0.158 ms for 1000000 pts (6347.2 Mpts/s), stddev=14.150273
+[       OK ] QueryFoldBench.Q4_StddevBatchFold (9 ms)
+[ RUN      ] QueryFoldBench.Q5_AddTimestampsOnlyMultiBucket
+[Q5] addTimestampsOnly multi-bucket COUNT: 0.265 ms for 1000000 pts (3768.3 Mpts/s), count=1000000
+[       OK ] QueryFoldBench.Q5_AddTimestampsOnlyMultiBucket (9 ms)
+[----------] 5 tests from QueryFoldBench (113 ms total)
+
+[----------] 6 tests from TsmReadPathBenchmark
+[ RUN      ] TsmReadPathBenchmark.R1_NarrowRangeQuery_ManyFiles
+
+╔══════════════════════════════════════════════════════════════════╗
+║  R1: Narrow-Range Query Over Many TSM Files                    ║
+╚══════════════════════════════════════════════════════════════════╝
+INFO  2026-09-11 15:52:01,869 [shard 0:main] timestar.native_index - NativeIndex opened at: /tmp/tsdb-opt-tests/shard_0/native_index (0 SSTables, 2 MemTable entries, 0 local IDs)
+INFO  2026-09-11 15:52:01,869 [shard 0:main] timestar.tsm - TSMFileManager init. shardId=0
+INFO  2026-09-11 15:52:01,869 [shard 0:main] timestar.wal - WALFileManager::init starting for shard 0
+INFO  2026-09-11 15:52:01,869 [shard 0:main] timestar.wal - WAL file manager initialization complete for shard 0
+INFO  2026-09-11 15:52:01,870 [shard 0:main] timestar.wal - Memory store 0 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:01,871 [shard 0:main] timestar.wal - New memory store 1 created for shard 0
+INFO  2026-09-11 15:52:01,871 [shard 0:main] timestar.wal - Rollover complete, new memory store 1 created for shard 0
+INFO  2026-09-11 15:52:01,871 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 0 to TSM on shard 0
+INFO  2026-09-11 15:52:01,871 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_0.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:01,871 [shard 0:main] timestar.wal - Successfully converted WAL 0 to TSM on shard 0 | 81920 -> 4133 bytes (95.0% reclaimed)
+INFO  2026-09-11 15:52:02,071 [shard 0:main] timestar.wal - Memory store 1 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:02,071 [shard 0:main] timestar.wal - New memory store 2 created for shard 0
+INFO  2026-09-11 15:52:02,071 [shard 0:main] timestar.wal - Rollover complete, new memory store 2 created for shard 0
+INFO  2026-09-11 15:52:02,071 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 1 to TSM on shard 0
+INFO  2026-09-11 15:52:02,071 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_1.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:02,072 [shard 0:main] timestar.wal - Successfully converted WAL 1 to TSM on shard 0 | 81920 -> 4133 bytes (95.0% reclaimed)
+INFO  2026-09-11 15:52:02,272 [shard 0:main] timestar.wal - Memory store 2 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:02,272 [shard 0:main] timestar.wal - New memory store 3 created for shard 0
+INFO  2026-09-11 15:52:02,272 [shard 0:main] timestar.wal - Rollover complete, new memory store 3 created for shard 0
+INFO  2026-09-11 15:52:02,272 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 2 to TSM on shard 0
+INFO  2026-09-11 15:52:02,272 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_2.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:02,272 [shard 0:main] timestar.wal - Successfully converted WAL 2 to TSM on shard 0 | 81920 -> 4133 bytes (95.0% reclaimed)
+INFO  2026-09-11 15:52:02,472 [shard 0:main] timestar.wal - Memory store 3 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:02,472 [shard 0:main] timestar.wal - New memory store 4 created for shard 0
+INFO  2026-09-11 15:52:02,472 [shard 0:main] timestar.wal - Rollover complete, new memory store 4 created for shard 0
+INFO  2026-09-11 15:52:02,472 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 3 to TSM on shard 0
+INFO  2026-09-11 15:52:02,473 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_3.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:02,473 [shard 0:main] timestar.wal - Successfully converted WAL 3 to TSM on shard 0 | 81920 -> 4133 bytes (95.0% reclaimed)
+INFO  2026-09-11 15:52:02,673 [shard 0:main] timestar.wal - Memory store 4 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:02,673 [shard 0:main] timestar.wal - New memory store 5 created for shard 0
+INFO  2026-09-11 15:52:02,673 [shard 0:main] timestar.wal - Rollover complete, new memory store 5 created for shard 0
+INFO  2026-09-11 15:52:02,673 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 4 to TSM on shard 0
+INFO  2026-09-11 15:52:02,673 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_4.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:02,673 [shard 0:main] timestar.wal - Successfully converted WAL 4 to TSM on shard 0 | 81920 -> 4133 bytes (95.0% reclaimed)
+INFO  2026-09-11 15:52:02,873 [shard 0:main] timestar.wal - Memory store 5 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:02,873 [shard 0:main] timestar.wal - New memory store 6 created for shard 0
+INFO  2026-09-11 15:52:02,873 [shard 0:main] timestar.wal - Rollover complete, new memory store 6 created for shard 0
+INFO  2026-09-11 15:52:02,874 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 5 to TSM on shard 0
+INFO  2026-09-11 15:52:02,874 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_5.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:02,874 [shard 0:main] timestar.wal - Successfully converted WAL 5 to TSM on shard 0 | 81920 -> 4133 bytes (95.0% reclaimed)
+INFO  2026-09-11 15:52:03,074 [shard 0:main] timestar.wal - Memory store 6 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:03,074 [shard 0:main] timestar.wal - New memory store 7 created for shard 0
+INFO  2026-09-11 15:52:03,074 [shard 0:main] timestar.wal - Rollover complete, new memory store 7 created for shard 0
+INFO  2026-09-11 15:52:03,074 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 6 to TSM on shard 0
+INFO  2026-09-11 15:52:03,074 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_6.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:03,074 [shard 0:main] timestar.wal - Successfully converted WAL 6 to TSM on shard 0 | 81920 -> 4133 bytes (95.0% reclaimed)
+INFO  2026-09-11 15:52:03,275 [shard 0:main] timestar.wal - Memory store 7 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:03,275 [shard 0:main] timestar.wal - New memory store 8 created for shard 0
+INFO  2026-09-11 15:52:03,275 [shard 0:main] timestar.wal - Rollover complete, new memory store 8 created for shard 0
+INFO  2026-09-11 15:52:03,275 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 7 to TSM on shard 0
+INFO  2026-09-11 15:52:03,275 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_7.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:03,275 [shard 0:main] timestar.wal - Successfully converted WAL 7 to TSM on shard 0 | 81920 -> 4133 bytes (95.0% reclaimed)
+INFO  2026-09-11 15:52:03,475 [shard 0:main] timestar.wal - Memory store 8 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:03,475 [shard 0:main] timestar.wal - New memory store 9 created for shard 0
+INFO  2026-09-11 15:52:03,475 [shard 0:main] timestar.wal - Rollover complete, new memory store 9 created for shard 0
+INFO  2026-09-11 15:52:03,475 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 8 to TSM on shard 0
+INFO  2026-09-11 15:52:03,475 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_8.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:03,476 [shard 0:main] timestar.wal - Successfully converted WAL 8 to TSM on shard 0 | 81920 -> 4133 bytes (95.0% reclaimed)
+INFO  2026-09-11 15:52:03,676 [shard 0:main] timestar.wal - Memory store 9 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:03,676 [shard 0:main] timestar.wal - New memory store 10 created for shard 0
+INFO  2026-09-11 15:52:03,676 [shard 0:main] timestar.wal - Rollover complete, new memory store 10 created for shard 0
+INFO  2026-09-11 15:52:03,676 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 9 to TSM on shard 0
+INFO  2026-09-11 15:52:03,676 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_9.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:03,676 [shard 0:main] timestar.wal - Successfully converted WAL 9 to TSM on shard 0 | 81920 -> 4133 bytes (95.0% reclaimed)
+  Narrow range (1/10 files)                           min=     4.8  avg=     4.9  p50=     4.9  p95=     5.2  max=     5.2 µs  (n=20)
+  Wide range (all files)                              min=    14.5  avg=    17.5  p50=    14.7  p95=    20.5  max=    52.2 µs  (n=20)
+
+  Narrow/Wide ratio: 0.28x (ideal ≈ 0.1x for 1/10 files)
+INFO  2026-09-11 15:52:03,876 [shard 0:main] timestar.engine - [ENGINE_STOP] Starting shutdown on shard 0
+INFO  2026-09-11 15:52:03,876 [shard 0:main] timestar.engine - [ENGINE_STOP] Closing insert gate (0 in-flight) on shard 0
+INFO  2026-09-11 15:52:03,876 [shard 0:main] timestar.engine - [ENGINE_STOP] Insert gate closed (0ms) on shard 0
+INFO  2026-09-11 15:52:03,876 [shard 0:main] timestar.engine - [ENGINE_STOP] Streaming gate closed (0ms) on shard 0
+INFO  2026-09-11 15:52:03,876 [shard 0:main] timestar.engine - [ENGINE_STOP] Retention drained (0ms) on shard 0
+INFO  2026-09-11 15:52:03,876 [shard 0:main] timestar.engine - [ENGINE_STOP] Compaction loop stopped (0ms) on shard 0
+INFO  2026-09-11 15:52:03,877 [shard 0:main] timestar.tsm - TSMFileManager stopped on shard 0
+INFO  2026-09-11 15:52:03,877 [shard 0:main] timestar.engine - [ENGINE_STOP] TSM files closed (0ms) on shard 0
+INFO  2026-09-11 15:52:03,877 [shard 0:main] timestar.wal - [WAL_CLOSE] Starting WAL file manager close on shard 0
+INFO  2026-09-11 15:52:03,877 [shard 0:main] timestar.wal - [WAL_CLOSE] Draining 0 background TSM conversions on shard 0
+INFO  2026-09-11 15:52:03,877 [shard 0:main] timestar.wal - [WAL_CLOSE] Background TSM conversions drained on shard 0
+INFO  2026-09-11 15:52:03,877 [shard 0:main] timestar.wal - [WAL_CLOSE] Closing empty memory store 10 on shard 0
+INFO  2026-09-11 15:52:03,877 [shard 0:main] timestar.wal - [WAL_CLOSE] WAL file manager closed on shard 0
+INFO  2026-09-11 15:52:03,877 [shard 0:main] timestar.engine - [ENGINE_STOP] WAL closed (0ms) on shard 0
+INFO  2026-09-11 15:52:03,877 [shard 0:main] timestar.native_index - Flushing immutable MemTable: 130 entries, 30320 approx bytes
+INFO  2026-09-11 15:52:03,877 [shard 0:main] timestar.native_index - SSTable write starting for file 1
+INFO  2026-09-11 15:52:03,877 [shard 0:main] timestar.native_index - SSTable write complete: 130 entries, 1991 bytes
+INFO  2026-09-11 15:52:03,877 [shard 0:main] timestar.native_index - NativeIndex closed on shard 0
+INFO  2026-09-11 15:52:03,877 [shard 0:main] timestar.engine - [ENGINE_STOP] Index closed (0ms) on shard 0
+INFO  2026-09-11 15:52:03,877 [shard 0:main] timestar.engine - [ENGINE_STOP] Shutdown complete (0ms) on shard 0
+[       OK ] TsmReadPathBenchmark.R1_NarrowRangeQuery_ManyFiles (2012 ms)
+[ RUN      ] TsmReadPathBenchmark.R2_IntegerNarrowRange
+
+╔══════════════════════════════════════════════════════════════════╗
+║  R2: Integer Series Narrow-Range Query                         ║
+╚══════════════════════════════════════════════════════════════════╝
+INFO  2026-09-11 15:52:03,893 [shard 0:main] timestar.native_index - NativeIndex opened at: /tmp/tsdb-opt-tests/shard_0/native_index (0 SSTables, 2 MemTable entries, 0 local IDs)
+INFO  2026-09-11 15:52:03,893 [shard 0:main] timestar.tsm - TSMFileManager init. shardId=0
+INFO  2026-09-11 15:52:03,893 [shard 0:main] timestar.wal - WALFileManager::init starting for shard 0
+INFO  2026-09-11 15:52:03,893 [shard 0:main] timestar.wal - WAL file manager initialization complete for shard 0
+INFO  2026-09-11 15:52:03,894 [shard 0:main] timestar.wal - Memory store 0 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:03,894 [shard 0:main] timestar.wal - New memory store 1 created for shard 0
+INFO  2026-09-11 15:52:03,894 [shard 0:main] timestar.wal - Rollover complete, new memory store 1 created for shard 0
+INFO  2026-09-11 15:52:03,894 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 0 to TSM on shard 0
+INFO  2026-09-11 15:52:03,894 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_0.tsm (tier 0): 10 series, bloom filter: 144 bytes
+INFO  2026-09-11 15:52:03,894 [shard 0:main] timestar.wal - Successfully converted WAL 0 to TSM on shard 0 | 40960 -> 1833 bytes (95.5% reclaimed)
+INFO  2026-09-11 15:52:04,094 [shard 0:main] timestar.wal - Memory store 1 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:04,094 [shard 0:main] timestar.wal - New memory store 2 created for shard 0
+INFO  2026-09-11 15:52:04,094 [shard 0:main] timestar.wal - Rollover complete, new memory store 2 created for shard 0
+INFO  2026-09-11 15:52:04,094 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 1 to TSM on shard 0
+INFO  2026-09-11 15:52:04,095 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_1.tsm (tier 0): 10 series, bloom filter: 144 bytes
+INFO  2026-09-11 15:52:04,095 [shard 0:main] timestar.wal - Successfully converted WAL 1 to TSM on shard 0 | 40960 -> 1833 bytes (95.5% reclaimed)
+INFO  2026-09-11 15:52:04,295 [shard 0:main] timestar.wal - Memory store 2 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:04,295 [shard 0:main] timestar.wal - New memory store 3 created for shard 0
+INFO  2026-09-11 15:52:04,295 [shard 0:main] timestar.wal - Rollover complete, new memory store 3 created for shard 0
+INFO  2026-09-11 15:52:04,295 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 2 to TSM on shard 0
+INFO  2026-09-11 15:52:04,295 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_2.tsm (tier 0): 10 series, bloom filter: 144 bytes
+INFO  2026-09-11 15:52:04,295 [shard 0:main] timestar.wal - Successfully converted WAL 2 to TSM on shard 0 | 40960 -> 1833 bytes (95.5% reclaimed)
+INFO  2026-09-11 15:52:04,495 [shard 0:main] timestar.wal - Memory store 3 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:04,495 [shard 0:main] timestar.wal - New memory store 4 created for shard 0
+INFO  2026-09-11 15:52:04,495 [shard 0:main] timestar.wal - Rollover complete, new memory store 4 created for shard 0
+INFO  2026-09-11 15:52:04,495 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 3 to TSM on shard 0
+INFO  2026-09-11 15:52:04,495 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_3.tsm (tier 0): 10 series, bloom filter: 144 bytes
+INFO  2026-09-11 15:52:04,495 [shard 0:main] timestar.wal - Successfully converted WAL 3 to TSM on shard 0 | 40960 -> 1833 bytes (95.5% reclaimed)
+INFO  2026-09-11 15:52:04,695 [shard 0:main] timestar.wal - Memory store 4 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:04,695 [shard 0:main] timestar.wal - New memory store 5 created for shard 0
+INFO  2026-09-11 15:52:04,695 [shard 0:main] timestar.wal - Rollover complete, new memory store 5 created for shard 0
+INFO  2026-09-11 15:52:04,695 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 4 to TSM on shard 0
+INFO  2026-09-11 15:52:04,696 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_4.tsm (tier 0): 10 series, bloom filter: 144 bytes
+INFO  2026-09-11 15:52:04,696 [shard 0:main] timestar.wal - Successfully converted WAL 4 to TSM on shard 0 | 40960 -> 1833 bytes (95.5% reclaimed)
+  Integer narrow range (10% of data)                  min=     8.3  avg=     8.6  p50=     8.5  p95=     9.1  max=     9.2 µs  (n=20)
+  Integer wide range (all data)                       min=    16.3  avg=    17.9  p50=    16.6  p95=    21.3  max=    38.2 µs  (n=20)
+
+  Narrow/Wide ratio: 0.48x (ideal ≈ 0.1x for 10%% data)
+INFO  2026-09-11 15:52:04,896 [shard 0:main] timestar.engine - [ENGINE_STOP] Starting shutdown on shard 0
+INFO  2026-09-11 15:52:04,896 [shard 0:main] timestar.engine - [ENGINE_STOP] Closing insert gate (0 in-flight) on shard 0
+INFO  2026-09-11 15:52:04,896 [shard 0:main] timestar.engine - [ENGINE_STOP] Insert gate closed (0ms) on shard 0
+INFO  2026-09-11 15:52:04,896 [shard 0:main] timestar.engine - [ENGINE_STOP] Streaming gate closed (0ms) on shard 0
+INFO  2026-09-11 15:52:04,896 [shard 0:main] timestar.engine - [ENGINE_STOP] Retention drained (0ms) on shard 0
+INFO  2026-09-11 15:52:04,896 [shard 0:main] timestar.engine - [ENGINE_STOP] Compaction loop stopped (0ms) on shard 0
+INFO  2026-09-11 15:52:04,896 [shard 0:main] timestar.tsm - TSMFileManager stopped on shard 0
+INFO  2026-09-11 15:52:04,896 [shard 0:main] timestar.engine - [ENGINE_STOP] TSM files closed (0ms) on shard 0
+INFO  2026-09-11 15:52:04,896 [shard 0:main] timestar.wal - [WAL_CLOSE] Starting WAL file manager close on shard 0
+INFO  2026-09-11 15:52:04,896 [shard 0:main] timestar.wal - [WAL_CLOSE] Draining 0 background TSM conversions on shard 0
+INFO  2026-09-11 15:52:04,896 [shard 0:main] timestar.wal - [WAL_CLOSE] Background TSM conversions drained on shard 0
+INFO  2026-09-11 15:52:04,896 [shard 0:main] timestar.wal - [WAL_CLOSE] Closing empty memory store 5 on shard 0
+INFO  2026-09-11 15:52:04,896 [shard 0:main] timestar.wal - [WAL_CLOSE] WAL file manager closed on shard 0
+INFO  2026-09-11 15:52:04,896 [shard 0:main] timestar.engine - [ENGINE_STOP] WAL closed (0ms) on shard 0
+INFO  2026-09-11 15:52:04,896 [shard 0:main] timestar.native_index - Flushing immutable MemTable: 70 entries, 23918 approx bytes
+INFO  2026-09-11 15:52:04,896 [shard 0:main] timestar.native_index - SSTable write starting for file 1
+INFO  2026-09-11 15:52:04,897 [shard 0:main] timestar.native_index - SSTable write complete: 70 entries, 1225 bytes
+INFO  2026-09-11 15:52:04,897 [shard 0:main] timestar.native_index - NativeIndex closed on shard 0
+INFO  2026-09-11 15:52:04,897 [shard 0:main] timestar.engine - [ENGINE_STOP] Index closed (1ms) on shard 0
+INFO  2026-09-11 15:52:04,897 [shard 0:main] timestar.engine - [ENGINE_STOP] Shutdown complete (1ms) on shard 0
+[       OK ] TsmReadPathBenchmark.R2_IntegerNarrowRange (1019 ms)
+[ RUN      ] TsmReadPathBenchmark.R5_MultiSeriesNarrowRange
+
+╔══════════════════════════════════════════════════════════════════╗
+║  R5: Multi-Series Narrow-Range Query Pipeline                  ║
+╚══════════════════════════════════════════════════════════════════╝
+INFO  2026-09-11 15:52:04,903 [shard 0:main] timestar.native_index - NativeIndex opened at: /tmp/tsdb-opt-tests/shard_0/native_index (0 SSTables, 2 MemTable entries, 0 local IDs)
+INFO  2026-09-11 15:52:04,903 [shard 0:main] timestar.tsm - TSMFileManager init. shardId=0
+INFO  2026-09-11 15:52:04,903 [shard 0:main] timestar.wal - WALFileManager::init starting for shard 0
+INFO  2026-09-11 15:52:04,903 [shard 0:main] timestar.wal - WAL file manager initialization complete for shard 0
+INFO  2026-09-11 15:52:04,904 [shard 0:main] timestar.wal - Memory store 0 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:04,904 [shard 0:main] timestar.wal - New memory store 1 created for shard 0
+INFO  2026-09-11 15:52:04,904 [shard 0:main] timestar.wal - Rollover complete, new memory store 1 created for shard 0
+INFO  2026-09-11 15:52:04,904 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 0 to TSM on shard 0
+INFO  2026-09-11 15:52:04,904 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_0.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:04,904 [shard 0:main] timestar.wal - Successfully converted WAL 0 to TSM on shard 0 | 81920 -> 4453 bytes (94.6% reclaimed)
+INFO  2026-09-11 15:52:05,104 [shard 0:main] timestar.wal - Memory store 1 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:05,104 [shard 0:main] timestar.wal - New memory store 2 created for shard 0
+INFO  2026-09-11 15:52:05,104 [shard 0:main] timestar.wal - Rollover complete, new memory store 2 created for shard 0
+INFO  2026-09-11 15:52:05,104 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 1 to TSM on shard 0
+INFO  2026-09-11 15:52:05,104 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_1.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:05,104 [shard 0:main] timestar.wal - Successfully converted WAL 1 to TSM on shard 0 | 81920 -> 4453 bytes (94.6% reclaimed)
+INFO  2026-09-11 15:52:05,304 [shard 0:main] timestar.wal - Memory store 2 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:05,305 [shard 0:main] timestar.wal - New memory store 3 created for shard 0
+INFO  2026-09-11 15:52:05,305 [shard 0:main] timestar.wal - Rollover complete, new memory store 3 created for shard 0
+INFO  2026-09-11 15:52:05,305 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 2 to TSM on shard 0
+INFO  2026-09-11 15:52:05,305 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_2.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:05,305 [shard 0:main] timestar.wal - Successfully converted WAL 2 to TSM on shard 0 | 81920 -> 4453 bytes (94.6% reclaimed)
+INFO  2026-09-11 15:52:05,505 [shard 0:main] timestar.wal - Memory store 3 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:05,505 [shard 0:main] timestar.wal - New memory store 4 created for shard 0
+INFO  2026-09-11 15:52:05,505 [shard 0:main] timestar.wal - Rollover complete, new memory store 4 created for shard 0
+INFO  2026-09-11 15:52:05,505 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 3 to TSM on shard 0
+INFO  2026-09-11 15:52:05,505 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_3.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:05,505 [shard 0:main] timestar.wal - Successfully converted WAL 3 to TSM on shard 0 | 81920 -> 4453 bytes (94.6% reclaimed)
+INFO  2026-09-11 15:52:05,706 [shard 0:main] timestar.wal - Memory store 4 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:05,706 [shard 0:main] timestar.wal - New memory store 5 created for shard 0
+INFO  2026-09-11 15:52:05,706 [shard 0:main] timestar.wal - Rollover complete, new memory store 5 created for shard 0
+INFO  2026-09-11 15:52:05,706 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 4 to TSM on shard 0
+INFO  2026-09-11 15:52:05,706 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_4.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:05,706 [shard 0:main] timestar.wal - Successfully converted WAL 4 to TSM on shard 0 | 81920 -> 4453 bytes (94.6% reclaimed)
+INFO  2026-09-11 15:52:05,906 [shard 0:main] timestar.wal - Memory store 5 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:05,906 [shard 0:main] timestar.wal - New memory store 6 created for shard 0
+INFO  2026-09-11 15:52:05,906 [shard 0:main] timestar.wal - Rollover complete, new memory store 6 created for shard 0
+INFO  2026-09-11 15:52:05,906 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 5 to TSM on shard 0
+INFO  2026-09-11 15:52:05,907 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_5.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:05,907 [shard 0:main] timestar.wal - Successfully converted WAL 5 to TSM on shard 0 | 81920 -> 4453 bytes (94.6% reclaimed)
+INFO  2026-09-11 15:52:06,107 [shard 0:main] timestar.wal - Memory store 6 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:06,107 [shard 0:main] timestar.wal - New memory store 7 created for shard 0
+INFO  2026-09-11 15:52:06,107 [shard 0:main] timestar.wal - Rollover complete, new memory store 7 created for shard 0
+INFO  2026-09-11 15:52:06,107 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 6 to TSM on shard 0
+INFO  2026-09-11 15:52:06,107 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_6.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:06,107 [shard 0:main] timestar.wal - Successfully converted WAL 6 to TSM on shard 0 | 81920 -> 4453 bytes (94.6% reclaimed)
+INFO  2026-09-11 15:52:06,307 [shard 0:main] timestar.wal - Memory store 7 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:06,307 [shard 0:main] timestar.wal - New memory store 8 created for shard 0
+INFO  2026-09-11 15:52:06,307 [shard 0:main] timestar.wal - Rollover complete, new memory store 8 created for shard 0
+INFO  2026-09-11 15:52:06,308 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 7 to TSM on shard 0
+INFO  2026-09-11 15:52:06,308 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_7.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:06,308 [shard 0:main] timestar.wal - Successfully converted WAL 7 to TSM on shard 0 | 81920 -> 4453 bytes (94.6% reclaimed)
+INFO  2026-09-11 15:52:06,508 [shard 0:main] timestar.wal - Memory store 8 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:06,508 [shard 0:main] timestar.wal - New memory store 9 created for shard 0
+INFO  2026-09-11 15:52:06,508 [shard 0:main] timestar.wal - Rollover complete, new memory store 9 created for shard 0
+INFO  2026-09-11 15:52:06,508 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 8 to TSM on shard 0
+INFO  2026-09-11 15:52:06,508 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_8.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:06,509 [shard 0:main] timestar.wal - Successfully converted WAL 8 to TSM on shard 0 | 81920 -> 4453 bytes (94.6% reclaimed)
+INFO  2026-09-11 15:52:06,709 [shard 0:main] timestar.wal - Memory store 9 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:06,709 [shard 0:main] timestar.wal - New memory store 10 created for shard 0
+INFO  2026-09-11 15:52:06,709 [shard 0:main] timestar.wal - Rollover complete, new memory store 10 created for shard 0
+INFO  2026-09-11 15:52:06,709 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 9 to TSM on shard 0
+INFO  2026-09-11 15:52:06,709 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_9.tsm (tier 0): 20 series, bloom filter: 288 bytes
+INFO  2026-09-11 15:52:06,709 [shard 0:main] timestar.wal - Successfully converted WAL 9 to TSM on shard 0 | 81920 -> 4453 bytes (94.6% reclaimed)
+  20 series narrow range (prefetch + query)           min=   143.0  avg=   178.5  p50=   147.9  p95=   222.1  max=   303.2 µs  (n=10)
+  20 series wide range (prefetch + query)             min=   353.4  avg=   366.3  p50=   360.6  p95=   376.3  max=   404.2 µs  (n=10)
+
+  Narrow/Wide ratio: 0.49x (ideal ≈ 0.2x for 2/10 files)
+INFO  2026-09-11 15:52:06,915 [shard 0:main] timestar.engine - [ENGINE_STOP] Starting shutdown on shard 0
+INFO  2026-09-11 15:52:06,915 [shard 0:main] timestar.engine - [ENGINE_STOP] Closing insert gate (0 in-flight) on shard 0
+INFO  2026-09-11 15:52:06,915 [shard 0:main] timestar.engine - [ENGINE_STOP] Insert gate closed (0ms) on shard 0
+INFO  2026-09-11 15:52:06,915 [shard 0:main] timestar.engine - [ENGINE_STOP] Streaming gate closed (0ms) on shard 0
+INFO  2026-09-11 15:52:06,915 [shard 0:main] timestar.engine - [ENGINE_STOP] Retention drained (0ms) on shard 0
+INFO  2026-09-11 15:52:06,915 [shard 0:main] timestar.engine - [ENGINE_STOP] Compaction loop stopped (0ms) on shard 0
+INFO  2026-09-11 15:52:06,915 [shard 0:main] timestar.tsm - TSMFileManager stopped on shard 0
+INFO  2026-09-11 15:52:06,915 [shard 0:main] timestar.engine - [ENGINE_STOP] TSM files closed (0ms) on shard 0
+INFO  2026-09-11 15:52:06,915 [shard 0:main] timestar.wal - [WAL_CLOSE] Starting WAL file manager close on shard 0
+INFO  2026-09-11 15:52:06,915 [shard 0:main] timestar.wal - [WAL_CLOSE] Draining 0 background TSM conversions on shard 0
+INFO  2026-09-11 15:52:06,915 [shard 0:main] timestar.wal - [WAL_CLOSE] Background TSM conversions drained on shard 0
+INFO  2026-09-11 15:52:06,915 [shard 0:main] timestar.wal - [WAL_CLOSE] Closing empty memory store 10 on shard 0
+INFO  2026-09-11 15:52:06,915 [shard 0:main] timestar.wal - [WAL_CLOSE] WAL file manager closed on shard 0
+INFO  2026-09-11 15:52:06,915 [shard 0:main] timestar.engine - [ENGINE_STOP] WAL closed (0ms) on shard 0
+INFO  2026-09-11 15:52:06,915 [shard 0:main] timestar.native_index - Flushing immutable MemTable: 130 entries, 30320 approx bytes
+INFO  2026-09-11 15:52:06,915 [shard 0:main] timestar.native_index - SSTable write starting for file 1
+INFO  2026-09-11 15:52:06,915 [shard 0:main] timestar.native_index - SSTable write complete: 130 entries, 1991 bytes
+INFO  2026-09-11 15:52:06,915 [shard 0:main] timestar.native_index - NativeIndex closed on shard 0
+INFO  2026-09-11 15:52:06,915 [shard 0:main] timestar.engine - [ENGINE_STOP] Index closed (0ms) on shard 0
+INFO  2026-09-11 15:52:06,916 [shard 0:main] timestar.engine - [ENGINE_STOP] Shutdown complete (0ms) on shard 0
+[       OK ] TsmReadPathBenchmark.R5_MultiSeriesNarrowRange (2018 ms)
+[ RUN      ] TsmReadPathBenchmark.R3_IntegerPushdownAggregation
+
+╔══════════════════════════════════════════════════════════════════╗
+║  R3: Integer Pushdown Aggregation vs Full Materialization       ║
+╚══════════════════════════════════════════════════════════════════╝
+INFO  2026-09-11 15:52:06,921 [shard 0:main] timestar.native_index - NativeIndex opened at: /tmp/tsdb-opt-tests/shard_0/native_index (0 SSTables, 2 MemTable entries, 0 local IDs)
+INFO  2026-09-11 15:52:06,921 [shard 0:main] timestar.tsm - TSMFileManager init. shardId=0
+INFO  2026-09-11 15:52:06,921 [shard 0:main] timestar.wal - WALFileManager::init starting for shard 0
+INFO  2026-09-11 15:52:06,921 [shard 0:main] timestar.wal - WAL file manager initialization complete for shard 0
+INFO  2026-09-11 15:52:06,921 [shard 0:main] timestar.wal - Memory store 0 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:06,921 [shard 0:main] timestar.wal - New memory store 1 created for shard 0
+INFO  2026-09-11 15:52:06,921 [shard 0:main] timestar.wal - Rollover complete, new memory store 1 created for shard 0
+INFO  2026-09-11 15:52:06,921 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 0 to TSM on shard 0
+INFO  2026-09-11 15:52:06,922 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_0.tsm (tier 0): 10 series, bloom filter: 144 bytes
+INFO  2026-09-11 15:52:06,922 [shard 0:main] timestar.wal - Successfully converted WAL 0 to TSM on shard 0 | 40960 -> 1833 bytes (95.5% reclaimed)
+INFO  2026-09-11 15:52:07,122 [shard 0:main] timestar.wal - Memory store 1 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:07,122 [shard 0:main] timestar.wal - New memory store 2 created for shard 0
+INFO  2026-09-11 15:52:07,122 [shard 0:main] timestar.wal - Rollover complete, new memory store 2 created for shard 0
+INFO  2026-09-11 15:52:07,122 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 1 to TSM on shard 0
+INFO  2026-09-11 15:52:07,122 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_1.tsm (tier 0): 10 series, bloom filter: 144 bytes
+INFO  2026-09-11 15:52:07,122 [shard 0:main] timestar.wal - Successfully converted WAL 1 to TSM on shard 0 | 40960 -> 1833 bytes (95.5% reclaimed)
+INFO  2026-09-11 15:52:07,322 [shard 0:main] timestar.wal - Memory store 2 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:07,322 [shard 0:main] timestar.wal - New memory store 3 created for shard 0
+INFO  2026-09-11 15:52:07,322 [shard 0:main] timestar.wal - Rollover complete, new memory store 3 created for shard 0
+INFO  2026-09-11 15:52:07,322 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 2 to TSM on shard 0
+INFO  2026-09-11 15:52:07,322 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_2.tsm (tier 0): 10 series, bloom filter: 144 bytes
+INFO  2026-09-11 15:52:07,322 [shard 0:main] timestar.wal - Successfully converted WAL 2 to TSM on shard 0 | 40960 -> 1833 bytes (95.5% reclaimed)
+INFO  2026-09-11 15:52:07,522 [shard 0:main] timestar.wal - Memory store 3 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:07,522 [shard 0:main] timestar.wal - New memory store 4 created for shard 0
+INFO  2026-09-11 15:52:07,522 [shard 0:main] timestar.wal - Rollover complete, new memory store 4 created for shard 0
+INFO  2026-09-11 15:52:07,522 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 3 to TSM on shard 0
+INFO  2026-09-11 15:52:07,523 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_3.tsm (tier 0): 10 series, bloom filter: 144 bytes
+INFO  2026-09-11 15:52:07,523 [shard 0:main] timestar.wal - Successfully converted WAL 3 to TSM on shard 0 | 40960 -> 1833 bytes (95.5% reclaimed)
+INFO  2026-09-11 15:52:07,723 [shard 0:main] timestar.wal - Memory store 4 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:07,723 [shard 0:main] timestar.wal - New memory store 5 created for shard 0
+INFO  2026-09-11 15:52:07,723 [shard 0:main] timestar.wal - Rollover complete, new memory store 5 created for shard 0
+INFO  2026-09-11 15:52:07,723 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 4 to TSM on shard 0
+INFO  2026-09-11 15:52:07,723 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_4.tsm (tier 0): 10 series, bloom filter: 144 bytes
+INFO  2026-09-11 15:52:07,723 [shard 0:main] timestar.wal - Successfully converted WAL 4 to TSM on shard 0 | 40960 -> 1833 bytes (95.5% reclaimed)
+  Integer AVG pushdown (if supported)                 min=    38.2  avg=    54.6  p50=    56.6  p95=    69.6  max=    96.1 µs  (n=20)
+  Pushdown hits: 20/20
+  Integer full materialization                        min=    13.4  avg=    15.1  p50=    13.7  p95=    19.5  max=    30.1 µs  (n=20)
+
+  Pushdown speedup: 0.28x vs full materialization
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.engine - [ENGINE_STOP] Starting shutdown on shard 0
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.engine - [ENGINE_STOP] Closing insert gate (0 in-flight) on shard 0
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.engine - [ENGINE_STOP] Insert gate closed (0ms) on shard 0
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.engine - [ENGINE_STOP] Streaming gate closed (0ms) on shard 0
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.engine - [ENGINE_STOP] Retention drained (0ms) on shard 0
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.engine - [ENGINE_STOP] Compaction loop stopped (0ms) on shard 0
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.tsm - TSMFileManager stopped on shard 0
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.engine - [ENGINE_STOP] TSM files closed (0ms) on shard 0
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.wal - [WAL_CLOSE] Starting WAL file manager close on shard 0
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.wal - [WAL_CLOSE] Draining 0 background TSM conversions on shard 0
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.wal - [WAL_CLOSE] Background TSM conversions drained on shard 0
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.wal - [WAL_CLOSE] Closing empty memory store 5 on shard 0
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.wal - [WAL_CLOSE] WAL file manager closed on shard 0
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.engine - [ENGINE_STOP] WAL closed (0ms) on shard 0
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.native_index - Flushing immutable MemTable: 70 entries, 23918 approx bytes
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.native_index - SSTable write starting for file 1
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.native_index - SSTable write complete: 70 entries, 1225 bytes
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.native_index - NativeIndex closed on shard 0
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.engine - [ENGINE_STOP] Index closed (0ms) on shard 0
+INFO  2026-09-11 15:52:07,925 [shard 0:main] timestar.engine - [ENGINE_STOP] Shutdown complete (0ms) on shard 0
+[       OK ] TsmReadPathBenchmark.R3_IntegerPushdownAggregation (1009 ms)
+[ RUN      ] TsmReadPathBenchmark.R6_StatsPushdownIOAmplification
+
+╔══════════════════════════════════════════════════════════════════╗
+║  R6: Stats-Pushdown I/O Amplification (boundary-block decode)   ║
+╚══════════════════════════════════════════════════════════════════╝
+INFO  2026-09-11 15:52:07,930 [shard 0:main] timestar.native_index - NativeIndex opened at: /tmp/tsdb-opt-tests/shard_0/native_index (0 SSTables, 2 MemTable entries, 0 local IDs)
+INFO  2026-09-11 15:52:07,930 [shard 0:main] timestar.tsm - TSMFileManager init. shardId=0
+INFO  2026-09-11 15:52:07,930 [shard 0:main] timestar.wal - WALFileManager::init starting for shard 0
+INFO  2026-09-11 15:52:07,930 [shard 0:main] timestar.wal - WAL file manager initialization complete for shard 0
+INFO  2026-09-11 15:52:07,952 [shard 0:main] timestar.wal - Memory store 0 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:07,952 [shard 0:main] timestar.wal - New memory store 1 created for shard 0
+INFO  2026-09-11 15:52:07,952 [shard 0:main] timestar.wal - Rollover complete, new memory store 1 created for shard 0
+INFO  2026-09-11 15:52:07,952 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 0 to TSM on shard 0
+INFO  2026-09-11 15:52:08,013 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_0.tsm (tier 0): 1 series, bloom filter: 64 bytes
+INFO  2026-09-11 15:52:08,014 [shard 0:main] timestar.wal - Successfully converted WAL 0 to TSM on shard 0 | 10768384 -> 11015880 bytes (-2.3% reclaimed)
+  AVG fold, mid-block range (2 decode blocks)         min=    23.4  avg=    24.2  p50=    23.7  p95=    26.3  max=    28.4 µs  (n=15)
+  Pushdown hits: 15/15
+  AVG fold, full range (0 decode blocks)              min=     4.8  avg=     4.9  p50=     4.9  p95=     5.0  max=     5.7 µs  (n=15)
+
+  Mid-block-range overhead vs zero-decode: 4.89x
+INFO  2026-09-11 15:52:08,453 [shard 0:main] timestar.engine - [ENGINE_STOP] Starting shutdown on shard 0
+INFO  2026-09-11 15:52:08,453 [shard 0:main] timestar.engine - [ENGINE_STOP] Closing insert gate (0 in-flight) on shard 0
+INFO  2026-09-11 15:52:08,453 [shard 0:main] timestar.engine - [ENGINE_STOP] Insert gate closed (0ms) on shard 0
+INFO  2026-09-11 15:52:08,453 [shard 0:main] timestar.engine - [ENGINE_STOP] Streaming gate closed (0ms) on shard 0
+INFO  2026-09-11 15:52:08,453 [shard 0:main] timestar.engine - [ENGINE_STOP] Retention drained (0ms) on shard 0
+INFO  2026-09-11 15:52:08,453 [shard 0:main] timestar.engine - [ENGINE_STOP] Compaction loop stopped (0ms) on shard 0
+INFO  2026-09-11 15:52:08,453 [shard 0:main] timestar.tsm - TSMFileManager stopped on shard 0
+INFO  2026-09-11 15:52:08,453 [shard 0:main] timestar.engine - [ENGINE_STOP] TSM files closed (0ms) on shard 0
+INFO  2026-09-11 15:52:08,453 [shard 0:main] timestar.wal - [WAL_CLOSE] Starting WAL file manager close on shard 0
+INFO  2026-09-11 15:52:08,453 [shard 0:main] timestar.wal - [WAL_CLOSE] Draining 0 background TSM conversions on shard 0
+INFO  2026-09-11 15:52:08,453 [shard 0:main] timestar.wal - [WAL_CLOSE] Background TSM conversions drained on shard 0
+INFO  2026-09-11 15:52:08,453 [shard 0:main] timestar.wal - [WAL_CLOSE] Closing empty memory store 1 on shard 0
+INFO  2026-09-11 15:52:08,453 [shard 0:main] timestar.wal - [WAL_CLOSE] WAL file manager closed on shard 0
+INFO  2026-09-11 15:52:08,453 [shard 0:main] timestar.engine - [ENGINE_STOP] WAL closed (0ms) on shard 0
+INFO  2026-09-11 15:52:08,453 [shard 0:main] timestar.native_index - Flushing immutable MemTable: 132 entries, 30707 approx bytes
+INFO  2026-09-11 15:52:08,453 [shard 0:main] timestar.native_index - SSTable write starting for file 1
+INFO  2026-09-11 15:52:08,453 [shard 0:main] timestar.native_index - SSTable write complete: 132 entries, 911 bytes
+INFO  2026-09-11 15:52:08,454 [shard 0:main] timestar.native_index - NativeIndex closed on shard 0
+INFO  2026-09-11 15:52:08,454 [shard 0:main] timestar.engine - [ENGINE_STOP] Index closed (0ms) on shard 0
+INFO  2026-09-11 15:52:08,454 [shard 0:main] timestar.engine - [ENGINE_STOP] Shutdown complete (0ms) on shard 0
+[       OK ] TsmReadPathBenchmark.R6_StatsPushdownIOAmplification (529 ms)
+[ RUN      ] TsmReadPathBenchmark.R7_StringDictReadPath
+
+╔══════════════════════════════════════════════════════════════════╗
+║  R7: Dictionary-Encoded String Series Read Path                 ║
+╚══════════════════════════════════════════════════════════════════╝
+INFO  2026-09-11 15:52:08,459 [shard 0:main] timestar.native_index - NativeIndex opened at: /tmp/tsdb-opt-tests/shard_0/native_index (0 SSTables, 2 MemTable entries, 0 local IDs)
+INFO  2026-09-11 15:52:08,459 [shard 0:main] timestar.tsm - TSMFileManager init. shardId=0
+INFO  2026-09-11 15:52:08,459 [shard 0:main] timestar.wal - WALFileManager::init starting for shard 0
+INFO  2026-09-11 15:52:08,459 [shard 0:main] timestar.wal - WAL file manager initialization complete for shard 0
+INFO  2026-09-11 15:52:08,467 [shard 0:main] timestar.wal - Memory store 0 full (WAL segment threshold reached), rolling over
+INFO  2026-09-11 15:52:08,467 [shard 0:main] timestar.wal - New memory store 1 created for shard 0
+INFO  2026-09-11 15:52:08,467 [shard 0:main] timestar.wal - Rollover complete, new memory store 1 created for shard 0
+INFO  2026-09-11 15:52:08,467 [shard 0:main] timestar.wal - [CONVERT_WAL_TO_TSM] Starting conversion of WAL 0 to TSM on shard 0
+INFO  2026-09-11 15:52:08,469 [shard 0:main] timestar.tsm - Loaded sparse index for shard_0/tsm/0_0.tsm (tier 0): 1 series, bloom filter: 64 bytes
+INFO  2026-09-11 15:52:08,469 [shard 0:main] timestar.wal - Successfully converted WAL 0 to TSM on shard 0 | 81920 -> 7002 bytes (91.5% reclaimed)
+  String dict narrow range (200 pts)                  min=    10.2  avg=    11.4  p50=    10.4  p95=    15.1  max=    15.8 µs  (n=20)
+  String dict full range (100k pts)                   min=  2903.7  avg=  3085.3  p50=  2943.5  p95=  3385.7  max=  3647.4 µs  (n=10)
+INFO  2026-09-11 15:52:08,998 [shard 0:main] timestar.engine - [ENGINE_STOP] Starting shutdown on shard 0
+INFO  2026-09-11 15:52:08,998 [shard 0:main] timestar.engine - [ENGINE_STOP] Closing insert gate (0 in-flight) on shard 0
+INFO  2026-09-11 15:52:08,998 [shard 0:main] timestar.engine - [ENGINE_STOP] Insert gate closed (0ms) on shard 0
+INFO  2026-09-11 15:52:08,998 [shard 0:main] timestar.engine - [ENGINE_STOP] Streaming gate closed (0ms) on shard 0
+INFO  2026-09-11 15:52:08,998 [shard 0:main] timestar.engine - [ENGINE_STOP] Retention drained (0ms) on shard 0
+INFO  2026-09-11 15:52:08,998 [shard 0:main] timestar.engine - [ENGINE_STOP] Compaction loop stopped (0ms) on shard 0
+INFO  2026-09-11 15:52:08,999 [shard 0:main] timestar.tsm - TSMFileManager stopped on shard 0
+INFO  2026-09-11 15:52:08,999 [shard 0:main] timestar.engine - [ENGINE_STOP] TSM files closed (0ms) on shard 0
+INFO  2026-09-11 15:52:08,999 [shard 0:main] timestar.wal - [WAL_CLOSE] Starting WAL file manager close on shard 0
+INFO  2026-09-11 15:52:08,999 [shard 0:main] timestar.wal - [WAL_CLOSE] Draining 0 background TSM conversions on shard 0
+INFO  2026-09-11 15:52:08,999 [shard 0:main] timestar.wal - [WAL_CLOSE] Background TSM conversions drained on shard 0
+INFO  2026-09-11 15:52:08,999 [shard 0:main] timestar.wal - [WAL_CLOSE] Closing empty memory store 1 on shard 0
+INFO  2026-09-11 15:52:08,999 [shard 0:main] timestar.wal - [WAL_CLOSE] WAL file manager closed on shard 0
+INFO  2026-09-11 15:52:08,999 [shard 0:main] timestar.engine - [ENGINE_STOP] WAL closed (0ms) on shard 0
+INFO  2026-09-11 15:52:08,999 [shard 0:main] timestar.native_index - Flushing immutable MemTable: 28 entries, 19271 approx bytes
+INFO  2026-09-11 15:52:08,999 [shard 0:main] timestar.native_index - SSTable write starting for file 1
+INFO  2026-09-11 15:52:08,999 [shard 0:main] timestar.native_index - SSTable write complete: 28 entries, 538 bytes
+INFO  2026-09-11 15:52:08,999 [shard 0:main] timestar.native_index - NativeIndex closed on shard 0
+INFO  2026-09-11 15:52:08,999 [shard 0:main] timestar.engine - [ENGINE_STOP] Index closed (0ms) on shard 0
+INFO  2026-09-11 15:52:08,999 [shard 0:main] timestar.engine - [ENGINE_STOP] Shutdown complete (0ms) on shard 0
+[       OK ] TsmReadPathBenchmark.R7_StringDictReadPath (544 ms)
+[----------] 6 tests from TsmReadPathBenchmark (7134 ms total)
+
+[----------] Global test environment tear-down
+[==========] 15 tests from 3 test suites ran. (8559 ms total)
+[  PASSED  ] 15 tests.

@@ -110,9 +110,9 @@ WireFormat responseFormat(const seastar::http::request& req) {
 
 void setContentType(seastar::http::reply& rep, WireFormat fmt) {
     if (fmt == WireFormat::Protobuf) {
-        rep.set_mime_type("application/x-protobuf");
+        rep.set_content_type("application/x-protobuf");
     } else {
-        rep.set_mime_type("application/json");
+        rep.set_content_type("application/json");
     }
 }
 

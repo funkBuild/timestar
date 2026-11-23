@@ -2,6 +2,8 @@
 
 #include "../../../lib/query/aggregator.hpp"
 #include "../../../lib/query/query_parser.hpp"
+#include "request_body.hpp"
+#include "shard_count.hpp"
 
 #include <glaze/json.hpp>
 
@@ -234,7 +236,7 @@ TEST_F(HttpQueryHandlerTest, DetermineTargetShards) {
     EXPECT_GT(shards.size(), 0);
 
     // Verify all shards are included
-    unsigned shardCount = seastar::smp::count;
+    unsigned shardCount = timestar::shardCount();
     if (shardCount == 0)
         shardCount = 1;  // Test environment default
     for (unsigned i = 0; i < shardCount; ++i) {
@@ -280,8 +282,8 @@ TEST_F(HttpQueryHandlerTest, MergeResults) {
 TEST_F(HttpQueryHandlerTest, ValidateRequestBodyWithinLimit) {
     HttpQueryHandler handler(nullptr);
 
-    seastar::http::request req;
-    req.content = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
+    seastar::http::request req{};
+    timestar::http::injectedBody(req) = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
 
     auto result = handler.validateRequest(req);
     EXPECT_EQ(result, nullptr) << "Valid small request should pass validation";
@@ -290,9 +292,9 @@ TEST_F(HttpQueryHandlerTest, ValidateRequestBodyWithinLimit) {
 TEST_F(HttpQueryHandlerTest, ValidateRequestBodyExceedsLimit) {
     HttpQueryHandler handler(nullptr);
 
-    seastar::http::request req;
+    seastar::http::request req{};
     // Create a body larger than 1MB
-    req.content = std::string(HttpQueryHandler::maxQueryBodySize() + 1, 'x');
+    timestar::http::injectedBody(req) = std::string(HttpQueryHandler::maxQueryBodySize() + 1, 'x');
 
     auto result = handler.validateRequest(req);
     ASSERT_NE(result, nullptr) << "Oversized request should fail validation";
@@ -304,9 +306,9 @@ TEST_F(HttpQueryHandlerTest, ValidateRequestBodyExceedsLimit) {
 TEST_F(HttpQueryHandlerTest, ValidateRequestBodyExactlyAtLimit) {
     HttpQueryHandler handler(nullptr);
 
-    seastar::http::request req;
+    seastar::http::request req{};
     // Create a body exactly at the 1MB limit
-    req.content = std::string(HttpQueryHandler::maxQueryBodySize(), 'x');
+    timestar::http::injectedBody(req) = std::string(HttpQueryHandler::maxQueryBodySize(), 'x');
 
     auto result = handler.validateRequest(req);
     EXPECT_EQ(result, nullptr) << "Request body exactly at limit should pass validation";
@@ -315,8 +317,8 @@ TEST_F(HttpQueryHandlerTest, ValidateRequestBodyExactlyAtLimit) {
 TEST_F(HttpQueryHandlerTest, ValidateRequestEmptyBody) {
     HttpQueryHandler handler(nullptr);
 
-    seastar::http::request req;
-    req.content = "";
+    seastar::http::request req{};
+    timestar::http::injectedBody(req) = "";
 
     auto result = handler.validateRequest(req);
     EXPECT_EQ(result, nullptr) << "Empty body should pass size validation (handled later by parser)";
@@ -330,8 +332,8 @@ TEST_F(HttpQueryHandlerTest, ValidateRequestEmptyBody) {
 TEST_F(HttpQueryHandlerTest, ValidateRequestCorrectContentType) {
     HttpQueryHandler handler(nullptr);
 
-    seastar::http::request req;
-    req.content = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
+    seastar::http::request req{};
+    timestar::http::injectedBody(req) = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
     req._headers["Content-Type"] = "application/json";
 
     auto result = handler.validateRequest(req);
@@ -341,8 +343,8 @@ TEST_F(HttpQueryHandlerTest, ValidateRequestCorrectContentType) {
 TEST_F(HttpQueryHandlerTest, ValidateRequestContentTypeWithCharset) {
     HttpQueryHandler handler(nullptr);
 
-    seastar::http::request req;
-    req.content = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
+    seastar::http::request req{};
+    timestar::http::injectedBody(req) = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
     req._headers["Content-Type"] = "application/json; charset=utf-8";
 
     auto result = handler.validateRequest(req);
@@ -352,8 +354,8 @@ TEST_F(HttpQueryHandlerTest, ValidateRequestContentTypeWithCharset) {
 TEST_F(HttpQueryHandlerTest, ValidateRequestNoContentType) {
     HttpQueryHandler handler(nullptr);
 
-    seastar::http::request req;
-    req.content = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
+    seastar::http::request req{};
+    timestar::http::injectedBody(req) = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
     // No Content-Type header set
 
     auto result = handler.validateRequest(req);
@@ -366,8 +368,8 @@ TEST_F(HttpQueryHandlerTest, ValidateRequestNoContentType) {
 TEST_F(HttpQueryHandlerTest, ValidateRequestWrongContentType) {
     HttpQueryHandler handler(nullptr);
 
-    seastar::http::request req;
-    req.content = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
+    seastar::http::request req{};
+    timestar::http::injectedBody(req) = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
     req._headers["Content-Type"] = "text/html";
 
     auto result = handler.validateRequest(req);
@@ -377,8 +379,8 @@ TEST_F(HttpQueryHandlerTest, ValidateRequestWrongContentType) {
 TEST_F(HttpQueryHandlerTest, ValidateRequestWrongContentTypePlainText) {
     HttpQueryHandler handler(nullptr);
 
-    seastar::http::request req;
-    req.content = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
+    seastar::http::request req{};
+    timestar::http::injectedBody(req) = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
     req._headers["Content-Type"] = "text/plain";
 
     auto result = handler.validateRequest(req);
@@ -388,8 +390,8 @@ TEST_F(HttpQueryHandlerTest, ValidateRequestWrongContentTypePlainText) {
 TEST_F(HttpQueryHandlerTest, ValidateRequestWrongContentTypeXml) {
     HttpQueryHandler handler(nullptr);
 
-    seastar::http::request req;
-    req.content = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
+    seastar::http::request req{};
+    timestar::http::injectedBody(req) = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
     req._headers["Content-Type"] = "application/xml";
 
     auto result = handler.validateRequest(req);
@@ -399,9 +401,9 @@ TEST_F(HttpQueryHandlerTest, ValidateRequestWrongContentTypeXml) {
 TEST_F(HttpQueryHandlerTest, ValidateRequestBodySizeStillRejectsOversized) {
     HttpQueryHandler handler(nullptr);
 
-    seastar::http::request req;
+    seastar::http::request req{};
     // Oversized body with unknown content type — body size check still rejects
-    req.content = std::string(HttpQueryHandler::maxQueryBodySize() + 1, 'x');
+    timestar::http::injectedBody(req) = std::string(HttpQueryHandler::maxQueryBodySize() + 1, 'x');
     req._headers["Content-Type"] = "text/html";
 
     auto result = handler.validateRequest(req);

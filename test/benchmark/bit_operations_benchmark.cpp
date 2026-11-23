@@ -2,8 +2,7 @@
 #include "../../lib/storage/compressed_buffer.hpp"
 
 #include <benchmark/benchmark.h>
-#include <immintrin.h>
-#include <x86intrin.h>
+#include <hwy/highway.h>
 
 #include <bit>
 #include <cassert>
@@ -178,44 +177,37 @@ static void BM_XOR_Scalar(benchmark::State& state) {
 }
 BENCHMARK(BM_XOR_Scalar);
 
-// SIMD XOR using AVX2 (process 4 uint64_t at once)
-static void BM_XOR_SIMD_AVX2(benchmark::State& state) {
+// SIMD XOR through Highway, at whatever vector width the build targets
+// (SSE2 by default, AVX2/AVX-512 with -DTIMESTAR_NATIVE_ARCH=ON). This used
+// raw AVX2 intrinsics, which do not compile without -mavx2 and so broke a
+// plain `make` on the default (portable) configuration.
+static void BM_XOR_SIMD_Highway(benchmark::State& state) {
+    namespace hn = hwy::HWY_NAMESPACE;
     auto floats = generate_random_floats(10000);
-    // Ensure size is multiple of 4 for SIMD
-    while (floats.size() % 4 != 1)
-        floats.pop_back();
+    const hn::ScalableTag<uint64_t> d;
+    const size_t lanes = hn::Lanes(d);
+    const size_t count = floats.size() - 1;
 
     std::vector<uint64_t> results;
-    results.resize(floats.size() - 1);
+    results.resize(count);
 
     for (auto _ : state) {
         const uint64_t* input = reinterpret_cast<const uint64_t*>(floats.data());
         uint64_t* output = results.data();
 
-        // Process first element separately
-        uint64_t last = input[0];
-
-        // Process in chunks of 4
-        size_t simd_count = (floats.size() - 1) / 4;
-        for (size_t i = 0; i < simd_count; ++i) {
-            __m256i current = _mm256_loadu_si256((__m256i*)(input + 1 + i * 4));
-            __m256i prev = _mm256_set_epi64x((i * 4 + 3 < floats.size() - 1) ? input[i * 4 + 3] : input[i * 4 + 2],
-                                             (i * 4 + 2 < floats.size() - 1) ? input[i * 4 + 2] : input[i * 4 + 1],
-                                             (i * 4 + 1 < floats.size() - 1) ? input[i * 4 + 1] : input[i * 4],
-                                             (i == 0) ? last : input[i * 4]);
-
-            __m256i xor_result = _mm256_xor_si256(current, prev);
-            _mm256_storeu_si256((__m256i*)(output + i * 4), xor_result);
+        // output[i] = input[i + 1] ^ input[i]: two overlapping unaligned loads.
+        size_t i = 0;
+        for (; i + lanes <= count; i += lanes) {
+            hn::StoreU(hn::Xor(hn::LoadU(d, input + i + 1), hn::LoadU(d, input + i)), d, output + i);
         }
-
-        // Handle remaining elements
-        for (size_t i = simd_count * 4; i < floats.size() - 1; ++i) {
-            results[i] = input[i + 1] ^ input[i];
+        for (; i < count; ++i) {
+            output[i] = input[i + 1] ^ input[i];
         }
+        benchmark::DoNotOptimize(output);
     }
     benchmark::DoNotOptimize(results);
 }
-BENCHMARK(BM_XOR_SIMD_AVX2);
+BENCHMARK(BM_XOR_SIMD_Highway);
 
 // ==================== Combined Bit Operations Benchmarks ====================
 

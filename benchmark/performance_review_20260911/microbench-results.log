@@ -1,0 +1,137 @@
+Note: Google Test filter = OptimizationBaseline.B3_*:OptimizationBaseline.B8_*:OptimizationBaseline.B9_*:TsmReadPathBenchmark.*:QueryFoldBench.*
+[==========] Running 14 tests from 3 test suites.
+[----------] Global test environment set-up.
+[----------] 3 tests from OptimizationBaseline
+[ RUN      ] OptimizationBaseline.B3_NativeIndexInsertCacheOverhead
+
+╔══════════════════════════════════════════════════════════════════╗
+║  B3: NativeIndex Insert Cache & Allocation Overhead            ║
+╚══════════════════════════════════════════════════════════════════╝
+      10 hosts →    200 series:      1.01 ms total  (198744 series/sec)
+    getOrCreateSeriesId (10 hosts)                    min=   0.002  avg=   0.005  p50=   0.002  p95=   0.008  max=   0.141 ms  (n=200)
+      50 hosts →   1000 series:      2.89 ms total  (345857 series/sec)
+    getOrCreateSeriesId (50 hosts)                    min=   0.000  avg=   0.003  p50=   0.002  p95=   0.006  max=   0.192 ms  (n=1000)
+     100 hosts →   2000 series:      4.65 ms total  (430207 series/sec)
+    getOrCreateSeriesId (100 hosts)                   min=   0.000  avg=   0.002  p50=   0.002  p95=   0.006  max=   0.142 ms  (n=2000)
+     500 hosts →  10000 series:     66.98 ms total  (149298 series/sec)
+    getOrCreateSeriesId (500 hosts)                   min=   0.000  avg=   0.007  p50=   0.003  p95=   0.006  max=  19.858 ms  (n=10000)
+    1000 hosts →  20000 series:    108.59 ms total  (184171 series/sec)
+    getOrCreateSeriesId (1000 hosts)                  min=   0.000  avg=   0.005  p50=   0.003  p95=   0.006  max=  28.524 ms  (n=20000)
+
+  Cache sizes after all inserts:
+    Series dedup cache:  26600 entries
+    Metadata cache:      26600 entries (13.6 MB)
+    Discovery cache:     0 entries (0.0 MB)
+
+[       OK ] OptimizationBaseline.B3_NativeIndexInsertCacheOverhead (486 ms)
+[ RUN      ] OptimizationBaseline.B8_EngineInsertPath
+
+╔══════════════════════════════════════════════════════════════════╗
+║  B8: Engine Insert Path (SeriesId roundtrip + alloc overhead)  ║
+╚══════════════════════════════════════════════════════════════════╝
+  500 inserts x 100 pts = 50000 total points
+  Total:   11618.05 ms  (4304 pts/sec)
+  Latency: min=9.825  avg=23.236  p50=18.853  p95=42.426  p99=61.514  max=69.027 ms
+
+[       OK ] OptimizationBaseline.B8_EngineInsertPath (12065 ms)
+[ RUN      ] OptimizationBaseline.B9_QueryParserAllocation
+
+╔══════════════════════════════════════════════════════════════════╗
+║  B9: Query Parser Allocation Overhead                          ║
+╚══════════════════════════════════════════════════════════════════╝
+  simple            0.83 ms total  (0.0001 ms/parse, 12112873 parses/sec)
+  1-field           0.68 ms total  (0.0001 ms/parse, 14777706 parses/sec)
+  1-scope           1.10 ms total  (0.0001 ms/parse, 9107833 parses/sec)
+  3-scopes          2.40 ms total  (0.0002 ms/parse, 4172016 parses/sec)
+  group-by          1.96 ms total  (0.0002 ms/parse, 5105688 parses/sec)
+  complex           3.96 ms total  (0.0004 ms/parse, 2528296 parses/sec)
+
+[       OK ] OptimizationBaseline.B9_QueryParserAllocation (11 ms)
+[----------] 3 tests from OptimizationBaseline (12563 ms total)
+
+[----------] 5 tests from QueryFoldBench
+[ RUN      ] QueryFoldBench.Q1_AddPointsRangeMultiBucket
+[Q1] addPointsRange multi-bucket AVG: 0.419 ms for 1000000 pts (2386.3 Mpts/s), checksum=50009657.076
+[       OK ] QueryFoldBench.Q1_AddPointsRangeMultiBucket (16 ms)
+[ RUN      ] QueryFoldBench.Q2_ScalarFoldAvgPerPoint
+Reactor stalled for 65 ms on shard 0, in scheduling group main. Backtrace: 0x701d51 0x6ab023 0x6ab58b 0x6ab777 0x45caf 0x1576f9 0x8a85be 0x89ba95 0x89bc34 0x89be70 0x8a0be8 0x8a10f6 0x1040e9 0x102fac
+[Q2] scalar per-point AVG fold: 4.601 ms for 1000000 pts (217.4 Mpts/s), checksum=50009657.076
+[       OK ] QueryFoldBench.Q2_ScalarFoldAvgPerPoint (40 ms)
+[ RUN      ] QueryFoldBench.Q3_SimdMinMaxSum
+Reactor stalled for 123 ms on shard 0, in scheduling group main. Backtrace: 0x701d51 0x6ab023 0x6ab58b 0x6ab777 0x45caf 0x154893 0x154c84 0x8a85be 0x89ba95 0x89bc34 0x89be70 0x8a0be8 0x8a10f6 0x1040e9 0x102fac
+[Q3] SIMD kernels, 4000000 doubles: sum=0.403 ms (79.3 GB/s)  min=0.426 ms (75.1 GB/s)  max=0.412 ms (77.6 GB/s)
+[       OK ] QueryFoldBench.Q3_SimdMinMaxSum (69 ms)
+[ RUN      ] QueryFoldBench.Q4_StddevBatchFold
+[Q4] STDDEV batch fold: 0.166 ms for 1000000 pts (6009.0 Mpts/s), stddev=14.150273
+[       OK ] QueryFoldBench.Q4_StddevBatchFold (10 ms)
+[ RUN      ] QueryFoldBench.Q5_AddTimestampsOnlyMultiBucket
+[Q5] addTimestampsOnly multi-bucket COUNT: 0.288 ms for 1000000 pts (3472.6 Mpts/s), count=1000000
+[       OK ] QueryFoldBench.Q5_AddTimestampsOnlyMultiBucket (10 ms)
+[----------] 5 tests from QueryFoldBench (147 ms total)
+
+[----------] 6 tests from TsmReadPathBenchmark
+[ RUN      ] TsmReadPathBenchmark.R1_NarrowRangeQuery_ManyFiles
+
+╔══════════════════════════════════════════════════════════════════╗
+║  R1: Narrow-Range Query Over Many TSM Files                    ║
+╚══════════════════════════════════════════════════════════════════╝
+  Narrow range (1/10 files)                           min=    68.0  avg=  1265.9  p50=    76.2  p95=  4584.0  max=  4593.4 µs  (n=20)
+  Wide range (all files)                              min=   548.4  avg=  3539.9  p50=  3056.5  p95=  6278.7  max= 10224.4 µs  (n=20)
+
+  Narrow/Wide ratio: 0.36x (ideal ≈ 0.1x for 1/10 files)
+[       OK ] TsmReadPathBenchmark.R1_NarrowRangeQuery_ManyFiles (6383 ms)
+[ RUN      ] TsmReadPathBenchmark.R2_IntegerNarrowRange
+
+╔══════════════════════════════════════════════════════════════════╗
+║  R2: Integer Series Narrow-Range Query                         ║
+╚══════════════════════════════════════════════════════════════════╝
+  Integer narrow range (10% of data)                  min=    65.8  avg=  2005.5  p50=   539.9  p95=  4577.7  max=  6628.7 µs  (n=20)
+  Integer wide range (all data)                       min=   516.0  avg=  3565.0  p50=  3971.9  p95=  6231.4  max=  6266.0 µs  (n=20)
+
+  Narrow/Wide ratio: 0.56x (ideal ≈ 0.1x for 10%% data)
+[       OK ] TsmReadPathBenchmark.R2_IntegerNarrowRange (2520 ms)
+[ RUN      ] TsmReadPathBenchmark.R5_MultiSeriesNarrowRange
+
+╔══════════════════════════════════════════════════════════════════╗
+║  R5: Multi-Series Narrow-Range Query Pipeline                  ║
+╚══════════════════════════════════════════════════════════════════╝
+  20 series narrow range (prefetch + query)           min= 30989.2  avg= 40024.8  p50= 40532.0  p95= 45709.4  max= 45878.5 µs  (n=10)
+  20 series wide range (prefetch + query)             min= 63513.6  avg= 67574.8  p50= 65217.5  p95= 73250.0  max= 73254.5 µs  (n=10)
+
+  Narrow/Wide ratio: 0.59x (ideal ≈ 0.2x for 2/10 files)
+[       OK ] TsmReadPathBenchmark.R5_MultiSeriesNarrowRange (7715 ms)
+[ RUN      ] TsmReadPathBenchmark.R3_IntegerPushdownAggregation
+
+╔══════════════════════════════════════════════════════════════════╗
+║  R3: Integer Pushdown Aggregation vs Full Materialization       ║
+╚══════════════════════════════════════════════════════════════════╝
+  Integer AVG pushdown (if supported)                 min=  7719.7  avg= 11532.1  p50= 10227.7  p95= 15724.7  max= 15750.2 µs  (n=20)
+  Pushdown hits: 20/20
+  Integer full materialization                        min=   532.9  avg=  3023.5  p50=  3109.5  p95=  5404.9  max=  5972.5 µs  (n=20)
+
+  Pushdown speedup: 0.26x vs full materialization
+[       OK ] TsmReadPathBenchmark.R3_IntegerPushdownAggregation (2788 ms)
+[ RUN      ] TsmReadPathBenchmark.R6_StatsPushdownIOAmplification
+
+╔══════════════════════════════════════════════════════════════════╗
+║  R6: Stats-Pushdown I/O Amplification (boundary-block decode)   ║
+╚══════════════════════════════════════════════════════════════════╝
+  AVG fold, mid-block range (2 decode blocks)         min=   186.4  avg=  2370.2  p50=  2175.4  p95=  4704.9  max=  6313.3 µs  (n=15)
+  Pushdown hits: 15/15
+  AVG fold, full range (0 decode blocks)              min=     4.9  avg=     5.0  p50=     4.9  p95=     5.0  max=     5.8 µs  (n=15)
+
+  Mid-block-range overhead vs zero-decode: 476.95x
+[       OK ] TsmReadPathBenchmark.R6_StatsPushdownIOAmplification (1287 ms)
+[ RUN      ] TsmReadPathBenchmark.R7_StringDictReadPath
+
+╔══════════════════════════════════════════════════════════════════╗
+║  R7: Dictionary-Encoded String Series Read Path                 ║
+╚══════════════════════════════════════════════════════════════════╝
+  String dict narrow range (200 pts)                  min=    27.7  avg=   515.0  p50=    33.3  p95=  4567.0  max=  4619.7 µs  (n=20)
+  String dict full range (100k pts)                   min=  4029.6  avg=  5285.3  p50=  4924.3  p95=  5248.8  max=  8649.2 µs  (n=10)
+[       OK ] TsmReadPathBenchmark.R7_StringDictReadPath (1122 ms)
+[----------] 6 tests from TsmReadPathBenchmark (21817 ms total)
+
+[----------] Global test environment tear-down
+[==========] 14 tests from 3 test suites ran. (34527 ms total)
+[  PASSED  ] 14 tests.

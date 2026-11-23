@@ -5,6 +5,7 @@
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/core/timestar_value.hpp"
 #include "../../test_helpers.hpp"
+#include "shard_count.hpp"
 
 #include <gtest/gtest.h>
 
@@ -370,7 +371,7 @@ TEST_F(EngineSeastarTest, IndexMetadataOnAnyShard) {
             eng.eng.invoke_on(0, [insert](Engine& engine) mutable { return engine.indexMetadata(insert); }).get();
         EXPECT_FALSE(sid.toHex().empty());
 
-        if (seastar::smp::count > 1) {
+        if (timestar::shardCount() > 1) {
             TimeStarInsert<double> insert2("cpu", "idle");
             insert2.addTag("host", "h2");
             insert2.addValue(2000, 95.0);

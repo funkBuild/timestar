@@ -50,10 +50,10 @@ TEST_F(MemoryStoreTest, InsertFloatValues) {
     ASSERT_NE(it, store->series.end());
 
     auto& seriesData = std::get<InMemorySeries<double>>(it->second);
-    EXPECT_EQ(seriesData.timestamps.size(), 5);
-    EXPECT_EQ(seriesData.values.size(), 5);
-    EXPECT_DOUBLE_EQ(seriesData.values[0], 20.5);
-    EXPECT_DOUBLE_EQ(seriesData.values[4], 22.5);
+    EXPECT_EQ(seriesData.timestamps().size(), 5);
+    EXPECT_EQ(seriesData.values().size(), 5);
+    EXPECT_DOUBLE_EQ(seriesData.values()[0], 20.5);
+    EXPECT_DOUBLE_EQ(seriesData.values()[4], 22.5);
 }
 
 TEST_F(MemoryStoreTest, InsertBooleanValues) {
@@ -78,10 +78,10 @@ TEST_F(MemoryStoreTest, InsertBooleanValues) {
     ASSERT_NE(it, store->series.end());
 
     auto& seriesData = std::get<InMemorySeries<bool>>(it->second);
-    EXPECT_EQ(seriesData.values.size(), 3);
-    EXPECT_EQ(seriesData.values[0], true);
-    EXPECT_EQ(seriesData.values[1], false);
-    EXPECT_EQ(seriesData.values[2], true);
+    EXPECT_EQ(seriesData.values().size(), 3);
+    EXPECT_EQ(seriesData.values()[0], true);
+    EXPECT_EQ(seriesData.values()[1], false);
+    EXPECT_EQ(seriesData.values()[2], true);
 }
 
 TEST_F(MemoryStoreTest, MultipleSeries) {
@@ -143,9 +143,9 @@ TEST_F(MemoryStoreTest, AppendToExistingSeries) {
     ASSERT_NE(it, store->series.end());
 
     auto& seriesData = std::get<InMemorySeries<double>>(it->second);
-    EXPECT_EQ(seriesData.values.size(), 4);
-    EXPECT_DOUBLE_EQ(seriesData.values[0], 100.0);
-    EXPECT_DOUBLE_EQ(seriesData.values[3], 400.0);
+    EXPECT_EQ(seriesData.values().size(), 4);
+    EXPECT_DOUBLE_EQ(seriesData.values()[0], 100.0);
+    EXPECT_DOUBLE_EQ(seriesData.values()[3], 400.0);
 }
 
 TEST_F(MemoryStoreTest, NonExistentSeries) {
@@ -244,13 +244,13 @@ TEST_F(MemoryStoreTest, SortingTimestamps) {
     seriesData.sort();
 
     // Verify timestamps are in order
-    for (size_t i = 1; i < seriesData.timestamps.size(); i++) {
-        EXPECT_GT(seriesData.timestamps[i], seriesData.timestamps[i - 1]);
+    for (size_t i = 1; i < seriesData.timestamps().size(); i++) {
+        EXPECT_GT(seriesData.timestamps()[i], seriesData.timestamps()[i - 1]);
     }
 
     // Verify values correspond to correct timestamps
-    for (size_t i = 0; i < seriesData.values.size(); i++) {
-        EXPECT_DOUBLE_EQ(seriesData.values[i], seriesData.timestamps[i] / 1000.0);
+    for (size_t i = 0; i < seriesData.values().size(); i++) {
+        EXPECT_DOUBLE_EQ(seriesData.values()[i], seriesData.timestamps()[i] / 1000.0);
     }
 }
 
@@ -277,10 +277,10 @@ TEST_F(MemoryStoreTest, InsertStringValues) {
     ASSERT_NE(it, store->series.end());
 
     auto& seriesData = std::get<InMemorySeries<std::string>>(it->second);
-    EXPECT_EQ(seriesData.timestamps.size(), 4);
-    EXPECT_EQ(seriesData.values.size(), 4);
-    EXPECT_EQ(seriesData.values[0], "Error: Connection timeout");
-    EXPECT_EQ(seriesData.values[3], "Debug: Cache hit");
+    EXPECT_EQ(seriesData.timestamps().size(), 4);
+    EXPECT_EQ(seriesData.values().size(), 4);
+    EXPECT_EQ(seriesData.values()[0], "Error: Connection timeout");
+    EXPECT_EQ(seriesData.values()[3], "Debug: Cache hit");
 }
 
 TEST_F(MemoryStoreTest, InsertMixedTypes) {
@@ -321,9 +321,9 @@ TEST_F(MemoryStoreTest, QuerySeriesFloat) {
     auto result = store->querySeries<double>(seriesId);
 
     ASSERT_NE(result, nullptr);
-    EXPECT_EQ(result->values.size(), 3);
-    EXPECT_DOUBLE_EQ(result->values[0], 20.5);
-    EXPECT_DOUBLE_EQ(result->values[2], 21.5);
+    EXPECT_EQ(result->values().size(), 3);
+    EXPECT_DOUBLE_EQ(result->values()[0], 20.5);
+    EXPECT_DOUBLE_EQ(result->values()[2], 21.5);
 }
 
 TEST_F(MemoryStoreTest, QuerySeriesString) {
@@ -339,9 +339,9 @@ TEST_F(MemoryStoreTest, QuerySeriesString) {
     auto result = store->querySeries<std::string>(seriesId);
 
     ASSERT_NE(result, nullptr);
-    EXPECT_EQ(result->values.size(), 3);
-    EXPECT_EQ(result->values[0], "starting");
-    EXPECT_EQ(result->values[2], "stopping");
+    EXPECT_EQ(result->values().size(), 3);
+    EXPECT_EQ(result->values()[0], "starting");
+    EXPECT_EQ(result->values()[2], "stopping");
 }
 
 TEST_F(MemoryStoreTest, QueryNonExistentSeries) {
@@ -369,10 +369,10 @@ TEST_F(MemoryStoreTest, DeleteRangeFloat) {
     ASSERT_NE(it, store->series.end());
 
     auto& seriesData = std::get<InMemorySeries<double>>(it->second);
-    EXPECT_EQ(seriesData.values.size(), 3);        // Should have 3 values left
-    EXPECT_DOUBLE_EQ(seriesData.values[0], 10.0);  // 1000
-    EXPECT_DOUBLE_EQ(seriesData.values[1], 40.0);  // 4000
-    EXPECT_DOUBLE_EQ(seriesData.values[2], 50.0);  // 5000
+    EXPECT_EQ(seriesData.values().size(), 3);        // Should have 3 values left
+    EXPECT_DOUBLE_EQ(seriesData.values()[0], 10.0);  // 1000
+    EXPECT_DOUBLE_EQ(seriesData.values()[1], 40.0);  // 4000
+    EXPECT_DOUBLE_EQ(seriesData.values()[2], 50.0);  // 5000
 }
 
 TEST_F(MemoryStoreTest, DeleteRangeString) {
@@ -393,10 +393,10 @@ TEST_F(MemoryStoreTest, DeleteRangeString) {
     ASSERT_NE(it, store->series.end());
 
     auto& seriesData = std::get<InMemorySeries<std::string>>(it->second);
-    EXPECT_EQ(seriesData.values.size(), 3);
-    EXPECT_EQ(seriesData.values[0], "first");
-    EXPECT_EQ(seriesData.values[1], "third");
-    EXPECT_EQ(seriesData.values[2], "fourth");
+    EXPECT_EQ(seriesData.values().size(), 3);
+    EXPECT_EQ(seriesData.values()[0], "first");
+    EXPECT_EQ(seriesData.values()[1], "third");
+    EXPECT_EQ(seriesData.values()[2], "fourth");
 }
 
 TEST_F(MemoryStoreTest, EmptyStringValues) {
@@ -413,10 +413,10 @@ TEST_F(MemoryStoreTest, EmptyStringValues) {
     ASSERT_NE(it, store->series.end());
 
     auto& seriesData = std::get<InMemorySeries<std::string>>(it->second);
-    EXPECT_EQ(seriesData.values.size(), 3);
-    EXPECT_EQ(seriesData.values[0], "");
-    EXPECT_EQ(seriesData.values[1], "not empty");
-    EXPECT_EQ(seriesData.values[2], "");
+    EXPECT_EQ(seriesData.values().size(), 3);
+    EXPECT_EQ(seriesData.values()[0], "");
+    EXPECT_EQ(seriesData.values()[1], "not empty");
+    EXPECT_EQ(seriesData.values()[2], "");
 }
 
 TEST_F(MemoryStoreTest, LongStringValues) {
@@ -434,7 +434,7 @@ TEST_F(MemoryStoreTest, LongStringValues) {
     ASSERT_NE(it, store->series.end());
 
     auto& seriesData = std::get<InMemorySeries<std::string>>(it->second);
-    EXPECT_EQ(seriesData.values.size(), 2);
-    EXPECT_EQ(seriesData.values[0].length(), 10000);
-    EXPECT_EQ(seriesData.values[1], "short");
+    EXPECT_EQ(seriesData.values().size(), 2);
+    EXPECT_EQ(seriesData.values()[0].length(), 10000);
+    EXPECT_EQ(seriesData.values()[1], "short");
 }

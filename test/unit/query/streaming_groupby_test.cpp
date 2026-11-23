@@ -532,7 +532,7 @@ TEST(StreamingGroupBy, MergePushdownResult_SortedValues) {
 // ============================================================================
 
 TEST(StreamingGroupBy, PartialResult_Bucketed_HasBucketStates) {
-    std::unordered_map<uint64_t, AggregationState> groupBuckets;
+    timestar::BucketStateMap groupBuckets;
     groupBuckets[0].addValueForMethod(10.0, 100, AggregationMethod::SUM);
     groupBuckets[1000].addValueForMethod(20.0, 1100, AggregationMethod::SUM);
 

@@ -14,7 +14,7 @@
 #  Stage 1 — deps: build tools and system libraries
 #  CI caches this layer via buildx GHA cache; rebuilds only when packages change.
 # ---------------------------------------------------------------------------
-FROM ubuntu:24.04 AS deps
+FROM ubuntu:26.04 AS deps
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -22,7 +22,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     build-essential \
-    g++-14 gcc-14 \
+    g++-15 gcc-15 \
     cmake \
     ninja-build \
     git \
@@ -58,12 +58,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Linting: clang-format pinned via pip so CI and local dev run the SAME
-# version regardless of distro (noble's apt tops out at clang-format-18;
-# dev boxes are on 21.x). Bump this together with CONTRIBUTING.md.
+# version regardless of distro (the distro package lags or leads the pinned
+# release). Bump this together with CONTRIBUTING.md.
 RUN pip install --break-system-packages clang-format==21.1.6
 
-# Use GCC 14
-ENV CC=gcc-14 CXX=g++-14
+# Use GCC 15 (the vendored Seastar needs libstdc++ 15)
+ENV CC=gcc-15 CXX=g++-15
 
 # ---------------------------------------------------------------------------
 #  Stage 2 — builder: compile the TimeStar server
@@ -89,8 +89,8 @@ RUN mkdir -p build && cd build && \
       -GNinja \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG" \
-      -DCMAKE_C_COMPILER=gcc-14 \
-      -DCMAKE_CXX_COMPILER=g++-14 \
+      -DCMAKE_C_COMPILER=gcc-15 \
+      -DCMAKE_CXX_COMPILER=g++-15 \
       -DTIMESTAR_ENABLE_LTO=${ENABLE_LTO} \
       -DTIMESTAR_NATIVE_ARCH=OFF \
       -DTIMESTAR_BUILD_TESTS=OFF \
@@ -104,17 +104,17 @@ RUN strip --strip-all build/bin/timestar_http_server
 # ---------------------------------------------------------------------------
 #  Stage 3 — minimal runtime image
 # ---------------------------------------------------------------------------
-FROM ubuntu:24.04 AS runtime
+FROM ubuntu:26.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Only runtime shared libraries — no -dev packages, no compilers
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libboost-filesystem1.83.0 \
-    libboost-program-options1.83.0 \
-    libboost-thread1.83.0 \
+    libboost-filesystem1.90.0 \
+    libboost-program-options1.90.0 \
+    libboost-thread1.90.0 \
     libc-ares2 \
-    libfmt9 \
+    libfmt10 \
     liblz4-1 \
     libgnutls30t64 \
     libatomic1 \

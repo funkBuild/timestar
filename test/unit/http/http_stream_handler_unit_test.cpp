@@ -1126,7 +1126,7 @@ TEST_F(SSEStructuralTest, DataLineContainsValidJSONObject) {
 // source (same pattern as http_write_handler_test.cpp):
 //   1. Per-event flush must reach the socket (flushToSocket + connection
 //      stream extraction), not just the chunked body stream.
-//   2. Content-Type must be set to text/event-stream via set_mime_type()
+//   2. Content-Type must be set to text/event-stream via set_content_type()
 //      (write_body()'s type parameter is an extension lookup and maps
 //      "text/event-stream" to text/plain).
 //   3. Error responses must use the flat timestar::http::jsonError() shape,
@@ -1167,8 +1167,8 @@ TEST_F(SSEHandlerSourceInspectionTest, ContentTypeIsTextEventStream) {
     std::string content = readHandlerSource();
     ASSERT_FALSE(content.empty()) << "Could not open http_stream_handler.cpp for source inspection";
 
-    EXPECT_NE(content.find("set_mime_type(\"text/event-stream\")"), std::string::npos)
-        << "SSE reply must set Content-Type via set_mime_type(\"text/event-stream\"); write_body()'s "
+    EXPECT_NE(content.find("set_content_type(\"text/event-stream\")"), std::string::npos)
+        << "SSE reply must set Content-Type via set_content_type(\"text/event-stream\"); write_body()'s "
            "content-type parameter is an extension lookup and falls back to text/plain";
 }
 

@@ -1,0 +1,6 @@
+base 4642353 1.41 294464 8815252 | 400 OK, 0 HTTP errors, 0 connection failures
+new 5292788 1.43 285568 8815252 | 400 OK, 0 HTTP errors, 0 connection failures
+new 5065028 1.32 291948 8815252 | 400 OK, 0 HTTP errors, 0 connection failures
+base 5035964 1.36 290012 8815252 | 400 OK, 0 HTTP errors, 0 connection failures
+base 4961960 1.28 288444 8815252 | 400 OK, 0 HTTP errors, 0 connection failures
+new 5435424 1.38 289944 8815252 | 400 OK, 0 HTTP errors, 0 connection failures
